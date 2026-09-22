@@ -104,10 +104,9 @@ type Dispatch struct {
 	responseHeader []byte
 	writeLock      sync.Mutex
 	prov           Provider
-	// provName is the concrete backend type name, cached at construction so
-	// error logs can identify which storage layer failed without reflection
-	// on every call.
-	provName         string
+	// logger is tagged with the backend type name at construction, so the
+	// reflection stays out of the per-request path.
+	logger           logger.Logger
 	pendingResponses sync.WaitGroup
 	shuttingDown     bool
 	shuttingDownLock sync.Mutex
@@ -119,12 +118,12 @@ type Dispatch struct {
 	asyncWriteZeroes bool
 }
 
-func NewDispatch(fp io.ReadWriter, prov Provider, asyncWriteZeroes bool) *Dispatch {
+func NewDispatch(fp io.ReadWriter, prov Provider, asyncWriteZeroes bool, lg logger.Logger) *Dispatch {
 	d := &Dispatch{
 		responseHeader:   make([]byte, 16),
 		fp:               fp,
 		prov:             prov,
-		provName:         fmt.Sprintf("%T", prov),
+		logger:           lg.With(zap.String("nbd_provider", fmt.Sprintf("%T", prov))),
 		fatal:            make(chan error, 1),
 		asyncWriteZeroes: asyncWriteZeroes,
 	}
@@ -338,10 +337,9 @@ func (d *Dispatch) cmdRead(ctx context.Context, cmdHandle uint64, cmdFrom uint64
 			// Per-request backend failure: signal it to the NBD client via the
 			// response error byte and keep the dispatch loop alive. Only
 			// writeResponse errors (dead NBD socket) escalate through d.fatal.
-			logger.L().Error(ctx, "nbd backend read failed",
+			d.logger.Error(ctx, "nbd backend read failed",
 				zap.Error(readErr),
 				zap.String("nbd_op", "read"),
-				zap.String("nbd_provider", d.provName),
 				zap.Uint64("nbd_handle", handle),
 				zap.Uint64("nbd_offset", from),
 				zap.Uint32("nbd_length", length),
@@ -360,10 +358,9 @@ func (d *Dispatch) cmdRead(ctx context.Context, cmdHandle uint64, cmdFrom uint64
 			select {
 			case d.fatal <- err:
 			default:
-				logger.L().Error(ctx, "nbd error cmd read",
+				d.logger.Error(ctx, "nbd error cmd read",
 					zap.Error(err),
 					zap.String("nbd_op", "read"),
-					zap.String("nbd_provider", d.provName),
 					zap.Uint64("nbd_handle", cmdHandle),
 					zap.Uint64("nbd_offset", cmdFrom),
 					zap.Uint32("nbd_length", cmdLength),
@@ -410,10 +407,9 @@ func (d *Dispatch) cmdWrite(ctx context.Context, cmdHandle uint64, cmdFrom uint6
 		}
 
 		if writeErr != nil {
-			logger.L().Error(ctx, "nbd backend write failed",
+			d.logger.Error(ctx, "nbd backend write failed",
 				zap.Error(writeErr),
 				zap.String("nbd_op", "write"),
-				zap.String("nbd_provider", d.provName),
 				zap.Uint64("nbd_handle", handle),
 				zap.Uint64("nbd_offset", from),
 				zap.Int("nbd_length", len(data)),
@@ -432,10 +428,9 @@ func (d *Dispatch) cmdWrite(ctx context.Context, cmdHandle uint64, cmdFrom uint6
 			select {
 			case d.fatal <- err:
 			default:
-				logger.L().Error(ctx, "nbd error cmd write",
+				d.logger.Error(ctx, "nbd error cmd write",
 					zap.Error(err),
 					zap.String("nbd_op", "write"),
-					zap.String("nbd_provider", d.provName),
 					zap.Uint64("nbd_handle", cmdHandle),
 					zap.Uint64("nbd_offset", cmdFrom),
 					zap.Int("nbd_length", len(cmdData)),
@@ -484,9 +479,8 @@ func (d *Dispatch) cmdWriteZeroes(ctx context.Context, cmdHandle uint64, cmdFrom
 		var respErr uint32
 		if zeroErr != nil {
 			respErr = 1
-			logger.L().Error(ctx, "nbd backend write-zeroes failed",
+			d.logger.Error(ctx, "nbd backend write-zeroes failed",
 				zap.Error(zeroErr),
-				zap.String("nbd_provider", d.provName),
 				zap.Uint64("nbd_handle", cmdHandle),
 				zap.Uint64("nbd_offset", cmdFrom),
 				zap.Int64("nbd_length", cmdLength),
@@ -515,10 +509,9 @@ func (d *Dispatch) cmdWriteZeroes(ctx context.Context, cmdHandle uint64, cmdFrom
 			select {
 			case d.fatal <- err:
 			default:
-				logger.L().Error(ctx, "nbd error cmd write-zeroes",
+				d.logger.Error(ctx, "nbd error cmd write-zeroes",
 					zap.Error(err),
 					zap.String("nbd_op", "write-zeroes"),
-					zap.String("nbd_provider", d.provName),
 					zap.Uint64("nbd_handle", cmdHandle),
 					zap.Uint64("nbd_offset", cmdFrom),
 					zap.Int64("nbd_length", cmdLength),

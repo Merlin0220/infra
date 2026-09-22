@@ -776,8 +776,8 @@ func (f *Factory) EgressProxy() network.EgressProxy {
 }
 
 // NewDirectPathMount opens host-side NBD access without a Firecracker VM.
-func (f *Factory) NewDirectPathMount(backend block.Device) *nbd.DirectPathMount {
-	return nbd.NewDirectPathMount(backend, f.devicePool, f.featureFlags)
+func (f *Factory) NewDirectPathMount(backend block.Device, lg logger.Logger) *nbd.DirectPathMount {
+	return nbd.NewDirectPathMount(backend, f.devicePool, f.featureFlags, lg)
 }
 
 // PreBootFn is an optional callback invoked after the rootfs is ready but before
@@ -854,6 +854,8 @@ func (f *Factory) CreateSandbox(
 		return nil, fmt.Errorf("failed to get rootfs: %w", err)
 	}
 
+	sbxLogger := runtime.Logger()
+
 	var rootfsProvider rootfs.Provider
 	if rootfsCachePath == "" {
 		rootfsProvider, err = rootfs.NewNBDProvider(
@@ -862,6 +864,7 @@ func (f *Factory) CreateSandbox(
 			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
 			f.devicePool,
 			f.featureFlags,
+			sbxLogger,
 		)
 	} else {
 		rootfsProvider, err = rootfs.NewDirectProvider(
@@ -870,6 +873,7 @@ func (f *Factory) CreateSandbox(
 			// Populate direct cache directly from the source file
 			// This is needed for marking all blocks as dirty and being able to read them directly
 			rootfsCachePath,
+			sbxLogger,
 		)
 	}
 	if err != nil {
@@ -879,7 +883,7 @@ func (f *Factory) CreateSandbox(
 	go func() {
 		runErr := rootfsProvider.Start(execCtx)
 		if runErr != nil {
-			runtime.Logger().Error(ctx, "rootfs overlay error", zap.Error(runErr))
+			sbxLogger.Error(ctx, "rootfs overlay error", zap.Error(runErr))
 		}
 	}()
 
@@ -1351,6 +1355,7 @@ func (f *Factory) ResumeSandbox(
 			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
 			f.devicePool,
 			f.featureFlags,
+			sbxLogger,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
