@@ -180,6 +180,44 @@ func NewDispatch(fp io.ReadWriter, prov Provider, asyncWriteZeroes bool, lg logg
 	return d
 }
 
+// admit registers one in-flight response, refusing once Drain has begun. The
+// registration shares the lock with the shuttingDown check on purpose: a
+// command counted after Drain read the count would be waited for by nobody.
+func (d *Dispatch) admit() error {
+	d.shuttingDownLock.Lock()
+	defer d.shuttingDownLock.Unlock()
+
+	if d.shuttingDown {
+		return ErrShuttingDown
+	}
+
+	d.pendingResponses.Add(1)
+
+	return nil
+}
+
+// completeAsync runs an admitted command off the read loop and releases its
+// admission. An error here is the reply socket failing rather than the
+// backend, so it goes to the read loop; when a failure is already on its way
+// there, this one is logged instead of being dropped silently.
+func (d *Dispatch) completeAsync(ctx context.Context, cmd command, perform func() error) {
+	go func() {
+		defer d.pendingResponses.Done()
+
+		err := perform()
+		if err == nil {
+			return
+		}
+
+		select {
+		case d.fatal <- err:
+		default:
+			d.logger.Error(ctx, "nbd command failed while the dispatcher was already failing",
+				append(cmd.fields(), zap.Error(err))...)
+		}
+	}()
+}
+
 func (d *Dispatch) Drain() {
 	d.shuttingDownLock.Lock()
 	d.shuttingDown = true
@@ -332,15 +370,9 @@ func (d *Dispatch) Handle(ctx context.Context) error {
 }
 
 func (d *Dispatch) cmdRead(ctx context.Context, cmd command) error {
-	d.shuttingDownLock.Lock()
-	if d.shuttingDown {
-		d.shuttingDownLock.Unlock()
-
-		return ErrShuttingDown
+	if err := d.admit(); err != nil {
+		return err
 	}
-
-	d.pendingResponses.Add(1)
-	d.shuttingDownLock.Unlock()
 
 	performRead := func() error {
 		// buffered to avoid goroutine leak
@@ -393,31 +425,15 @@ func (d *Dispatch) cmdRead(ctx context.Context, cmd command) error {
 		return d.writeResponse(0, cmd.handle, data)
 	}
 
-	go func() {
-		err := performRead()
-		if err != nil {
-			select {
-			case d.fatal <- err:
-			default:
-				d.logger.Error(ctx, "nbd error cmd read", append(cmd.fields(), zap.Error(err))...)
-			}
-		}
-		d.pendingResponses.Done()
-	}()
+	d.completeAsync(ctx, cmd, performRead)
 
 	return nil
 }
 
 func (d *Dispatch) cmdWrite(ctx context.Context, cmd command, cmdData []byte) error {
-	d.shuttingDownLock.Lock()
-	if d.shuttingDown {
-		d.shuttingDownLock.Unlock()
-
-		return ErrShuttingDown
+	if err := d.admit(); err != nil {
+		return err
 	}
-
-	d.pendingResponses.Add(1)
-	d.shuttingDownLock.Unlock()
 
 	performWrite := func() error {
 		// buffered to avoid goroutine leak
@@ -451,17 +467,7 @@ func (d *Dispatch) cmdWrite(ctx context.Context, cmd command, cmdData []byte) er
 		return d.writeResponse(0, cmd.handle, []byte{})
 	}
 
-	go func() {
-		err := performWrite()
-		if err != nil {
-			select {
-			case d.fatal <- err:
-			default:
-				d.logger.Error(ctx, "nbd error cmd write", append(cmd.fields(), zap.Error(err))...)
-			}
-		}
-		d.pendingResponses.Done()
-	}()
+	d.completeAsync(ctx, cmd, performWrite)
 
 	return nil
 }
@@ -512,27 +518,11 @@ func (d *Dispatch) cmdWriteZeroes(ctx context.Context, cmd command) error {
 		return performWriteZeroes()
 	}
 
-	d.shuttingDownLock.Lock()
-	if d.shuttingDown {
-		d.shuttingDownLock.Unlock()
-
-		return ErrShuttingDown
+	if err := d.admit(); err != nil {
+		return err
 	}
 
-	d.pendingResponses.Add(1)
-	d.shuttingDownLock.Unlock()
-
-	go func() {
-		if err := performWriteZeroes(); err != nil {
-			select {
-			case d.fatal <- err:
-			default:
-				d.logger.Error(ctx, "nbd error cmd punch", append(cmd.fields(), zap.Error(err))...)
-			}
-		}
-
-		d.pendingResponses.Done()
-	}()
+	d.completeAsync(ctx, cmd, performWriteZeroes)
 
 	return nil
 }
