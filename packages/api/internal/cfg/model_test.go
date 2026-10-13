@@ -33,6 +33,14 @@ func TestParse(t *testing.T) {
 		assert.ErrorContains(t, err, `environment variable "POSTGRES_CONNECTION_STRING" should not be empty`)
 	})
 
+	t.Run("LOKI_URL is optional", func(t *testing.T) { //nolint:paralleltest // cannot call t.Setenv and t.Parallel
+		removeEnv(t, "LOKI_URL")
+
+		config, err := Parse()
+		require.NoError(t, err)
+		assert.Empty(t, config.LokiURL)
+	})
+
 	t.Run("base64 signing key can be parsed", func(t *testing.T) {
 		content := []byte{1, 2, 3, 4, 5, 6}
 		encoded := base64.StdEncoding.EncodeToString(content)
@@ -68,6 +76,38 @@ func TestParse(t *testing.T) {
 		result, err := Parse()
 		require.NoError(t, err)
 		assert.Equal(t, "secrets-backend:5000", result.SecretsStoreBackendGrpcAddress)
+	})
+
+	t.Run("composed service discovery provider is accepted", func(t *testing.T) {
+		t.Setenv("SERVICE_DISCOVERY_PROVIDER", ServiceDiscoveryProviderNomadKubernetes)
+
+		result, err := Parse()
+		require.NoError(t, err)
+		assert.Equal(t, "nomad+kubernetes", result.ServiceDiscoveryProvider)
+	})
+
+	t.Run("kubernetes api endpoint is read from the environment", func(t *testing.T) {
+		t.Setenv("K8S_API_ENDPOINT", "https://dns-endpoint.example")
+
+		result, err := Parse()
+		require.NoError(t, err)
+		assert.Equal(t, "https://dns-endpoint.example", result.K8sAPIEndpoint)
+	})
+
+	t.Run("best of K hugepage memory defaults to true", func(t *testing.T) { //nolint:paralleltest // cannot call t.Setenv and t.Parallel
+		removeEnv(t, "BEST_OF_K_HUGEPAGE_MEMORY")
+
+		result, err := Parse()
+		require.NoError(t, err)
+		assert.True(t, result.BestOfKHugepageMemory)
+	})
+
+	t.Run("best of K hugepage memory can be disabled", func(t *testing.T) {
+		t.Setenv("BEST_OF_K_HUGEPAGE_MEMORY", "false")
+
+		result, err := Parse()
+		require.NoError(t, err)
+		assert.False(t, result.BestOfKHugepageMemory)
 	})
 
 	t.Run("invalid service discovery provider exposes failure condition", func(t *testing.T) {

@@ -16,9 +16,14 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
+// TransitionKeyTTL bounds how long a removal owns its transition key. It must
+// outlive the longest pause plus its terminal build-status write, or waiters
+// read the vanished key as success while the owner is still committing.
+const TransitionKeyTTL = 95 * time.Second
+
 const (
 	lockTimeout            = time.Minute
-	transitionKeyTTL       = 70 * time.Second // Should be longer than the longest expected state transition time
+	transitionKeyTTL       = TransitionKeyTTL
 	transitionResultKeyTTL = 30 * time.Second
 	lockRetryMinInterval   = 200 * time.Millisecond
 	lockRetryMaxInterval   = time.Second
@@ -48,6 +53,7 @@ type Storage struct {
 type expirationIndexMetrics struct {
 	indexHealed   metric.Int64Counter
 	indexRescored metric.Int64Counter
+	indexDeferred metric.Int64Counter
 
 	indexSwept         metric.Int64Counter
 	sweptOrphan        metric.MeasurementOption
@@ -68,6 +74,11 @@ func newExpirationIndexMetrics(meter metric.Meter) (expirationIndexMetrics, erro
 		return expirationIndexMetrics{}, fmt.Errorf("expiration index rescored counter: %w", err)
 	}
 
+	deferred, err := telemetry.GetCounter(meter, telemetry.ApiRedisStorageExpirationIndexDeferred)
+	if err != nil {
+		return expirationIndexMetrics{}, fmt.Errorf("expiration index deferred counter: %w", err)
+	}
+
 	swept, err := telemetry.GetCounter(meter, telemetry.ApiRedisStorageExpirationIndexSwept)
 	if err != nil {
 		return expirationIndexMetrics{}, fmt.Errorf("expiration index swept counter: %w", err)
@@ -76,6 +87,7 @@ func newExpirationIndexMetrics(meter metric.Meter) (expirationIndexMetrics, erro
 	return expirationIndexMetrics{
 		indexHealed:        healed,
 		indexRescored:      rescored,
+		indexDeferred:      deferred,
 		indexSwept:         swept,
 		sweptOrphan:        metric.WithAttributeSet(attribute.NewSet(attribute.String(sweptReasonAttr, "orphan"))),
 		sweptDeadExecution: metric.WithAttributeSet(attribute.NewSet(attribute.String(sweptReasonAttr, "dead_execution"))),
@@ -169,7 +181,8 @@ func (s *Storage) Reconcile(ctx context.Context, sbxs []sandboxtypes.NodeSandbox
 		return nil
 	}
 
-	// Pipeline per-team MGET calls.
+	// Pipeline per-team MGET calls, each capped at sandboxScanBatchSize keys
+	// so every command's work and reply size stay bounded.
 	pipe := s.redisClient.Pipeline()
 
 	type batchInfo struct {
@@ -179,13 +192,17 @@ func (s *Storage) Reconcile(ctx context.Context, sbxs []sandboxtypes.NodeSandbox
 
 	var batches []batchInfo
 	for _, candidates := range teamCandidates {
-		keys := make([]string, len(candidates))
-		for i, c := range candidates {
-			keys[i] = c.key
-		}
+		for start := 0; start < len(candidates); start += sandboxScanBatchSize {
+			chunk := candidates[start:min(start+sandboxScanBatchSize, len(candidates))]
 
-		cmd := pipe.MGet(ctx, keys...)
-		batches = append(batches, batchInfo{cmd: cmd, candidates: candidates})
+			keys := make([]string, len(chunk))
+			for i, c := range chunk {
+				keys[i] = c.key
+			}
+
+			cmd := pipe.MGet(ctx, keys...)
+			batches = append(batches, batchInfo{cmd: cmd, candidates: chunk})
+		}
 	}
 
 	_, err := pipe.Exec(ctx)

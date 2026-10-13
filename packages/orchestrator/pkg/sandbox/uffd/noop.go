@@ -65,7 +65,7 @@ func (m *NoopMemory) PrefetchData(_ context.Context) (block.PrefetchData, error)
 	}, nil
 }
 
-func (m *NoopMemory) Start(context.Context, string) error {
+func (m *NoopMemory) Start(context.Context) error {
 	return nil
 }
 
@@ -100,3 +100,8 @@ func (m *NoopMemory) PeekMemfd(context.Context) *block.Memfd {
 func (m *NoopMemory) ServeStats() userfaultfd.ServeSnapshot {
 	return userfaultfd.ServeSnapshot{}
 }
+
+var _ BalloonModeLabeler = (*NoopMemory)(nil)
+
+// SetBalloonMode is a no-op: NoopMemory emits no serve metrics.
+func (m *NoopMemory) SetBalloonMode(userfaultfd.BalloonMode) {}

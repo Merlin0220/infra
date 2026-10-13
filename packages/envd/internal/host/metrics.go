@@ -12,16 +12,16 @@ import (
 type Metrics struct {
 	Timestamp int64 `json:"ts"` // Unix Timestamp in UTC
 
-	CPUCount       uint32  `json:"cpu_count"`    // Total CPU cores
+	CPUCount       uint32  `json:"cpu_count"`    // CPU cores online
 	CPUUsedPercent float32 `json:"cpu_used_pct"` // Percent rounded to 2 decimal places
-
-	// Deprecated
-	// TODO: Remove when they are no longer used in orchestrator (https://linear.app/e2b/issue/E2B-2998/remove-envd-deprecated-metrics-when-not-used)
-	MemTotalMiB uint64 `json:"mem_total_mib"` // Total virtual memory in MiB
-
-	// Deprecated
-	// TODO: Remove when no longer used in orchestrator
-	MemUsedMiB uint64 `json:"mem_used_mib"` // Used virtual memory in MiB
+	// CPUPossible and CPUTarget are filled by the API from the CPU manager, not here.
+	CPUPossible uint32 `json:"cpu_possible"` // CPUs the guest can bring online
+	CPUTarget   uint32 `json:"cpu_target"`   // Online count last requested
+	// CPUTargetAttempts counts attempts at reaching CPUTarget since it was set.
+	CPUTargetAttempts uint32 `json:"cpu_target_attempts"`
+	// CPUWritePendingMs is how long a CPU online/offline write has been stuck in the
+	// kernel, 0 when none is.
+	CPUWritePendingMs uint64 `json:"cpu_write_pending_ms"`
 
 	MemTotal uint64 `json:"mem_total"` // Total virtual memory in bytes
 	MemUsed  uint64 `json:"mem_used"`  // Used virtual memory in bytes
@@ -29,6 +29,8 @@ type Metrics struct {
 
 	DiskUsed  uint64 `json:"disk_used"`  // Used disk space in bytes
 	DiskTotal uint64 `json:"disk_total"` // Total disk space in bytes
+
+	OomKills *[]OOMKill `json:"oom_kills,omitempty"` // Latest OOM kills; nil when not known
 }
 
 func GetMetrics() (*Metrics, error) {
@@ -36,9 +38,6 @@ func GetMetrics() (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	memUsedMiB := v.Used / 1024 / 1024
-	memTotalMiB := v.Total / 1024 / 1024
 
 	cpuTotal, err := cpu.Counts(true)
 	if err != nil {
@@ -65,8 +64,6 @@ func GetMetrics() (*Metrics, error) {
 		Timestamp:      time.Now().UTC().Unix(),
 		CPUCount:       uint32(cpuTotal),
 		CPUUsedPercent: cpuUsedPctRounded,
-		MemUsedMiB:     memUsedMiB,
-		MemTotalMiB:    memTotalMiB,
 		MemTotal:       v.Total,
 		MemUsed:        v.Used,
 		MemCache:       v.Cached,

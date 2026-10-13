@@ -11,11 +11,11 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/emptypb"
 
-	"github.com/e2b-dev/infra/packages/api/internal/clusters/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
 	infogrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
@@ -30,12 +30,16 @@ const (
 type Instance struct {
 	// Identifier that uniquely identifies the instance so it will not be registered multiple times.
 	// Depending on service discovery used, it can be combination of different parameters, what service discovery gives us.
-	uniqueIdentifier string
+	workloadID string
 
 	ClusterID uuid.UUID
 	NodeID    string
 
 	LocalIPAddress string
+
+	// Backend is the discovery lister the instance came from, carried through
+	// so a node built from this one can still say how it was found.
+	Backend string
 
 	serviceInstanceID    string
 	serviceVersion       string
@@ -65,12 +69,28 @@ type InstanceInfo struct {
 	IsBuilder            bool
 }
 
+// instanceFrom projects a discovered instance onto a pool entry. The process
+// identity becomes the pool's key, so a restart replaces rather than shadows;
+// the machine is kept because a build persists the one it was placed on and
+// resolves it again later.
+func instanceFrom(clusterID uuid.UUID, sd servicediscovery.Instance, client *GRPCClient) *Instance {
+	return &Instance{
+		workloadID:     sd.WorkloadID,
+		NodeID:         sd.NodeID,
+		ClusterID:      clusterID,
+		LocalIPAddress: sd.IPAddress,
+		Backend:        sd.Backend,
+
+		client: client,
+	}
+}
+
 func newInstance(
 	ctx context.Context,
 	tel *telemetry.Client,
 	clusterAuth *instanceAuthorization,
 	clusterID uuid.UUID,
-	sd discovery.Item,
+	sd servicediscovery.Instance,
 	connAddr string,
 	connTls bool,
 ) (*Instance, error) {
@@ -86,16 +106,7 @@ func newInstance(
 	//
 	// For case with local cluster we will not receive instance ID from service discovery, but its not needed for proxy routing,
 	// so it can be empty and will be filled after first sync.
-	i := &Instance{
-		uniqueIdentifier:  sd.UniqueIdentifier,
-		serviceInstanceID: sd.InstanceID,
-		NodeID:            sd.NodeID,
-		ClusterID:         clusterID,
-		LocalIPAddress:    sd.LocalIPAddress,
-
-		client: client,
-		mutex:  sync.RWMutex{},
-	}
+	i := instanceFrom(clusterID, sd, client)
 
 	err = i.Sync(ctx)
 	if err != nil {

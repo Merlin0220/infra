@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/launchdarkly/go-sdk-common/v3/ldlog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -25,6 +27,8 @@ import (
 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
 	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	redis_utils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
@@ -170,6 +174,65 @@ func TestValidateNetworkConfig(t *testing.T) {
 			name:    "empty network config is valid",
 			network: &api.SandboxNetworkConfig{},
 			wantErr: false,
+		},
+		{
+			name: "valid HTTPS ports",
+			network: &api.SandboxNetworkConfig{
+				HttpsPorts: &[]uint32{443, 8443},
+			},
+			wantErr: false,
+		},
+		{
+			name: "too many HTTPS ports",
+			network: &api.SandboxNetworkConfig{
+				HttpsPorts: func() *[]uint32 {
+					ports := make([]uint32, maxHTTPSPorts+1)
+					for i := range ports {
+						ports[i] = uint32(i + 1)
+					}
+
+					return &ports
+				}(),
+			},
+			wantErr:    true,
+			wantCode:   http.StatusBadRequest,
+			wantErrMsg: fmt.Sprintf("HTTPS ports can have at most %d entries.", maxHTTPSPorts),
+		},
+		{
+			name: "duplicate HTTPS port is invalid",
+			network: &api.SandboxNetworkConfig{
+				HttpsPorts: &[]uint32{443, 443},
+			},
+			wantErr:    true,
+			wantCode:   http.StatusBadRequest,
+			wantErrMsg: "HTTPS port 443 is specified more than once.",
+		},
+		{
+			name: "zero HTTPS port is invalid",
+			network: &api.SandboxNetworkConfig{
+				HttpsPorts: &[]uint32{0},
+			},
+			wantErr:    true,
+			wantCode:   http.StatusBadRequest,
+			wantErrMsg: "HTTPS port must be between 1 and 65535: 0",
+		},
+		{
+			name: "out-of-range HTTPS port is invalid",
+			network: &api.SandboxNetworkConfig{
+				HttpsPorts: &[]uint32{65536},
+			},
+			wantErr:    true,
+			wantCode:   http.StatusBadRequest,
+			wantErrMsg: "HTTPS port must be between 1 and 65535: 65536",
+		},
+		{
+			name: "envd HTTPS port is invalid",
+			network: &api.SandboxNetworkConfig{
+				HttpsPorts: &[]uint32{uint32(consts.DefaultEnvdServerPort)},
+			},
+			wantErr:    true,
+			wantCode:   http.StatusBadRequest,
+			wantErrMsg: fmt.Sprintf("HTTPS backend routing is not supported for reserved port %d", consts.DefaultEnvdServerPort),
 		},
 		{
 			name: "valid deny_out with CIDR",
@@ -345,7 +408,7 @@ func TestValidateNetworkConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			mockFF := handlersmocks.NewMockFeatureFlagsClient(t)
-			err := validateNetworkConfig(t.Context(), mockFF, uuid.Nil, "", tt.network)
+			err := validateNetworkConfig(t.Context(), mockFF, uuid.Nil, "", 10, tt.network)
 
 			if tt.wantErr {
 				if err == nil {
@@ -366,6 +429,19 @@ func TestValidateNetworkConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDBNetworkConfigToAPIHTTPSPorts(t *testing.T) {
+	t.Parallel()
+
+	httpsPorts := []uint32{443, 8443}
+	result := dbNetworkConfigToAPI(&dbtypes.SandboxNetworkConfig{
+		Ingress: &dbtypes.SandboxNetworkIngressConfig{HTTPSPorts: httpsPorts},
+	})
+
+	require.NotNil(t, result)
+	require.NotNil(t, result.HttpsPorts)
+	assert.Equal(t, httpsPorts, *result.HttpsPorts)
 }
 
 func TestOrchestrator_convertVolumeMounts(t *testing.T) {
@@ -573,6 +649,136 @@ func TestOrchestrator_convertVolumeMounts(t *testing.T) {
 			{Id: dbVolume.ID.String(), Name: "vol1", Path: "/vol1", Type: "local"},
 		}, actual)
 	})
+}
+
+func TestNewSandboxFromV2(t *testing.T) {
+	t.Parallel()
+
+	t.Run("v2 request has every NewSandbox field except secure", func(t *testing.T) {
+		t.Parallel()
+
+		v1Fields := map[string]reflect.Type{}
+		for f := range reflect.TypeFor[api.NewSandbox]().Fields() {
+			v1Fields[f.Name] = f.Type
+		}
+		delete(v1Fields, "Secure")
+
+		v2Fields := map[string]reflect.Type{}
+		for f := range reflect.TypeFor[api.NewSandboxV2]().Fields() {
+			v2Fields[f.Name] = f.Type
+		}
+
+		assert.Equal(t, v1Fields, v2Fields)
+	})
+
+	t.Run("forces secure and copies every field", func(t *testing.T) {
+		t.Parallel()
+
+		timeout := int32(60)
+		autoPause := true
+		autoPauseMemory := false
+		allowInternet := false
+		allowPublicTraffic := false
+
+		v2 := api.NewSandboxV2{
+			TemplateID:          "base",
+			Timeout:             &timeout,
+			AutoPause:           &autoPause,
+			AutoPauseMemory:     &autoPauseMemory,
+			AutoResume:          &api.SandboxAutoResumeConfig{Enabled: true},
+			AllowInternetAccess: &allowInternet,
+			Network:             &api.SandboxNetworkConfig{AllowPublicTraffic: &allowPublicTraffic},
+			Metadata:            &api.SandboxMetadata{"k": "v"},
+			EnvVars:             &api.EnvVars{"A": "1"},
+			Mcp:                 &api.Mcp{},
+			Iam:                 &api.SandboxIam{},
+			VolumeMounts:        &[]api.SandboxVolumeMount{{Name: "vol", Path: "/vol"}},
+		}
+
+		got := newSandboxFromV2(v2)
+
+		require.NotNil(t, got.Secure)
+		assert.True(t, *got.Secure)
+
+		got.Secure = nil
+		var want api.NewSandbox
+		raw, err := json.Marshal(v2)
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(raw, &want))
+		assert.Equal(t, want, got)
+	})
+}
+
+func TestPostSandboxes_AlwaysRequiresSecureCapableTemplate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		secure *bool
+	}{
+		{name: "secure omitted"},
+		{name: "secure false", secure: new(false)},
+		{name: "secure true", secure: new(true)},
+	}
+
+	db := testutils.SetupDatabase(t)
+	redis := redis_utils.SetupInstance(t)
+	ctx := t.Context()
+
+	teamID := testutils.CreateTestTeam(t, db)
+	teamSlug := testutils.GetTeamSlug(t, ctx, db, teamID)
+
+	flags, err := featureflags.NewClientWithLogLevel("", "", "", ldlog.Error)
+	require.NoError(t, err)
+
+	store := &APIStore{
+		templateCache: templatecache.NewTemplateCache(db.SqlcClient, redis),
+		featureFlags:  flags,
+	}
+	t.Cleanup(func() {
+		require.NoError(t, store.templateCache.Close(ctx))
+	})
+
+	alias := "secure-access-required"
+	templateID := createTestTemplate(ctx, t, db, teamID)
+	createTestTemplateAliasWithName(ctx, t, db, templateID, alias, &teamSlug)
+	buildID := testutils.CreateTestBuild(t, ctx, db, templateID, "ready")
+	testutils.CreateTestBuildAssignment(t, ctx, db, templateID, buildID, id.DefaultTag)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+
+			body, err := json.Marshal(api.PostSandboxesJSONRequestBody{
+				TemplateID: id.WithNamespace(teamSlug, alias),
+				Secure:     tt.secure,
+			})
+			require.NoError(t, err)
+
+			ginCtx.Request = httptest.NewRequestWithContext(ctx, http.MethodPost, "/sandboxes", bytes.NewReader(body))
+			ginCtx.Request.Header.Set("Content-Type", "application/json")
+			auth.SetTeamInfoForTest(t, ginCtx, &authtypes.Team{
+				Team: &authqueries.Team{
+					ID:   teamID,
+					Slug: teamSlug,
+				},
+				Limits: &authtypes.TeamLimits{MaxLengthHours: 24},
+			})
+
+			//nolint:contextcheck // handler reads ctx from ginCtx.Request.Context().
+			store.PostSandboxes(ginCtx)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code)
+
+			var apiErr api.Error
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &apiErr))
+			assert.Equal(t, int32(http.StatusBadRequest), apiErr.Code)
+			assert.Equal(t, "You need to re-build template to allow using secured access. Please visit https://e2b.dev/docs/sandbox/secured-access for more information.", apiErr.Message)
+		})
+	}
 }
 
 func TestPostSandboxes_MissingTagDisclosure(t *testing.T) {
@@ -882,10 +1088,39 @@ func markerRun(from, count int) string {
 	return builder.String()
 }
 
+func TestAPIRulesToDBRulesNormalizesDomains(t *testing.T) {
+	t.Parallel()
+
+	rules := map[string][]api.SandboxNetworkRule{
+		"API.Example.COM": {simpleRule(map[string]string{"X-Exact": "value"})},
+		"*.GitHub.COM":    {simpleRule(map[string]string{"X-Test": "value"})},
+	}
+
+	dbRules := apiRulesToDBRules(&rules)
+	require.NotContains(t, dbRules, "API.Example.COM")
+	require.Contains(t, dbRules, "api.example.com")
+	require.Len(t, dbRules["api.example.com"], 1)
+	assert.Equal(t, "value", dbRules["api.example.com"][0].Transform.Headers["X-Exact"])
+	require.NotContains(t, dbRules, "*.GitHub.COM")
+	require.Contains(t, dbRules, "*.github.com")
+	require.Len(t, dbRules["*.github.com"], 1)
+	assert.Equal(t, "value", dbRules["*.github.com"][0].Transform.Headers["X-Test"])
+}
+
 func TestValidateNetworkRules(t *testing.T) {
 	t.Parallel()
 
 	teamID := uuid.New()
+	const defaultMaxDomains = 10
+
+	rulesWithDomains := func(count int) *map[string][]api.SandboxNetworkRule {
+		rules := make(map[string][]api.SandboxNetworkRule, count)
+		for i := range count {
+			rules[fmt.Sprintf("domain%d.example.com", i)] = nil
+		}
+
+		return &rules
+	}
 
 	tests := []struct {
 		name        string
@@ -940,32 +1175,18 @@ func TestValidateNetworkRules(t *testing.T) {
 		},
 		// ── domain count ─────────────────────────────────────────────────────────
 		{
-			name: "exactly max domains is valid",
-			rules: func() *map[string][]api.SandboxNetworkRule {
-				m := make(map[string][]api.SandboxNetworkRule, maxNetworkRuleDomains)
-				for i := range maxNetworkRuleDomains {
-					m[fmt.Sprintf("domain%d.example.com", i)] = nil
-				}
-
-				return &m
-			}(),
+			name:        "exactly max domains is valid",
+			rules:       rulesWithDomains(defaultMaxDomains),
 			envdVersion: minEnvdVersionForNetworkRules,
 			setupFF:     ffEnabled,
 		},
 		{
-			name: "one over max domains returns 400",
-			rules: func() *map[string][]api.SandboxNetworkRule {
-				m := make(map[string][]api.SandboxNetworkRule, maxNetworkRuleDomains+1)
-				for i := range maxNetworkRuleDomains + 1 {
-					m[fmt.Sprintf("domain%d.example.com", i)] = nil
-				}
-
-				return &m
-			}(),
+			name:        "one over max domains returns 400",
+			rules:       rulesWithDomains(defaultMaxDomains + 1),
 			envdVersion: minEnvdVersionForNetworkRules,
 			setupFF:     ffEnabled,
 			wantCode:    http.StatusBadRequest,
-			wantMsg:     fmt.Sprintf("at most %d domains", maxNetworkRuleDomains),
+			wantMsg:     fmt.Sprintf("at most %d domains", defaultMaxDomains),
 		},
 		// ── domain key validation ─────────────────────────────────────────────────
 		{
@@ -999,20 +1220,143 @@ func TestValidateNetworkRules(t *testing.T) {
 			setupFF:     ffEnabled,
 		},
 		{
-			name:        "wildcard domain is rejected",
+			name:        "wildcard domain is accepted",
 			envdVersion: minEnvdVersionForNetworkRules,
-			rules:       new(map[string][]api.SandboxNetworkRule{"*.openai.com": {}}),
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.github.com": {}}),
+			setupFF:     ffEnabled,
+		},
+		{
+			name:        "uppercase wildcard domain is accepted",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.GitHub.COM": {}}),
+			setupFF:     ffEnabled,
+		},
+		{
+			name:        "exact and wildcard domains are accepted together",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules: new(map[string][]api.SandboxNetworkRule{
+				"api.github.com": {},
+				"*.github.com":   {},
+			}),
+			setupFF: ffEnabled,
+		},
+		{
+			name:        "top-level wildcard is accepted",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.com": {}}),
+			setupFF:     ffEnabled,
+		},
+		{
+			name:        "country-code public suffix wildcard is accepted",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.co.uk": {}}),
+			setupFF:     ffEnabled,
+		},
+		{
+			name:        "private public suffix wildcard is accepted",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.github.io": {}}),
+			setupFF:     ffEnabled,
+		},
+		{
+			name:        "shared service wildcard is accepted",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.s3.amazonaws.com": {}}),
+			setupFF:     ffEnabled,
+		},
+		{
+			name:        "internal wildcard is accepted",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.internal": {}}),
+			setupFF:     ffEnabled,
+		},
+		{
+			name:        "bare wildcard is rejected",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*": {}}),
 			setupFF:     ffEnabled,
 			wantCode:    http.StatusBadRequest,
 			wantMsg:     "not a valid domain name",
 		},
 		{
-			name:        "bare wildcard is rejected",
+			name:        "wildcard without a suffix is rejected",
 			envdVersion: minEnvdVersionForNetworkRules,
 			rules:       new(map[string][]api.SandboxNetworkRule{"*.": {}}),
 			setupFF:     ffEnabled,
 			wantCode:    http.StatusBadRequest,
 			wantMsg:     "not a valid domain name",
+		},
+		{
+			name:        "embedded wildcard is rejected",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"api.*.example.com": {}}),
+			setupFF:     ffEnabled,
+			wantCode:    http.StatusBadRequest,
+			wantMsg:     "not a valid domain name",
+		},
+		{
+			name:        "repeated wildcard is rejected",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.*.example.com": {}}),
+			setupFF:     ffEnabled,
+			wantCode:    http.StatusBadRequest,
+			wantMsg:     "not a valid domain name",
+		},
+		{
+			name:        "non-ASCII wildcard is rejected",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.münich.example": {}}),
+			setupFF:     ffEnabled,
+			wantCode:    http.StatusBadRequest,
+			wantMsg:     "not a valid domain name",
+		},
+		{
+			name:        "trailing-dot wildcard is rejected",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules:       new(map[string][]api.SandboxNetworkRule{"*.github.com.": {}}),
+			setupFF:     ffEnabled,
+			wantCode:    http.StatusBadRequest,
+			wantMsg:     "not a valid domain name",
+		},
+		{
+			name:        "case-insensitive exact duplicates are rejected",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules: new(map[string][]api.SandboxNetworkRule{
+				"api.example.com": {},
+				"API.EXAMPLE.COM": {},
+			}),
+			setupFF:  ffEnabled,
+			wantCode: http.StatusBadRequest,
+			wantMsg:  "unique ignoring case",
+		},
+		{
+			name:        "case-insensitive wildcard duplicates are rejected",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules: new(map[string][]api.SandboxNetworkRule{
+				"*.example.com": {},
+				"*.EXAMPLE.COM": {},
+			}),
+			setupFF:  ffEnabled,
+			wantCode: http.StatusBadRequest,
+			wantMsg:  "unique ignoring case",
+		},
+		{
+			name:        "wildcard domain at full key limit is accepted",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules: new(map[string][]api.SandboxNetworkRule{
+				"*." + strings.Repeat("a", 63) + "." + strings.Repeat("b", 58) + ".com": {},
+			}),
+			setupFF: ffEnabled,
+		},
+		{
+			name:        "wildcard domain over full key limit is rejected",
+			envdVersion: minEnvdVersionForNetworkRules,
+			rules: new(map[string][]api.SandboxNetworkRule{
+				"*." + strings.Repeat("a", 63) + "." + strings.Repeat("b", 59) + ".com": {},
+			}),
+			setupFF:  ffEnabled,
+			wantCode: http.StatusBadRequest,
+			wantMsg:  "maximum length",
 		},
 		// ── transform count ───────────────────────────────────────────────────────
 		{
@@ -1150,7 +1494,7 @@ func TestValidateNetworkRules(t *testing.T) {
 			t.Parallel()
 
 			ff := tt.setupFF(t)
-			apiErr := validateNetworkRules(t.Context(), ff, teamID, tt.envdVersion, tt.rules)
+			apiErr := validateNetworkRules(t.Context(), ff, teamID, tt.envdVersion, defaultMaxDomains, tt.rules)
 
 			if tt.wantMsg == "" {
 				assert.Nil(t, apiErr)
@@ -1168,6 +1512,8 @@ func TestValidateNetworkRules(t *testing.T) {
 			}
 		})
 	}
+
+	assert.Nil(t, validateNetworkRules(t.Context(), ffEnabled(t), teamID, minEnvdVersionForNetworkRules, defaultMaxDomains+1, rulesWithDomains(defaultMaxDomains+1)), "custom max domains should override the boundary")
 }
 
 func createTestTemplateAliasWithName(ctx context.Context, t *testing.T, db *testutils.Database, templateID, aliasName string, namespace *string) {

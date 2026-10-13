@@ -7,10 +7,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/launchdarkly/go-sdk-common/v3/ldvalue"
 	"github.com/launchdarkly/go-server-sdk/v7/testhelpers/ldtestdata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
@@ -20,11 +23,14 @@ import (
 	sandboxredis "github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/redis"
 	teamtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
 	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
+	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
 	redis_utils "github.com/e2b-dev/infra/packages/shared/pkg/redis"
-	e2bcatalog "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-catalog"
+	sandbox_network "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-network"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
 // testBuild returns a minimal queries.EnvBuild that satisfies CreateSandbox.
@@ -48,6 +54,14 @@ func testBuild() queries.EnvBuild {
 func newCreateSandboxTestOrchestrator(t *testing.T, nodeOpts ...nodemanager.TestOptions) *Orchestrator {
 	t.Helper()
 
+	return newCreateSandboxTestOrchestratorWithFlags(t, ldtestdata.DataSource(), nodeOpts...)
+}
+
+// newCreateSandboxTestOrchestratorWithFlags is newCreateSandboxTestOrchestrator
+// with a caller-supplied flag source, for tests that drive a feature flag.
+func newCreateSandboxTestOrchestratorWithFlags(t *testing.T, flagSource *ldtestdata.TestDataSource, nodeOpts ...nodemanager.TestOptions) *Orchestrator {
+	t.Helper()
+
 	client := redis_utils.SetupInstance(t)
 	storage, err := sandboxredis.NewStorage(client, noop.NewMeterProvider(), nil)
 	require.NoError(t, err)
@@ -58,7 +72,6 @@ func newCreateSandboxTestOrchestrator(t *testing.T, nodeOpts ...nodemanager.Test
 		storage,
 		redisreservations.NewReservationStorage(client, storage.Notifier()),
 		sandbox.Callbacks{
-			AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) {},
 			AsyncNewlyCreatedSandbox: func(context.Context, sandbox.Sandbox, sandbox.CreationMetadata) {},
 		},
 	)
@@ -66,7 +79,7 @@ func newCreateSandboxTestOrchestrator(t *testing.T, nodeOpts ...nodemanager.Test
 	meter := noop.NewMeterProvider().Meter("github.com/e2b-dev/infra/packages/api/internal/orchestrator")
 	counter, _ := meter.Int64Counter("test-created-sandboxes")
 
-	ffClient, ffErr := featureflags.NewClientWithDatasource(ldtestdata.DataSource())
+	ffClient, ffErr := featureflags.NewClientWithDatasource(flagSource)
 	require.NoError(t, ffErr)
 
 	algo := placement.NewBestOfK(placement.DefaultBestOfKConfig()).(*placement.BestOfK)
@@ -80,7 +93,6 @@ func newCreateSandboxTestOrchestrator(t *testing.T, nodeOpts ...nodemanager.Test
 		placementAlgorithm:      algo,
 		featureFlagsClient:      ffClient,
 		createdSandboxesCounter: counter,
-		routingCatalog:          e2bcatalog.NewRedisSandboxCatalog(client),
 	}
 
 	o.registerNode(node)
@@ -99,6 +111,93 @@ func testTeam() *teamtypes.Team {
 			MaxLengthHours:     24,
 		},
 	}
+}
+
+func TestBuildEgressConfigPreservesWildcardRuleKey(t *testing.T) {
+	t.Parallel()
+
+	const domain = "*.github.com"
+	config := buildEgressConfig(nil, nil, map[string][]dbtypes.SandboxNetworkRule{
+		domain: {{Transform: &dbtypes.SandboxNetworkTransform{Headers: map[string]string{"X-Test": "value"}}}},
+	})
+
+	rules, ok := config.GetRules()[domain]
+	require.True(t, ok)
+	require.Len(t, rules.GetRules(), 1)
+	assert.Equal(t, "value", rules.GetRules()[0].GetTransform().GetHeaders()["X-Test"])
+}
+
+// The TLS block has to survive validated config -> stored form -> wire. A
+// field-by-field copy that misses a hop leaves the API accepting TLS while the
+// orchestrator dials in the clear.
+func TestEgressProxyTLSRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	t.Run("enabled block reaches the wire", func(t *testing.T) {
+		t.Parallel()
+
+		stored := &dbtypes.SandboxNetworkEgressConfig{}
+		ApplyValidatedEgressProxy(stored, &sandbox_network.EgressProxyConfig{
+			Address:  "proxy.example.com:1080",
+			Username: "alice",
+			Password: "s3cret",
+			TLS: &sandbox_network.EgressProxyTLSConfig{
+				Enabled:    true,
+				ServerName: "cert-name.test",
+				CACert:     "-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----",
+			},
+		})
+
+		require.NotNil(t, stored.EgressProxyTLS, "stored config must keep the TLS block")
+		assert.True(t, stored.EgressProxyTLS.Enabled)
+
+		wire := buildNetworkConfig(&dbtypes.SandboxNetworkConfig{Egress: stored}, nil, nil)
+		proxyTLS := wire.GetEgress().GetEgressProxyTls()
+
+		require.NotNil(t, proxyTLS, "the orchestrator must be told the hop is TLS")
+		assert.True(t, proxyTLS.GetEnabled())
+		assert.Equal(t, "cert-name.test", proxyTLS.GetServerName())
+		assert.Equal(t, stored.EgressProxyTLS.CACert, string(proxyTLS.GetCaCert()))
+	})
+
+	t.Run("proxy without TLS stays plaintext", func(t *testing.T) {
+		t.Parallel()
+
+		stored := &dbtypes.SandboxNetworkEgressConfig{}
+		ApplyValidatedEgressProxy(stored, &sandbox_network.EgressProxyConfig{
+			Address: "proxy.example.com:1080",
+		})
+
+		assert.Nil(t, stored.EgressProxyTLS)
+
+		wire := buildNetworkConfig(&dbtypes.SandboxNetworkConfig{Egress: stored}, nil, nil)
+		assert.Nil(t, wire.GetEgress().GetEgressProxyTls(),
+			"an existing BYOP config must not acquire TLS it never asked for")
+		assert.Equal(t, "proxy.example.com:1080", wire.GetEgress().GetEgressProxyAddress())
+	})
+
+	t.Run("nil config clears the proxy", func(t *testing.T) {
+		t.Parallel()
+
+		// A PUT that omits egressProxy arrives as a fresh config and a nil
+		// source.
+		stored := &dbtypes.SandboxNetworkEgressConfig{}
+		ApplyValidatedEgressProxy(stored, nil)
+
+		assert.Empty(t, stored.EgressProxyAddress)
+		assert.Nil(t, stored.EgressProxyTLS)
+	})
+}
+
+func TestBuildNetworkConfigHTTPSPorts(t *testing.T) {
+	t.Parallel()
+
+	httpsPorts := []uint32{443, 8443}
+	network := buildNetworkConfig(&dbtypes.SandboxNetworkConfig{
+		Ingress: &dbtypes.SandboxNetworkIngressConfig{HTTPSPorts: httpsPorts},
+	}, nil, nil)
+
+	assert.Equal(t, httpsPorts, network.GetIngress().GetHttpsPorts())
 }
 
 // TestCreateSandbox_StaleDataAfterConcurrentPause exercises CreateSandbox with
@@ -287,4 +386,269 @@ func TestCreateSandbox_UnconfirmedFilesystemBootFailsLoud(t *testing.T) {
 
 		assert.Nil(t, apiErr)
 	})
+}
+
+// TestCreateSandbox_StoresResolvedFirecrackerVersion pins the mechanism the
+// version gates are built on: when the orchestrator echoes the resolved
+// Firecracker version on the create response, the sandbox record must carry
+// THAT value (marked resolved) — a regression that silently kept the declared
+// build version would put the gates back to approximating. A node that
+// predates the echo keeps the declared version, unmarked.
+func TestCreateSandbox_StoresResolvedFirecrackerVersion(t *testing.T) {
+	t.Parallel()
+
+	fetcher := func(build queries.EnvBuild) SandboxDataFetcher {
+		return func(_ context.Context) (SandboxMetadata, *api.APIError) {
+			return SandboxMetadata{TemplateID: "tpl", BaseTemplateID: "base-tpl", Build: build}, nil
+		}
+	}
+
+	t.Run("echoing node: record carries the resolved version", func(t *testing.T) {
+		t.Parallel()
+
+		o := newCreateSandboxTestOrchestrator(t)
+		team := testTeam()
+		now := time.Now()
+		build := testBuild()
+
+		sbx, apiErr := o.CreateSandbox(t.Context(), "sbx-fcv-"+uuid.New().String()[:8], uuid.New().String(), team,
+			fetcher(build), now, now.Add(time.Hour), time.Hour, true, false, sandbox.CreationMetadata{IsResume: true})
+		require.Nil(t, apiErr)
+
+		assert.Equal(t, nodemanager.MockResolvedFirecrackerVersion, sbx.FirecrackerVersion,
+			"the record must store the orchestrator's echo, not the declared build version")
+		assert.NotEqual(t, build.FirecrackerVersion, sbx.FirecrackerVersion,
+			"the mock echo is deliberately distinct from the declared version")
+		assert.True(t, sbx.FirecrackerVersionResolved)
+	})
+
+	t.Run("legacy node without echo: declared version, unmarked", func(t *testing.T) {
+		t.Parallel()
+
+		o := newCreateSandboxTestOrchestrator(t, nodemanager.WithLegacySandboxClient())
+		team := testTeam()
+		now := time.Now()
+		build := testBuild()
+
+		sbx, apiErr := o.CreateSandbox(t.Context(), "sbx-fcv-"+uuid.New().String()[:8], uuid.New().String(), team,
+			fetcher(build), now, now.Add(time.Hour), time.Hour, true, false, sandbox.CreationMetadata{IsResume: true})
+		require.Nil(t, apiErr)
+
+		assert.Equal(t, build.FirecrackerVersion, sbx.FirecrackerVersion)
+		assert.False(t, sbx.FirecrackerVersionResolved)
+	})
+}
+
+// buildOnCPU returns testBuild() recorded as having been built on cpuModel.
+func buildOnCPU(cpuModel string) queries.EnvBuild {
+	build := testBuild()
+	arch, family := "x86_64", "6"
+	build.CpuArchitecture = &arch
+	build.CpuFamily = &family
+	build.CpuModel = &cpuModel
+
+	return build
+}
+
+// fsOnlyPinFlagSource serves fs-only-resume-cpu-model as cpuModel.
+func fsOnlyPinFlagSource(cpuModel string) *ldtestdata.TestDataSource {
+	source := ldtestdata.DataSource()
+	source.Update(source.Flag("fs-only-resume-cpu-model").ValueForAll(ldvalue.String(cpuModel)))
+
+	return source
+}
+
+// Only a resume is pinned to the node its snapshot was taken on. A start that
+// names that node but is not a resume (a fork) is placed by load, so the forks
+// of one sandbox are not all sent to the original's node.
+func TestCreateSandbox_NodeAffinityOnlyForResume(t *testing.T) {
+	t.Parallel()
+
+	fromSnapshotOn := func(nodeID string) SandboxDataFetcher {
+		return func(_ context.Context) (SandboxMetadata, *api.APIError) {
+			return SandboxMetadata{
+				TemplateID:     "tpl",
+				BaseTemplateID: "base-tpl",
+				Build:          testBuild(),
+				NodeID:         &nodeID,
+			}, nil
+		}
+	}
+
+	tests := []struct {
+		name     string
+		isResume bool
+		wantNode string
+	}{
+		{"resume stays on the snapshot's node", true, "node-origin"},
+		{"fork is placed on the less loaded node", false, "node-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			o := newCreateSandboxTestOrchestrator(t)
+			// Loaded well past node-1, so best-of-K never prefers it.
+			origin := nodemanager.NewTestNode("node-origin", api.NodeStatusReady, 30, 8)
+			origin.ClusterID = uuid.Nil
+			o.registerNode(origin)
+			now := time.Now()
+
+			sbx, apiErr := o.CreateSandbox(t.Context(), "sbx-affinity-"+uuid.New().String()[:8], uuid.New().String(),
+				testTeam(), fromSnapshotOn(origin.ID),
+				now, now.Add(time.Hour), time.Hour, tt.isResume, false, sandbox.CreationMetadata{IsResume: tt.isResume})
+
+			require.Nil(t, apiErr)
+			assert.Equal(t, tt.wantNode, sbx.NodeID)
+		})
+	}
+}
+
+// A filesystem-only snapshot is held to its build's CPU model, so the
+// cross-generation upgrade a memory restore may take is withheld from it. The
+// pin has to beat snapshot node affinity too: the origin node reaches placement
+// as the preferred node, which otherwise skips the CPU filter.
+func TestCreateSandbox_FilesystemOnlySnapshotPinsCPUModel(t *testing.T) {
+	t.Parallel()
+
+	resumeFetcher := func(nodeID string, filesystemOnly bool) SandboxDataFetcher {
+		return func(_ context.Context) (SandboxMetadata, *api.APIError) {
+			return SandboxMetadata{
+				TemplateID:             "tpl",
+				BaseTemplateID:         "base-tpl",
+				Build:                  buildOnCPU(machineinfo.IceLakeModel),
+				NodeID:                 &nodeID,
+				FilesystemOnlySnapshot: filesystemOnly,
+			}, nil
+		}
+	}
+
+	tests := []struct {
+		name string
+		// nil exercises the flag's own default rather than an injected value.
+		pinnedModel    *string
+		nodeCPUModel   string
+		filesystemOnly bool
+		wantErrCode    string
+	}{
+		{"fs-only, pinned to n2: n4 node refused", new(machineinfo.IceLakeModel), machineinfo.EmeraldRapidsModel, true, errCodeNoCompatibleNode},
+		{"fs-only, empty pin: n4 node accepted", new(""), machineinfo.EmeraldRapidsModel, true, ""},
+		{"memory snapshot, pinned to n2: n4 node accepted", new(machineinfo.IceLakeModel), machineinfo.EmeraldRapidsModel, false, ""},
+		{"fs-only, pinned to n2, n2 node: affinity kept", new(machineinfo.IceLakeModel), machineinfo.IceLakeModel, true, ""},
+		// A deployment with no LaunchDarkly must place as it did before the pin
+		// existed, not strand every filesystem-only resume on a compiled default.
+		{"fs-only, no flag rule: unpinned", nil, machineinfo.EmeraldRapidsModel, true, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			flagSource := ldtestdata.DataSource()
+			if tt.pinnedModel != nil {
+				flagSource = fsOnlyPinFlagSource(*tt.pinnedModel)
+			}
+
+			o := newCreateSandboxTestOrchestratorWithFlags(t, flagSource,
+				nodemanager.WithCPUInfo("x86_64", "6", tt.nodeCPUModel))
+			now := time.Now()
+
+			_, apiErr := o.CreateSandbox(t.Context(), "sbx-pin-"+uuid.New().String()[:8], uuid.New().String(),
+				testTeam(), resumeFetcher("node-1", tt.filesystemOnly),
+				now, now.Add(time.Hour), time.Hour, true, false, sandbox.CreationMetadata{IsResume: true})
+
+			if tt.wantErrCode == "" {
+				assert.Nil(t, apiErr)
+
+				return
+			}
+
+			require.NotNil(t, apiErr)
+			assert.Equal(t, tt.wantErrCode, apiErr.ErrorCode)
+			assert.Equal(t, http.StatusServiceUnavailable, apiErr.Code)
+		})
+	}
+}
+
+// A build predating CPU recording is still subject to the pin: the pin matches
+// on what the node reports, so there is no build machine info to exempt it.
+func TestCreateSandbox_FilesystemOnlySnapshotWithoutBuildCPUStillPinned(t *testing.T) {
+	t.Parallel()
+
+	resume := func(nodeID string) SandboxDataFetcher {
+		return func(_ context.Context) (SandboxMetadata, *api.APIError) {
+			return SandboxMetadata{
+				TemplateID:             "tpl",
+				BaseTemplateID:         "base-tpl",
+				Build:                  testBuild(), // no CPU columns recorded
+				NodeID:                 &nodeID,
+				FilesystemOnlySnapshot: true,
+			}, nil
+		}
+	}
+
+	tests := []struct {
+		name         string
+		nodeCPUModel string
+		wantErrCode  string
+	}{
+		{"node reports the pinned model", machineinfo.IceLakeModel, ""},
+		{"node reports another model", machineinfo.EmeraldRapidsModel, errCodeNoCompatibleNode},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			o := newCreateSandboxTestOrchestratorWithFlags(t, fsOnlyPinFlagSource(machineinfo.IceLakeModel),
+				nodemanager.WithCPUInfo("x86_64", "6", tt.nodeCPUModel))
+			now := time.Now()
+
+			_, apiErr := o.CreateSandbox(t.Context(), "sbx-nocpu-"+uuid.New().String()[:8], uuid.New().String(),
+				testTeam(), resume("node-1"),
+				now, now.Add(time.Hour), time.Hour, true, false, sandbox.CreationMetadata{IsResume: true})
+
+			if tt.wantErrCode == "" {
+				assert.Nil(t, apiErr)
+
+				return
+			}
+
+			require.NotNil(t, apiErr)
+			assert.Equal(t, tt.wantErrCode, apiErr.ErrorCode)
+		})
+	}
+}
+
+func TestCreateSandbox_CreatedCounterCarriesTeam(t *testing.T) {
+	t.Parallel()
+
+	o := newCreateSandboxTestOrchestrator(t)
+	reader := sdkmetric.NewManualReader()
+	counter, err := telemetry.GetCounter(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("github.com/e2b-dev/infra/packages/api/internal/orchestrator"), telemetry.ApiOrchestratorCreatedSandboxes)
+	require.NoError(t, err)
+	o.createdSandboxesCounter = counter
+
+	team := testTeam()
+	now := time.Now()
+	build := testBuild()
+	fetcher := func(_ context.Context) (SandboxMetadata, *api.APIError) {
+		return SandboxMetadata{TemplateID: "tpl", BaseTemplateID: "base-tpl", Build: build}, nil
+	}
+
+	_, apiErr := o.CreateSandbox(t.Context(), "sbx-team-"+uuid.New().String()[:8], uuid.New().String(), team,
+		fetcher, now, now.Add(time.Hour), time.Hour, true, false, sandbox.CreationMetadata{})
+	require.Nil(t, apiErr)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	require.Len(t, rm.ScopeMetrics, 1)
+	require.Len(t, rm.ScopeMetrics[0].Metrics, 1)
+	sum, ok := rm.ScopeMetrics[0].Metrics[0].Data.(metricdata.Sum[int64])
+	require.True(t, ok)
+	require.Len(t, sum.DataPoints, 1)
+	teamID, ok := sum.DataPoints[0].Attributes.Value("team.id")
+	require.True(t, ok)
+	assert.Equal(t, team.ID.String(), teamID.AsString())
 }

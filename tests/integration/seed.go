@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,12 +22,12 @@ import (
 )
 
 type SeedData struct {
-	AccessToken string
-	APIKey      string
-	EnvID       string
-	BuildID     uuid.UUID
-	TeamID      uuid.UUID
-	UserID      uuid.UUID
+	APIKey  string
+	EnvID   string
+	BuildID uuid.UUID
+	TeamID  uuid.UUID
+	UserID  uuid.UUID
+	RAMMB   int
 }
 
 func main() {
@@ -64,13 +65,29 @@ func run(ctx context.Context) int {
 	}
 	defer authDb.Close()
 
+	// The build rows must declare the memory the template's memfile was
+	// actually built with: the VM sizes itself from the row, and a row
+	// larger than the memfile makes resumes read past its end. CI always
+	// sets the env (build-sandbox-template writes it to .env.test); the
+	// fallback matches the orchestrator Makefile's MEMORY_MB default so a
+	// local build-then-seed without the env stays consistent too.
+	ramMB := 256
+	if v := os.Getenv("TESTS_SANDBOX_RAM_MB"); v != "" {
+		ramMB, err = strconv.Atoi(v)
+		if err != nil {
+			log.Printf("Invalid TESTS_SANDBOX_RAM_MB %q: %v", v, err)
+
+			return 1
+		}
+	}
+
 	data := SeedData{
-		AccessToken: os.Getenv("TESTS_E2B_ACCESS_TOKEN"),
-		APIKey:      os.Getenv("TESTS_E2B_API_KEY"),
-		EnvID:       os.Getenv("TESTS_SANDBOX_TEMPLATE_ID"),
-		BuildID:     uuid.MustParse(os.Getenv("TESTS_SANDBOX_BUILD_ID")),
-		TeamID:      uuid.MustParse(os.Getenv("TESTS_SANDBOX_TEAM_ID")),
-		UserID:      uuid.MustParse(os.Getenv("TESTS_SANDBOX_USER_ID")),
+		APIKey:  os.Getenv("TESTS_E2B_API_KEY"),
+		EnvID:   os.Getenv("TESTS_SANDBOX_TEMPLATE_ID"),
+		BuildID: uuid.MustParse(os.Getenv("TESTS_SANDBOX_BUILD_ID")),
+		TeamID:  uuid.MustParse(os.Getenv("TESTS_SANDBOX_TEAM_ID")),
+		UserID:  uuid.MustParse(os.Getenv("TESTS_SANDBOX_USER_ID")),
+		RAMMB:   ramMB,
 	}
 
 	err = seed(ctx, db, authDb, data)
@@ -100,34 +117,6 @@ VALUES ($1, $2)
 	err = authdb.UpsertPublicUser(ctx, data.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to create public user: %w", err)
-	}
-
-	// Access token for legacy template build endpoints that do not support API key auth.
-	tokenWithoutPrefix := strings.TrimPrefix(data.AccessToken, keys.AccessTokenPrefix)
-	accessTokenBytes, err := hex.DecodeString(tokenWithoutPrefix)
-	if err != nil {
-		return fmt.Errorf("failed to decode access token: %w", err)
-	}
-
-	accessTokenHash := hasher.Hash(accessTokenBytes)
-
-	accessTokenMask, err := keys.MaskKey(keys.AccessTokenPrefix, tokenWithoutPrefix)
-	if err != nil {
-		return fmt.Errorf("failed to mask access token: %w", err)
-	}
-
-	_, err = authdb.CreateAccessToken(ctx, authqueries.CreateAccessTokenParams{
-		ID:                    uuid.New(),
-		UserID:                data.UserID,
-		AccessTokenHash:       accessTokenHash,
-		AccessTokenPrefix:     accessTokenMask.Prefix,
-		AccessTokenLength:     int32(accessTokenMask.ValueLength),
-		AccessTokenMaskPrefix: accessTokenMask.MaskedValuePrefix,
-		AccessTokenMaskSuffix: accessTokenMask.MaskedValueSuffix,
-		Name:                  "Integration Tests Access Token",
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create access token: %w", err)
 	}
 
 	// Team
@@ -218,29 +207,29 @@ VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, 'template')
 		if build.createdAt != nil {
 			err = db.TestsRawSQL(ctx, `
 INSERT INTO env_builds (
-	id, dockerfile, status, vcpu, ram_mb, free_disk_size_mb,
+	id, env_id, team_id, dockerfile, status, vcpu, ram_mb, free_disk_size_mb,
 	total_disk_size_mb, kernel_version, firecracker_version, envd_version,
 	cluster_node_id, version, created_at, updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
+) VALUES ($1, $14, $15, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
 `, build.id, "FROM e2bdev/base:latest", dbtypes.BuildStatusUploaded,
-				2, 512, 512, 1982, "vmlinux-6.1.158-c1a568c", "v1.14.1_431f1fc", pkg.Version,
-				"integration-test-node", templates.TemplateV1Version, build.createdAt)
+				2, data.RAMMB, 512, 1982, "vmlinux-6.1.158-c1a568c", "v1.14-0.2.0", pkg.Version,
+				"integration-test-node", templates.TemplateV2LatestVersion, build.createdAt, data.EnvID, data.TeamID)
 		} else {
 			err = db.TestsRawSQL(ctx, `
 INSERT INTO env_builds (
-	id, dockerfile, status, vcpu, ram_mb, free_disk_size_mb,
+	id, env_id, team_id, dockerfile, status, vcpu, ram_mb, free_disk_size_mb,
 	total_disk_size_mb, kernel_version, firecracker_version, envd_version,
 	cluster_node_id, version, updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
+) VALUES ($1, $13, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
 `, build.id, "FROM e2bdev/base:latest", dbtypes.BuildStatusUploaded,
-				2, 512, 512, 1982, "vmlinux-6.1.158-c1a568c", "v1.14.1_431f1fc", pkg.Version,
-				"integration-test-node", templates.TemplateV1Version)
+				2, data.RAMMB, 512, 1982, "vmlinux-6.1.158-c1a568c", "v1.14-0.2.0", pkg.Version,
+				"integration-test-node", templates.TemplateV2LatestVersion, data.EnvID, data.TeamID)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to create env build: %w", err)
 		}
 
-		// Create the build assignment (trigger will backfill env_id for backward compat)
+		// Create the build assignment
 		var assignmentCreatedAt *time.Time
 		if build.createdAt != nil {
 			assignmentCreatedAt = build.createdAt

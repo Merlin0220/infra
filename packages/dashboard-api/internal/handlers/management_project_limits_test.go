@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/e2b-dev/infra/packages/dashboard-api/internal/management"
 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
@@ -27,6 +28,7 @@ const validLimitsBody = `{
 	"concurrent_template_builds": 30,
 	"events_ttl_days": 14,
 	"default_free_disk_size_mb": 10240,
+	"api_team_rps_list": 60,
 	"max_disk_size_mb": 51200
 }`
 
@@ -36,23 +38,46 @@ const validLimitsBody = `{
 func TestUpsertProjectLimitsIsVisibleThroughTheView(t *testing.T) {
 	t.Parallel()
 
-	db := testutils.SetupDatabase(t)
-	teamID := testutils.CreateTestTeam(t, db)
-	store, auth := newLimitsStore(db)
+	for name, body := range map[string]string{
+		"legacy ceiling name":    validLimitsBody,
+		"canonical ceiling name": strings.Replace(validLimitsBody, `"max_disk_size_mb": 51200`, `"max_free_disk_size_mb": 51200`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	recorder := callUpsertProjectLimits(t, store, teamID, validLimitsBody)
-	require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+			db := testutils.SetupDatabase(t)
+			teamID := testutils.CreateTestTeam(t, db)
+			store, auth := newLimitsStore(db)
 
-	limits := readTeamLimits(t, db, teamID)
-	require.Equal(t, map[string]int64{
-		"max_length_hours": 12, "concurrent_sandboxes": 40, "concurrent_template_builds": 30,
-		"max_vcpu": 16, "max_ram_mb": 32768, "disk_mb": 20480, "events_ttl_days": 14,
-		"default_free_disk_size_mb": 10240, "max_disk_size_mb": 51200,
-	}, limits)
+			recorder := callUpsertProjectLimits(t, store, teamID, body)
+			require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
 
-	// Limits are cached with the team, so a push that skips this is invisible
-	// until the entry expires.
-	require.Equal(t, []uuid.UUID{teamID}, auth.invalidated)
+			limits := readTeamLimits(t, db, teamID)
+			require.Equal(t, map[string]int64{
+				"max_length_hours": 12, "concurrent_sandboxes": 40, "concurrent_template_builds": 30,
+				"max_vcpu": 16, "max_ram_mb": 32768, "disk_mb": 20480, "events_ttl_days": 14,
+				"default_free_disk_size_mb": 10240, "max_disk_size_mb": 51200,
+				"max_free_disk_size_mb": 51200,
+			}, limits)
+
+			var legacyCeiling, canonicalCeiling int64
+			require.NoError(t, db.SqlcClient.TestsRawSQLQuery(t.Context(), `
+				SELECT max_disk_size_mb, max_free_disk_size_mb
+				FROM public.project_limits WHERE team_id = $1
+			`, func(rows pgx.Rows) error {
+				rows.Next()
+
+				return rows.Scan(&legacyCeiling, &canonicalCeiling)
+			}, teamID))
+			require.EqualValues(t, 51200, legacyCeiling)
+			require.Equal(t, legacyCeiling, canonicalCeiling,
+				"the compatibility writer must store both ceiling names equally")
+
+			// Limits are cached with the team, so a push that skips this is invisible
+			// until the entry expires.
+			require.Equal(t, []uuid.UUID{teamID}, auth.invalidated)
+		})
+	}
 }
 
 // The revision decides which delivery writes, so a body without one is a caller
@@ -103,15 +128,61 @@ func TestUpsertProjectLimitsRejectsFreeDiskAboveTheCeiling(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 }
 
-func TestUpsertProjectLimitsRejectsAMalformedBody(t *testing.T) {
+func TestUpsertProjectLimitsCarriesTheListRateToTheView(t *testing.T) {
 	t.Parallel()
 
 	db := testutils.SetupDatabase(t)
 	teamID := testutils.CreateTestTeam(t, db)
 	store, _ := newLimitsStore(db)
 
-	recorder := callUpsertProjectLimits(t, store, teamID, `{"revision":`)
+	body := strings.Replace(validLimitsBody, `"api_team_rps_list": 60`, `"api_team_rps_list": 33`, 1)
+	recorder := callUpsertProjectLimits(t, store, teamID, body)
+	require.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+
+	var rate int64
+	require.NoError(t, db.SqlcClient.TestsRawSQLQuery(t.Context(),
+		"SELECT api_team_rps_list FROM public.team_limits WHERE id = $1",
+		func(rows pgx.Rows) error {
+			rows.Next()
+
+			return rows.Scan(&rate)
+		}, teamID))
+	require.EqualValues(t, 33, rate)
+}
+
+func TestUpsertProjectLimitsRejectsANegativeListRate(t *testing.T) {
+	t.Parallel()
+
+	db := testutils.SetupDatabase(t)
+	teamID := testutils.CreateTestTeam(t, db)
+	store, auth := newLimitsStore(db)
+
+	body := strings.Replace(validLimitsBody, `"api_team_rps_list": 60`, `"api_team_rps_list": -1`, 1)
+	recorder := callUpsertProjectLimits(t, store, teamID, body)
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Empty(t, auth.invalidated)
+}
+
+func TestUpsertProjectLimitsRejectsAMalformedBody(t *testing.T) {
+	t.Parallel()
+
+	for name, body := range map[string]string{
+		"malformed JSON":             `{"revision":`,
+		"conflicting ceiling names":  strings.Replace(validLimitsBody, `"max_disk_size_mb": 51200`, `"max_disk_size_mb": 51200, "max_free_disk_size_mb": 25600`, 1),
+		"missing both ceiling names": strings.Replace(validLimitsBody, `"max_disk_size_mb": 51200`, `"unrelated": 1`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			db := testutils.SetupDatabase(t)
+			teamID := testutils.CreateTestTeam(t, db)
+			store, auth := newLimitsStore(db)
+
+			recorder := callUpsertProjectLimits(t, store, teamID, body)
+			require.Equal(t, http.StatusBadRequest, recorder.Code)
+			require.Empty(t, auth.invalidated)
+		})
+	}
 }
 
 func newLimitsStore(db *testutils.Database) (*APIStore, *recordingCacheAuthService) {
@@ -120,7 +191,7 @@ func newLimitsStore(db *testutils.Database) (*APIStore, *recordingCacheAuthServi
 	return &APIStore{
 		db:                db.SqlcClient,
 		authService:       auth,
-		managementService: management.NewService(db.AuthDB, db.SqlcClient, auth),
+		managementService: management.NewService(db.AuthDB, db.SqlcClient, auth, noop.NewMeterProvider()),
 	}, auth
 }
 
@@ -155,7 +226,8 @@ func readTeamLimits(t *testing.T, db *testutils.Database, teamID uuid.UUID) map[
 			'disk_mb', disk_mb,
 			'events_ttl_days', events_ttl_days,
 			'default_free_disk_size_mb', default_free_disk_size_mb,
-			'max_disk_size_mb', max_disk_size_mb
+			'max_disk_size_mb', max_disk_size_mb,
+			'max_free_disk_size_mb', max_free_disk_size_mb
 		) FROM public.team_limits WHERE id = $1`,
 		func(r pgx.Rows) error {
 			r.Next()

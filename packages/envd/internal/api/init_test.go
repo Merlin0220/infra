@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/e2b-dev/infra/packages/envd/internal/execcontext"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/cgroups"
+	"github.com/e2b-dev/infra/packages/envd/internal/services/cpus"
 	"github.com/e2b-dev/infra/packages/envd/internal/utils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 )
@@ -139,9 +142,16 @@ func secureTokenPtr(s string) *SecureToken {
 type mockMMDSClient struct {
 	hash string
 	err  error
+	// onGet runs on every lookup, which sits between the /init lock and SetData in the
+	// handler; a test uses it to stop a handler there, or to end its request context there.
+	onGet func()
 }
 
 func (m *mockMMDSClient) GetAccessTokenHash(_ context.Context) (string, error) {
+	if m.onGet != nil {
+		m.onGet()
+	}
+
 	return m.hash, m.err
 }
 
@@ -150,7 +160,7 @@ func newTestAPI(accessToken *SecureToken, mmdsClient MMDSClient) *API {
 	defaults := &execcontext.Defaults{
 		EnvVars: utils.NewEnvVars(),
 	}
-	api := New(&logger, defaults, nil, false, cgroups.NewWorkloadFreezer(cgroups.NewNoopManager()))
+	api := New(&logger, defaults, nil, false, cgroups.NewWorkloadFreezer(cgroups.NewNoopManager()), nil, cpus.NewNoopManager(), nil)
 	if accessToken != nil {
 		api.accessToken.TakeFrom(accessToken)
 	}
@@ -602,6 +612,8 @@ type fakeCgroupManager struct {
 	mu               sync.Mutex
 	frozen           []cgroups.ProcessType
 	freezeErr        error
+	freezeDelay      time.Duration
+	freezeDelayOnce  sync.Once
 	unfrozen         []cgroups.ProcessType
 	unfreezeAttempts []cgroups.ProcessType
 	unfreezeErr      error
@@ -612,6 +624,84 @@ type fakeCgroupManager struct {
 	// frozenUnobservable models a guest with no cgroup manager: the write is accepted
 	// but freeze state can never be read back.
 	frozenUnobservable bool
+	// onUnfreeze runs inside every Unfreeze, which is inside the handler's thaw; a test uses
+	// it to end the request context while the thaw is running.
+	onUnfreeze func()
+}
+
+type fakeLogFlusher struct {
+	mu             sync.Mutex
+	calls          int
+	sendAttempts   int
+	purged         bool
+	err            error
+	waitForContext bool
+	contextErr     error
+	deadline       time.Time
+	hasDeadline    bool
+	onCall         func()
+}
+
+func (f *fakeLogFlusher) FlushAndPurge(ctx context.Context) error {
+	f.mu.Lock()
+	f.calls++
+	f.deadline, f.hasDeadline = ctx.Deadline()
+	f.mu.Unlock()
+
+	if f.onCall != nil {
+		f.onCall()
+	}
+	defer func() {
+		f.mu.Lock()
+		f.purged = true
+		f.mu.Unlock()
+	}()
+
+	if err := ctx.Err(); err != nil {
+		f.mu.Lock()
+		f.contextErr = err
+		f.mu.Unlock()
+
+		return err
+	}
+
+	f.mu.Lock()
+	f.sendAttempts++
+	f.mu.Unlock()
+	if f.waitForContext {
+		<-ctx.Done()
+
+		f.mu.Lock()
+		f.contextErr = ctx.Err()
+		f.mu.Unlock()
+
+		return ctx.Err()
+	}
+
+	return f.err
+}
+
+type fakeLogFlushResult struct {
+	calls        int
+	sendAttempts int
+	purged       bool
+	contextErr   error
+	deadline     time.Time
+	hasDeadline  bool
+}
+
+func (f *fakeLogFlusher) result() fakeLogFlushResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return fakeLogFlushResult{
+		calls:        f.calls,
+		sendAttempts: f.sendAttempts,
+		purged:       f.purged,
+		contextErr:   f.contextErr,
+		deadline:     f.deadline,
+		hasDeadline:  f.hasDeadline,
+	}
 }
 
 func (f *fakeCgroupManager) GetFileDescriptor(cgroups.ProcessType) (int, bool) {
@@ -619,6 +709,8 @@ func (f *fakeCgroupManager) GetFileDescriptor(cgroups.ProcessType) (int, bool) {
 }
 
 func (f *fakeCgroupManager) Freeze(pt cgroups.ProcessType) error {
+	f.freezeDelayOnce.Do(func() { time.Sleep(f.freezeDelay) })
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.freezeErr != nil {
@@ -646,6 +738,10 @@ func (f *fakeCgroupManager) Frozen(pt cgroups.ProcessType) (bool, error) {
 }
 
 func (f *fakeCgroupManager) Unfreeze(pt cgroups.ProcessType) error {
+	if f.onUnfreeze != nil {
+		f.onUnfreeze()
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.unfreezeAttempts = append(f.unfreezeAttempts, pt)
@@ -660,9 +756,47 @@ func (f *fakeCgroupManager) Unfreeze(pt cgroups.ProcessType) error {
 func (f *fakeCgroupManager) Close() error { return nil }
 
 func newAPIWithCgroupManager(mgr cgroups.Manager) *API {
+	return newAPIWithCgroupManagerAndLogFlusher(mgr, nil)
+}
+
+func newAPIWithCgroupManagerAndLogFlusher(mgr cgroups.Manager, logFlusher LogFlusher) *API {
 	logger := zerolog.Nop()
 
-	return New(&logger, &execcontext.Defaults{EnvVars: utils.NewEnvVars()}, nil, false, cgroups.NewWorkloadFreezer(mgr))
+	return New(&logger, &execcontext.Defaults{EnvVars: utils.NewEnvVars()}, nil, false, cgroups.NewWorkloadFreezer(mgr), nil, cpus.NewNoopManager(), logFlusher)
+}
+
+// postInitJSON serves one /init directly, as the generated router would call it. A body
+// carrying an access token goes through postInitRaw: SecureToken only decodes.
+func postInitJSON(t *testing.T, ctx context.Context, api *API, body PostInitJSONBody) *httptest.ResponseRecorder {
+	t.Helper()
+
+	raw, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	return postInitRaw(t, ctx, api, raw)
+}
+
+func postInitRaw(t *testing.T, ctx context.Context, api *API, raw []byte) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/init", bytes.NewReader(raw))
+	require.NoError(t, err)
+	rec := httptest.NewRecorder()
+	api.PostInit(rec, req)
+
+	return rec
+}
+
+// freezeAPI takes the pre-pause freeze through POST /freeze.
+func freezeAPI(t *testing.T, api *API) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/freeze", http.NoBody)
+	require.NoError(t, err)
+	maxWaitMs := int64(1000)
+	rec := httptest.NewRecorder()
+	api.PostFreeze(rec, req, PostFreezeParams{MaxWaitMs: &maxWaitMs})
+	require.Equal(t, http.StatusOK, rec.Code)
 }
 
 // newAPIWithCgroupManagerLogging is newAPIWithCgroupManager with the log output captured,
@@ -670,11 +804,139 @@ func newAPIWithCgroupManager(mgr cgroups.Manager) *API {
 func newAPIWithCgroupManagerLogging(mgr cgroups.Manager, out io.Writer) *API {
 	logger := zerolog.New(out)
 
-	return New(&logger, &execcontext.Defaults{EnvVars: utils.NewEnvVars()}, nil, false, cgroups.NewWorkloadFreezer(mgr))
+	return New(&logger, &execcontext.Defaults{EnvVars: utils.NewEnvVars()}, nil, false, cgroups.NewWorkloadFreezer(mgr), nil, cpus.NewNoopManager(), nil)
 }
 
 func TestPostFreeze(t *testing.T) {
 	t.Parallel()
+
+	t.Run("flushes logs after freezing the workload", func(t *testing.T) {
+		t.Parallel()
+
+		mgr := &fakeCgroupManager{}
+		var frozenBeforeFlush bool
+		flusher := &fakeLogFlusher{onCall: func() {
+			mgr.mu.Lock()
+			defer mgr.mu.Unlock()
+			frozenBeforeFlush = slices.Equal(mgr.frozen, cgroups.WorkloadProcessTypes)
+		}}
+		api := newAPIWithCgroupManagerAndLogFlusher(mgr, flusher)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/freeze", http.NoBody)
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		maxWaitMs := int64(1000)
+		api.PostFreeze(rec, req, PostFreezeParams{MaxWaitMs: &maxWaitMs})
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		result := flusher.result()
+		assert.Equal(t, 1, result.calls)
+		assert.Equal(t, 1, result.sendAttempts)
+		assert.True(t, result.purged)
+		assert.True(t, frozenBeforeFlush)
+	})
+
+	t.Run("still answers 200 when flushing fails", func(t *testing.T) {
+		t.Parallel()
+
+		flusher := &fakeLogFlusher{err: errors.New("collector unavailable")}
+		api := newAPIWithCgroupManagerAndLogFlusher(&fakeCgroupManager{}, flusher)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/freeze", http.NoBody)
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		maxWaitMs := int64(1000)
+		api.PostFreeze(rec, req, PostFreezeParams{MaxWaitMs: &maxWaitMs})
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		result := flusher.result()
+		assert.Equal(t, 1, result.calls)
+		assert.True(t, result.purged)
+	})
+
+	t.Run("bounds a stuck flush by maxWaitMs and purges", func(t *testing.T) {
+		t.Parallel()
+
+		const maxWait = 100 * time.Millisecond
+		flusher := &fakeLogFlusher{waitForContext: true}
+		api := newAPIWithCgroupManagerAndLogFlusher(&fakeCgroupManager{}, flusher)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/freeze", http.NoBody)
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		maxWaitMs := int64(maxWait / time.Millisecond)
+
+		start := time.Now()
+		api.PostFreeze(rec, req, PostFreezeParams{MaxWaitMs: &maxWaitMs})
+		elapsed := time.Since(start)
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		result := flusher.result()
+		assert.Equal(t, 1, result.calls)
+		assert.Equal(t, 1, result.sendAttempts)
+		assert.True(t, result.purged)
+		require.ErrorIs(t, result.contextErr, context.DeadlineExceeded)
+		assert.GreaterOrEqual(t, elapsed, maxWait/2)
+		assert.Less(t, elapsed, maxWait+100*time.Millisecond)
+	})
+
+	t.Run("gives the flusher only the budget left after freezing", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			maxWait    = time.Second
+			freezeTime = 200 * time.Millisecond
+		)
+		flusher := &fakeLogFlusher{}
+		api := newAPIWithCgroupManagerAndLogFlusher(&fakeCgroupManager{freezeDelay: freezeTime}, flusher)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/freeze", http.NoBody)
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		maxWaitMs := int64(maxWait / time.Millisecond)
+
+		start := time.Now()
+		api.PostFreeze(rec, req, PostFreezeParams{MaxWaitMs: &maxWaitMs})
+
+		require.Equal(t, http.StatusOK, rec.Code)
+		result := flusher.result()
+		require.True(t, result.hasDeadline)
+		assert.LessOrEqual(t, result.deadline.Sub(start), maxWait+50*time.Millisecond,
+			"the flush deadline must stay anchored to the whole handler budget")
+		assert.Equal(t, 1, result.sendAttempts)
+		assert.True(t, result.purged)
+	})
+
+	t.Run("without maxWaitMs purges without sending", func(t *testing.T) {
+		t.Parallel()
+
+		flusher := &fakeLogFlusher{}
+		api := newAPIWithCgroupManagerAndLogFlusher(&fakeCgroupManager{}, flusher)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/freeze", http.NoBody)
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		api.PostFreeze(rec, req, PostFreezeParams{})
+
+		require.Equal(t, http.StatusNoContent, rec.Code)
+		result := flusher.result()
+		assert.Equal(t, 1, result.calls)
+		assert.Zero(t, result.sendAttempts)
+		assert.True(t, result.purged)
+		require.ErrorIs(t, result.contextErr, context.DeadlineExceeded)
+	})
+
+	t.Run("uses a noop flusher outside Firecracker", func(t *testing.T) {
+		t.Parallel()
+
+		api := newAPIWithCgroupManagerAndLogFlusher(&fakeCgroupManager{}, noopLogFlusher{})
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/freeze", http.NoBody)
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+
+		api.PostFreeze(rec, req, PostFreezeParams{})
+		assert.Equal(t, http.StatusNoContent, rec.Code)
+	})
 
 	t.Run("freezes all user cgroups", func(t *testing.T) {
 		t.Parallel()
@@ -724,9 +986,11 @@ func TestPostFreeze(t *testing.T) {
 		assert.Zero(t, *body.Frozen)
 	})
 
-	// A cgroup that rejects the write is expected -- threaded cgroups do, and one
-	// removed mid-sweep reports ENOENT. Answering 500 would hide the failed count that
-	// exists to make those visible, and would lose the whole result with it.
+	// A cgroup that is still there and rejects the write is expected. Answering 500 would
+	// hide the failed count that exists to make it visible, and would lose the whole
+	// result with it. A WALK-DISCOVERED cgroup that was removed mid-sweep does not reach
+	// this arm -- it is counted vanished and raises nothing; one of envd's own static
+	// cgroups that goes away does reach it, by design.
 	t.Run("reports failed cgroups in the body rather than erroring", func(t *testing.T) {
 		t.Parallel()
 		mgr := &fakeCgroupManager{freezeErr: errors.New("write cgroup.freeze: io error")}
@@ -933,4 +1197,78 @@ func TestPostInit_UnauthorizedDoesNotUnfreeze(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 	assert.Empty(t, mgr.unfreezeAttempts, "unauthorized /init must not attempt unfreeze")
+}
+
+// A helper forked by the command inherits its output pipes, as mount.nfs does under
+// mount. Canceling must kill the whole process group, so the pipes close as soon as
+// the context expires rather than after WaitDelay.
+func TestNFSCommandKillsForkedHelpersOnCancel(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := runNFSCommand(ctx, zerolog.Nop(), "sh", "-c", "sleep 30 & wait")
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Less(t, elapsed, nfsCmdWaitDelay, "the forked helper outlived the cancel and held the pipes open")
+}
+
+// A helper that escapes the process group cannot be killed by the cancel; WaitDelay
+// still stops CombinedOutput from waiting on its pipes forever.
+func TestNFSCommandBoundsWaitWhenHelperEscapesGroup(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid not available")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := runNFSCommand(ctx, zerolog.Nop(), "sh", "-c", "setsid sleep 30 & wait")
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Less(t, elapsed, nfsCmdWaitDelay+5*time.Second, "CombinedOutput waited on an escaped helper's pipes")
+}
+
+// A mount rejected while the NFS proxy starts up must be retried, not reported
+// as a failed /init.
+func TestRetryUntilDoneRecoversFromTransientFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	attempts, err := retryUntilDone(ctx, time.Millisecond, func(_ context.Context, attempt int) error {
+		if attempt < 3 {
+			return errors.New("connection refused")
+		}
+
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, 3, attempts)
+}
+
+// When every attempt fails, the error returned at the deadline is the last
+// attempt's, so /init reports why the mount failed rather than a bare timeout.
+func TestRetryUntilDoneReturnsLastErrorAtDeadline(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	attempts, err := retryUntilDone(ctx, 5*time.Millisecond, func(_ context.Context, attempt int) error {
+		return errors.New("connection refused " + strconv.Itoa(attempt))
+	})
+
+	require.Error(t, err)
+	assert.Greater(t, attempts, 1)
+	assert.Equal(t, "connection refused "+strconv.Itoa(attempts), err.Error())
 }

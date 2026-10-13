@@ -25,6 +25,9 @@ message SandboxConfig {
 
   int64 vcpu = 11;
   int64 ram_mb = 12;
+  // VM capacity on cold boot; 0 defaults to max(vcpu, recorded snapshot capacity).
+  // Memory resumes use recorded capacity; legacy resizes must pass the original size.
+  int64 max_vcpus = 28;
 
   string team_id = 13;
   // Maximum length of the sandbox in Hours.
@@ -124,11 +127,24 @@ message SandboxNetworkEgressConfig {
   string egress_proxy_address = 5;
   string egress_proxy_username = 6;
   string egress_proxy_password = 7;
+  optional SandboxNetworkEgressProxyTLS egress_proxy_tls = 8;
+}
+
+// TLS for the hop to the BYOP SOCKS5 proxy. The SOCKS5 negotiation and the
+// tunneled traffic both run inside the session.
+message SandboxNetworkEgressProxyTLS {
+  bool enabled = 1;
+  // Verified against the proxy certificate and sent as SNI. Empty means the
+  // host part of egress_proxy_address.
+  string server_name = 2;
+  // PEM roots to verify the proxy against. Empty means the system trust store.
+  bytes ca_cert = 3;
 }
 
 message SandboxNetworkIngressConfig {
   optional string traffic_access_token = 1;
   optional string mask_request_host = 2;
+  repeated uint32 https_ports = 3;
 }
 
 message SandboxCreateRequest {
@@ -154,6 +170,33 @@ message SandboxCreateResponse {
   // caller that demanded a filesystem boot can detect an unhonored demand
   // instead of trusting deploy ordering.
   bool filesystem_boot_applied = 3;
+
+  // The Firecracker version the sandbox actually RUNS: the request's
+  // declared version resolved through the firecracker-versions flag at
+  // start, frozen for the sandbox's lifetime. Callers gating features on the
+  // FC version must read this rather than re-deriving it — a re-resolution
+  // can disagree with the frozen value whenever the flag changes or the
+  // evaluation contexts differ. Empty from orchestrators that predate the
+  // field.
+  string resolved_firecracker_version = 4;
+
+  // The network mode the orchestrator selected for this execution and where
+  // callers must send its ingress traffic. Absent from orchestrators that
+  // predate routed networking; callers then keep using the worker endpoint
+  // they already resolve today.
+  optional SandboxNetworkPlacement network_placement = 5;
+}
+
+// The network placement of one execution of a sandbox: its mode, the router
+// serving it and the ingress endpoint a caller must use. The execution_id pins
+// the placement to that execution, so a caller can reject a placement that
+// belongs to a predecessor.
+message SandboxNetworkPlacement {
+  string execution_id = 1;
+  string network_mode = 2;
+  string router_id = 3;
+  string ingress_address = 4;
+  uint32 ingress_port = 5;
 }
 
 message SandboxUpdateRequest {
@@ -212,6 +255,9 @@ message SandboxCheckpointRequest {
   // index (e.g. template_id). Opaque to the orchestrator, which just forwards
   // it to object metadata.
   map<string, string> metadata = 4;
+  // Persist only the filesystem: no memfile is exported and a sandbox created
+  // from the build cold-boots. The source sandbox keeps running.
+  bool filesystem_only = 5;
 }
 
 message SandboxCheckpointResponse {

@@ -67,13 +67,18 @@ func (s *Server) ServiceInfo(ctx context.Context, _ *emptypb.Empty) (*orchestrat
 		sandboxDiskAllocated += uint64(item.Config.TotalDiskSizeMB) * 1024 * 1024
 	}
 
-	serviceStatus := info.GetStatus()
+	info.statusMu.RLock()
+	serviceStatus := info.status
+	outstandingWork := uint64(info.outstandingWork)
+	info.statusMu.RUnlock()
 
 	return &orchestratorinfo.ServiceInfoResponse{
 		NodeId:                 info.ClientId,
 		ServiceId:              info.ServiceId,
 		ServiceStatus:          serviceStatus.Status,
 		ServiceStatusChangedAt: timestamppb.New(serviceStatus.ChangedAt),
+		OutstandingWork:        outstandingWork,
+		MaxSandboxes:           info.MaxSandboxes.Load(),
 
 		ServiceVersion: info.SourceVersion,
 		ServiceCommit:  info.SourceCommit,
@@ -143,7 +148,7 @@ func convertMachineInfo(machineInfo machineinfo.MachineInfo) *orchestratorinfo.M
 func (s *Server) ServiceStatusOverride(ctx context.Context, req *orchestratorinfo.ServiceStatusChangeRequest) (*emptypb.Empty, error) {
 	logger.L().Info(ctx, "service status override request received", zap.String("status", req.GetServiceStatus().String()))
 	if !s.info.OverrideStatus(ctx, req.GetServiceStatus()) {
-		return nil, status.Error(codes.FailedPrecondition, "cannot change node status from draining to standby")
+		return nil, status.Errorf(codes.FailedPrecondition, "cannot override node status to %s", req.GetServiceStatus())
 	}
 
 	return &emptypb.Empty{}, nil

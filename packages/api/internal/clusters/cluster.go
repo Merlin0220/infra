@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"net"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
@@ -16,7 +14,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
-	"github.com/e2b-dev/infra/packages/api/internal/clusters/discovery"
 	clickhouse "github.com/e2b-dev/infra/packages/clickhouse/pkg"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
@@ -25,6 +22,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs/loki"
 	"github.com/e2b-dev/infra/packages/shared/pkg/machineinfo"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 	"github.com/e2b-dev/infra/packages/shared/pkg/synchronization"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -43,7 +41,7 @@ type Cluster struct {
 	AuthOrgID     string
 
 	instances       *smap.Map[*Instance]
-	synchronization *synchronization.Synchronize[discovery.Item, *Instance]
+	synchronization *synchronization.Synchronize[servicediscovery.Instance, *Instance]
 	resources       ClusterResource
 }
 
@@ -57,7 +55,7 @@ func NewCluster(
 	domain *string,
 	authOrgID string,
 	sandboxes *smap.Map[*Instance],
-	synchronization *synchronization.Synchronize[discovery.Item, *Instance],
+	synchronization *synchronization.Synchronize[servicediscovery.Instance, *Instance],
 	resources ClusterResource,
 ) *Cluster {
 	return &Cluster{
@@ -71,9 +69,8 @@ func NewCluster(
 }
 
 func newLocalCluster(
-	ctx context.Context,
 	tel *telemetry.Client,
-	storeDiscovery discovery.Discovery,
+	storeDiscovery servicediscovery.Discoverer,
 	clickhouse clickhouse.Clickhouse,
 	queryLogsProvider *loki.LokiQueryProvider,
 	sandboxLogsReader ClickhouseLogsReader,
@@ -83,9 +80,9 @@ func newLocalCluster(
 	clusterID := consts.LocalClusterID
 
 	instances := smap.New[*Instance]()
-	instanceCreation := func(ctx context.Context, item discovery.Item) (*Instance, error) {
+	instanceCreation := func(ctx context.Context, item servicediscovery.Instance) (*Instance, error) {
 		// For local cluster we are doing direct connection to instance IP and API port and without additional cluster auth.
-		return newInstance(ctx, tel, nil, clusterID, item, net.JoinHostPort(item.LocalIPAddress, strconv.FormatUint(uint64(item.LocalInstanceApiPort), 10)), false)
+		return newInstance(ctx, tel, nil, clusterID, item, item.Address(), false)
 	}
 
 	store := instancesSyncStore{clusterID: clusterID, instances: instances, discovery: storeDiscovery, instanceCreation: instanceCreation}
@@ -99,14 +96,18 @@ func newLocalCluster(
 		newLocalClusterResourceProvider(clickhouse, queryLogsProvider, sandboxLogsReader, featureFlags, instances, config),
 	)
 
-	// Periodically sync cluster instances
-	go c.synchronization.Start(ctx, instancesSyncInterval, instancesSyncTimeout, true)
-
 	return c
 }
 
+// remoteInstanceAuthorization routes a call through the remote proxy to one
+// instance. The discovery ID is that instance's service id: the edge API
+// reports it per run, which is what the proxy keys on — the machine would send
+// the call to whatever is on it now.
+func remoteInstanceAuthorization(secret string, tls bool, sd servicediscovery.Instance) *instanceAuthorization {
+	return &instanceAuthorization{secret: secret, tls: tls, serviceInstanceID: sd.WorkloadID}
+}
+
 func newRemoteCluster(
-	ctx context.Context,
 	tel *telemetry.Client,
 	endpoint string,
 	endpointTLS bool,
@@ -142,14 +143,13 @@ func newRemoteCluster(
 	}
 
 	instances := smap.New[*Instance]()
-	instanceCreation := func(ctx context.Context, item discovery.Item) (*Instance, error) {
-		// For remote cluster we are doing connection to endpoint that works as gRPC proxy and handles auth and routing for us.
-		auth := &instanceAuthorization{secret: secret, tls: endpointTLS, serviceInstanceID: item.InstanceID}
-
-		return newInstance(ctx, tel, auth, clusterID, item, endpoint, endpointTLS)
+	instanceCreation := func(ctx context.Context, item servicediscovery.Instance) (*Instance, error) {
+		// A remote cluster is reached through an endpoint acting as a gRPC proxy,
+		// which handles auth and routing for us.
+		return newInstance(ctx, tel, remoteInstanceAuthorization(secret, endpointTLS, item), clusterID, item, endpoint, endpointTLS)
 	}
 
-	storeDiscovery := discovery.NewRemoteServiceDiscovery(clusterID, httpClient)
+	storeDiscovery := servicediscovery.NewRemote(httpClient)
 	store := instancesSyncStore{clusterID: clusterID, instances: instances, instanceCreation: instanceCreation, discovery: storeDiscovery}
 
 	c := NewCluster(
@@ -161,10 +161,27 @@ func newRemoteCluster(
 		newRemoteClusterResourceProvider(clusterID, instances, httpClient),
 	)
 
-	// Periodically sync cluster instances
-	go c.synchronization.Start(ctx, instancesSyncInterval, instancesSyncTimeout, true)
-
 	return c, nil
+}
+
+// initialSyncMode says whether a cluster should run a discovery round as soon
+// as it starts, or wait for the first scheduled tick. A cluster that already
+// applied a snapshot during startup must not immediately run a second,
+// overlapping discovery for the same cluster.
+type initialSyncMode int
+
+const (
+	syncImmediately initialSyncMode = iota
+	syncOnNextTick
+)
+
+// Start begins the periodic discovery loop after construction.
+func (c *Cluster) Start(ctx context.Context, mode initialSyncMode) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	go c.synchronization.Start(ctx, instancesSyncInterval, instancesSyncTimeout, mode == syncImmediately)
 }
 
 func (c *Cluster) Close(ctx context.Context) error {
@@ -191,17 +208,61 @@ func (c *Cluster) Close(ctx context.Context) error {
 	return nil
 }
 
+// Scanned rather than looked up: the pool is keyed by the running process, and
+// a build persists the machine it was placed on (env_builds.cluster_node_id),
+// so this resolves the machine to whichever process is on it now.
 func (c *Cluster) GetTemplateBuilderByNodeID(nodeID string) (*Instance, error) {
-	instance, found := c.instances.Get(nodeID)
+	instance, found := builderOnNode(c.instances, nodeID)
 	if !found {
 		return nil, ErrTemplateBuilderNotFound
 	}
 
-	if info := instance.GetInfo(); info.Status == infogrpc.ServiceInfoStatus_Unhealthy || !info.IsBuilder {
-		return nil, ErrTemplateBuilderNotFound
+	return instance, nil
+}
+
+// instanceOnNode finds an instance running on a machine, preferring one that is
+// not unhealthy. Like builderOnNode this cannot be a map lookup, but it applies
+// no further filter: callers that only need to reach the machine should not
+// start rejecting instances the old lookup accepted.
+func instanceOnNode(instances *smap.Map[*Instance], nodeID string) (*Instance, bool) {
+	var unhealthy *Instance
+
+	for _, instance := range instances.Items() {
+		if instance.NodeID != nodeID {
+			continue
+		}
+
+		if instance.GetInfo().Status == infogrpc.ServiceInfoStatus_Unhealthy {
+			unhealthy = instance
+
+			continue
+		}
+
+		return instance, true
 	}
 
-	return instance, nil
+	return unhealthy, unhealthy != nil
+}
+
+// builderOnNode finds the usable template builder running on a machine. The
+// pool is keyed by process, so this cannot be a map lookup, and every entry on
+// the machine has to be considered rather than the first: a restart leaves the
+// dead run and the live one sharing a machine for a sync round, and stopping
+// early would answer with whichever the map happened to yield.
+func builderOnNode(instances *smap.Map[*Instance], nodeID string) (*Instance, bool) {
+	for _, instance := range instances.Items() {
+		if instance.NodeID != nodeID {
+			continue
+		}
+
+		if info := instance.GetInfo(); info.Status == infogrpc.ServiceInfoStatus_Unhealthy || !info.IsBuilder {
+			continue
+		}
+
+		return instance, true
+	}
+
+	return nil, false
 }
 
 func (c *Cluster) GetByServiceInstanceID(serviceInstanceID string) (*Instance, bool) {

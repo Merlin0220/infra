@@ -14,17 +14,20 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 var (
-	meter = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network/v2")
+	tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network/v2")
+	meter  = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network/v2")
 
 	newSlotsAvailableCounter = utils.Must(meter.Int64UpDownCounter("orchestrator.network.v2.slots_pool.new",
 		metric.WithDescription("Number of new v2 network slots ready to be used."),
@@ -240,40 +243,15 @@ func (p *V2Pool) Populate(ctx context.Context) {
 	}
 }
 
-func (p *V2Pool) Get(ctx context.Context, netConfig *orchestrator.SandboxNetworkConfig, class network.EgressClass) (*network.Slot, error) {
-	var slot *network.Slot
-
-	select {
-	case <-p.done:
-		return nil, network.ErrClosed
-	case s := <-p.reusedSlots:
-		reusableSlotsAvailableCounter.Add(ctx, -1)
-		acquiredSlots.Add(ctx, 1, metric.WithAttributes(attribute.String("pool", "reused")))
-		telemetry.ReportEvent(ctx, "reused v2 network slot")
-		slot = s
-	default:
-		select {
-		case <-p.done:
-			return nil, network.ErrClosed
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case s, ok := <-p.newSlots:
-			// Populate closes the channel on its way out, and a closed channel
-			// wins this select as readily as done does.
-			if !ok {
-				return nil, network.ErrClosed
-			}
-
-			newSlotsAvailableCounter.Add(ctx, -1)
-			acquiredSlots.Add(ctx, 1, metric.WithAttributes(attribute.String("pool", "new")))
-			telemetry.ReportEvent(ctx, "new v2 network slot")
-			slot = s
-		}
+func (p *V2Pool) Get(ctx context.Context, netConfig *orchestrator.SandboxNetworkConfig, class sandboxtypes.EgressClass) (*network.Slot, error) {
+	slot, err := p.take(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := p.configureSlot(ctx, slot, netConfig, class); err != nil {
 		// Never handed out, so nobody listens for the release notification.
-		if rerr := p.ReturnAsync(context.WithoutCancel(ctx), slot, func(context.Context, string) {}, 0); rerr != nil {
+		if rerr := p.ReturnAsync(context.WithoutCancel(ctx), slot, func(context.Context, string) error { return nil }, 0); rerr != nil {
 			logger.L().Error(ctx, "failed to return v2 slot to pool", zap.Error(rerr), zap.Int("slot_index", slot.Idx))
 		}
 
@@ -283,7 +261,49 @@ func (p *V2Pool) Get(ctx context.Context, netConfig *orchestrator.SandboxNetwork
 	return slot, nil
 }
 
-func (p *V2Pool) configureSlot(ctx context.Context, slot *network.Slot, netConfig *orchestrator.SandboxNetworkConfig, class network.EgressClass) error {
+// take prefers a reused slot and otherwise waits for whichever queue delivers
+// first.
+func (p *V2Pool) take(ctx context.Context) (*network.Slot, error) {
+	select {
+	case <-p.done:
+		return nil, network.ErrClosed
+	case s := <-p.reusedSlots:
+		return p.takeReused(ctx, s), nil
+	default:
+	}
+
+	select {
+	case <-p.done:
+		return nil, network.ErrClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case s := <-p.reusedSlots:
+		// ReturnAsync may publish a reusable slot after the fast-path miss.
+		return p.takeReused(ctx, s), nil
+	case s, ok := <-p.newSlots:
+		// Populate closes the channel on its way out, and a closed channel
+		// wins this select as readily as done does.
+		if !ok {
+			return nil, network.ErrClosed
+		}
+
+		newSlotsAvailableCounter.Add(ctx, -1)
+		acquiredSlots.Add(ctx, 1, metric.WithAttributes(attribute.String("pool", "new")))
+		telemetry.ReportEvent(ctx, "new v2 network slot")
+
+		return s, nil
+	}
+}
+
+func (p *V2Pool) takeReused(ctx context.Context, s *network.Slot) *network.Slot {
+	reusableSlotsAvailableCounter.Add(ctx, -1)
+	acquiredSlots.Add(ctx, 1, metric.WithAttributes(attribute.String("pool", "reused")))
+	telemetry.ReportEvent(ctx, "reused v2 network slot")
+
+	return s
+}
+
+func (p *V2Pool) configureSlot(ctx context.Context, slot *network.Slot, netConfig *orchestrator.SandboxNetworkConfig, class sandboxtypes.EgressClass) error {
 	// Slots are created before their tenant is known, so a build re-stamps the
 	// rule CreateNetworkV2 seeded. No-op when both classes resolve alike.
 	if err := ApplyEgressDSCP(slot, p.config.EgressDSCP(class)); err != nil {
@@ -324,6 +344,8 @@ func (p *V2Pool) ReturnAsync(ctx context.Context, slot *network.Slot, releasedFn
 		err := p.returnSlot(ctx, slot, releasedFn, returnDelay)
 		switch {
 		case err == nil:
+		case errors.Is(err, network.ErrSlotRetained):
+			logger.L().Error(ctx, "v2 network slot retained and unavailable for reuse", zap.Error(err), zap.Int("slot_index", slot.Idx))
 		case errors.Is(err, network.ErrClosed), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 			logger.L().Warn(ctx, "v2 network slot returned during pool shutdown", zap.Error(err), zap.Int("slot_index", slot.Idx))
 		default:
@@ -337,30 +359,42 @@ func (p *V2Pool) ReturnAsync(ctx context.Context, slot *network.Slot, releasedFn
 // returnSlot recycles a slot that was used by a sandbox. It waits returnDelay
 // before making the slot reusable to let inflight requests on the previous
 // sandbox drain.
-func (p *V2Pool) returnSlot(ctx context.Context, slot *network.Slot, releasedFn network.ReleaseNotify, returnDelay time.Duration) error {
-	notifyNetworkRelease := sync.OnceFunc(func() {
-		releasedFn(ctx, slot.HostIPString())
-	})
-	defer notifyNetworkRelease()
+func (p *V2Pool) returnSlot(ctx context.Context, slot *network.Slot, releasedFn network.ReleaseNotify, returnDelay time.Duration) (retErr error) {
+	started := time.Now()
+	cleanupStarted := started
+	defer func() { network.RecordSlotReturnDuration(ctx, started, cleanupStarted, 2, retErr) }()
 
-	// If the pool is closed or the context is cancelled during the delay we
-	// still fall through and clean up the slot to avoid leaking it.
-	select {
-	case <-ctx.Done():
-		return p.cleanupWith(ctx, slot, ctx.Err())
-	case <-p.done:
-		return p.cleanupWith(ctx, slot, network.ErrClosed)
-	case <-time.After(returnDelay):
-	}
+	return telemetry.Observe0(ctx, tracer, "clean network-slot", func(ctx context.Context) error {
+		// If the pool is closed or the context is cancelled during the delay we
+		// still fall through and clean up the slot to avoid leaking it.
+		var cause error
+		select {
+		case <-ctx.Done():
+			cause = ctx.Err()
+		case <-p.done:
+			cause = network.ErrClosed
+		case <-time.After(returnDelay):
+		}
 
-	notifyNetworkRelease()
+		cleanupStarted = time.Now()
 
-	return p.recycle(ctx, slot)
+		// Every path notifies before the slot can be torn down or reused.
+		if err := releasedFn(ctx, slot.HostIPString()); err != nil {
+			telemetry.SetAttributes(ctx, attribute.Bool("network.slot.retained", true))
+
+			return errors.Join(cause, fmt.Errorf("%w: v2 slot '%d': %w", network.ErrSlotRetained, slot.Idx, err))
+		}
+		if cause != nil {
+			return p.cleanupWith(ctx, slot, cause)
+		}
+
+		return p.recycle(ctx, slot)
+	}, trace.WithAttributes(attribute.Int("network_version", 2)))
 }
 
 func (p *V2Pool) recycle(ctx context.Context, slot *network.Slot) error {
 	// Undo any build-specific DSCP before the next tenant can inherit it.
-	if err := ApplyEgressDSCP(slot, p.config.EgressDSCP(network.EgressClassSandbox)); err != nil {
+	if err := ApplyEgressDSCP(slot, p.config.EgressDSCP(sandboxtypes.EgressClassSandbox)); err != nil {
 		return p.cleanupWith(ctx, slot, fmt.Errorf("error resetting v2 slot egress DSCP: %w", err))
 	}
 

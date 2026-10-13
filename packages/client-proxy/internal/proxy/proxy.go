@@ -26,8 +26,6 @@ import (
 )
 
 const (
-	orchestratorProxyPort = 5007 // orchestrator proxy port
-
 	// This timeout should be > 600 (GCP LB upstream idle timeout) to prevent race condition
 	// Also it's a good practice to set it to a value higher than the idle timeout of the backend service
 	// https://cloud.google.com/load-balancing/docs/https#timeouts_and_retries%23:~:text=The%20load%20balancer%27s%20backend%20keepalive,is%20greater%20than%20600%20seconds
@@ -135,7 +133,7 @@ func handlePausedSandbox(
 	return nodeIP, autoResumeSucceeded, nil
 }
 
-func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port uint16, catalog catalog.SandboxesCatalog, pausedSandboxResumer PausedSandboxResumer, featureFlagsClient *featureflags.Client) (*reverseproxy.Proxy, error) {
+func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port, orchestratorProxyPort uint16, catalog catalog.SandboxesCatalog, pausedSandboxResumer PausedSandboxResumer, featureFlagsClient *featureflags.Client) (*reverseproxy.Proxy, error) {
 	getTargetFromRequest := reverseproxy.GetTargetFromRequest()
 	proxy := reverseproxy.New(
 		port,
@@ -155,22 +153,19 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 			envdAccessToken := r.Header.Get(proxygrpc.MetadataEnvdHTTPAccessToken)
 			nodeIP, err := catalogResolution(ctx, sandboxId, port, trafficAccessToken, envdAccessToken, catalog, pausedSandboxResumer)
 			if err != nil {
-				var resumeDeniedErr *reverseproxy.SandboxResumePermissionDeniedError
-				if errors.As(err, &resumeDeniedErr) {
+				if resumeDeniedErr, ok := errors.AsType[*reverseproxy.SandboxResumePermissionDeniedError](err); ok {
 					l.Warn(ctx, "sandbox resume denied", zap.Error(err))
 
 					return nil, resumeDeniedErr
 				}
 
-				var resourceExhaustedErr *reverseproxy.SandboxResourceExhaustedError
-				if errors.As(err, &resourceExhaustedErr) {
+				if resourceExhaustedErr, ok := errors.AsType[*reverseproxy.SandboxResourceExhaustedError](err); ok {
 					l.Warn(ctx, "sandbox resource exhausted", zap.Error(err))
 
 					return nil, resourceExhaustedErr
 				}
 
-				var stillTransitioningErr *reverseproxy.SandboxStillTransitioningError
-				if errors.As(err, &stillTransitioningErr) {
+				if stillTransitioningErr, ok := errors.AsType[*reverseproxy.SandboxStillTransitioningError](err); ok {
 					l.Warn(ctx, "sandbox still transitioning", zap.Error(err))
 
 					return nil, stillTransitioningErr
@@ -187,7 +182,7 @@ func NewClientProxy(meterProvider metric.MeterProvider, serviceName string, port
 
 			url := &url.URL{
 				Scheme: "http",
-				Host:   net.JoinHostPort(nodeIP, strconv.Itoa(orchestratorProxyPort)),
+				Host:   net.JoinHostPort(nodeIP, strconv.Itoa(int(orchestratorProxyPort))),
 			}
 
 			l = l.With(

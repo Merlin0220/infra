@@ -5,6 +5,7 @@ package proxy
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,12 +15,14 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
+	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/envd"
 	"github.com/e2b-dev/infra/packages/shared/pkg/connlimit"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	reverseproxy "github.com/e2b-dev/infra/packages/shared/pkg/proxy"
 	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/pool"
@@ -30,12 +33,29 @@ const (
 	// This timeout should be > 600 (GCP LB upstream idle timeout) to prevent race condition
 	// Also it's a good practice to set it to higher values as you progress in the stack
 	// https://cloud.google.com/load-balancing/docs/https#timeouts_and_retries%23:~:text=The%20load%20balancer%27s%20backend%20keepalive,is%20greater%20than%20600%20seconds
-	idleTimeout = 620 * time.Second
+	idleTimeout     = 620 * time.Second
+	shutdownTimeout = 30 * time.Second
 
 	trafficAccessTokenHeader = "e2b-traffic-access-token"
 )
 
 var _ sandbox.MapSubscriber = (*SandboxProxy)(nil)
+
+// envd speaks plaintext, so its port stays HTTP even when the config lists it.
+// The API refuses it at create time; this covers direct gRPC callers.
+func schemeForPort(ingress *orchestrator.SandboxNetworkIngressConfig, port uint64) string {
+	if port == uint64(consts.DefaultEnvdServerPort) {
+		return "http"
+	}
+
+	for _, httpsPort := range ingress.GetHttpsPorts() {
+		if uint64(httpsPort) == port {
+			return "https"
+		}
+	}
+
+	return "http"
+}
 
 type SandboxProxy struct {
 	proxy   *reverseproxy.Proxy
@@ -80,6 +100,10 @@ func newDestinationResolver(sandboxes *sandbox.Map) func(r *http.Request) (*pool
 
 		// Handle traffic access token validation.
 		// We are skipping envd port as it has its own access validation mechanism.
+		// Preflights fail this check too — the Fetch standard forbids a preflight
+		// from carrying custom headers, so it can never present the token. The
+		// proxy answers them from the resulting error path, so no unauthenticated
+		// request ever reaches the guest port.
 		if accessToken != "" && isNonEnvdTraffic {
 			accessTokenRaw := r.Header.Get(trafficAccessTokenHeader)
 			if accessTokenRaw == "" {
@@ -97,7 +121,7 @@ func newDestinationResolver(sandboxes *sandbox.Map) func(r *http.Request) (*pool
 		}
 
 		url := &url.URL{
-			Scheme: "http",
+			Scheme: schemeForPort(ingress, port),
 			Host:   net.JoinHostPort(sbx.Slot.HostIPString(), strconv.FormatUint(port, 10)),
 		}
 
@@ -120,6 +144,10 @@ func newDestinationResolver(sandboxes *sandbox.Map) func(r *http.Request) (*pool
 			ConnectionKey:   sbx.LifecycleID,
 			RequestLogger:   logger,
 			MaskRequestHost: maskRequestHost,
+			// Guest certificates are self-signed, so verification cannot
+			// succeed. Safe to decide per destination because ingress is fixed
+			// for the lifecycle the pool keys its clients by.
+			InsecureSkipTLSVerify: len(ingress.GetHttpsPorts()) > 0,
 		}, nil
 	}
 }
@@ -197,12 +225,24 @@ func (p *SandboxProxy) Start(ctx context.Context) error {
 
 func (p *SandboxProxy) Close(ctx context.Context) error {
 	var err error
-	select {
-	case <-ctx.Done():
-		err = p.proxy.Close()
-	default:
-		err = p.proxy.Shutdown(ctx)
+	forced := ctx.Err() != nil
+	if !forced {
+		shutdownCtx, cancel := context.WithTimeout(ctx, shutdownTimeout)
+		defer cancel()
+
+		err = p.proxy.Shutdown(shutdownCtx)
+		if err != nil {
+			forced = true
+			logger.L().Warn(ctx, "sandbox proxy graceful shutdown interrupted", zap.Error(err))
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				err = nil
+			}
+		}
 	}
+	if forced {
+		err = errors.Join(err, p.proxy.Close())
+	}
+	logger.L().Info(ctx, "sandbox proxy shutdown complete", zap.Bool("forced", forced), zap.Error(err))
 	if err != nil {
 		return fmt.Errorf("failed to shutdown proxy server: %w", err)
 	}
@@ -221,8 +261,13 @@ func (p *SandboxProxy) GetAddr() string {
 // OnInsert is called when a sandbox is inserted into the map.
 func (p *SandboxProxy) OnInsert(_ context.Context, _ *sandbox.Sandbox) {}
 
+// OnStopping is called when a sandbox leaves the live registry.
+func (p *SandboxProxy) OnStopping(_ context.Context, _ *sandbox.Sandbox) {}
+
 // OnNetworkRelease is called when a sandbox's network slot is released.
 // Keyed by LifecycleID so the removal is scoped to this sandbox lifecycle.
-func (p *SandboxProxy) OnNetworkRelease(_ context.Context, sbx *sandbox.Sandbox) {
+func (p *SandboxProxy) OnNetworkRelease(_ context.Context, sbx *sandbox.Sandbox) error {
 	p.limiter.Remove(sbx.LifecycleID)
+
+	return nil
 }

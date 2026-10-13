@@ -55,6 +55,7 @@ const (
 	KillReasonAdmin               KillReason = "admin"
 	KillReasonOrphaned            KillReason = "orphaned"
 	KillReasonBaseTemplateMissing KillReason = "base_template_missing"
+	KillReasonTeamDeleted         KillReason = "team_deleted"
 )
 
 // String returns the reason as a string, normalizing the empty value to
@@ -93,13 +94,17 @@ type RemoveOpts struct {
 }
 
 var AllowedTransitions = map[State]map[State]bool{
-	StateRunning:      {StatePausing: true, StateKilling: true, StateSnapshotting: true},
-	StatePausing:      {StateKilling: true},
+	StateRunning: {StatePausing: true, StateKilling: true, StateSnapshotting: true},
+	// Pausing→Running is legal only as the restore of a retryably refused
+	// pause (the node declined the snapshot; the sandbox never stopped).
+	StatePausing:      {StateKilling: true, StateRunning: true},
 	StateSnapshotting: {StateRunning: true, StateKilling: true, StatePausing: true},
 }
 
 const (
 	SandboxTimeoutDefault = time.Second * 15
+	// Timeout applied by the v2 create and connect endpoints when the request omits one
+	SandboxTimeoutDefaultV2 = time.Minute * 5
 	// Should we auto pause the instance by default instead of killing it
 	AutoPauseDefault = false
 )

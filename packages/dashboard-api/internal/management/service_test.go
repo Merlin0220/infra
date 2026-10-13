@@ -8,17 +8,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric/noop"
 
 	sharedauth "github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	authtypes "github.com/e2b-dev/infra/packages/auth/pkg/types"
-	authqueries "github.com/e2b-dev/infra/packages/db/pkg/auth/queries"
 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
 )
 
 func newService(db *testutils.Database) (*Service, *recordingCache) {
 	cache := &recordingCache{}
 
-	return NewService(db.AuthDB, db.SqlcClient, cache), cache
+	return NewService(db.AuthDB, db.SqlcClient, cache, noop.NewMeterProvider()), cache
 }
 
 func teamMembers(t *testing.T, db *testutils.Database, teamID uuid.UUID) []uuid.UUID {
@@ -41,6 +41,22 @@ func teamMembers(t *testing.T, db *testutils.Database, teamID uuid.UUID) []uuid.
 	require.NoError(t, err)
 
 	return members
+}
+
+func teamMemberIsDefault(t *testing.T, db *testutils.Database, teamID, userID uuid.UUID) bool {
+	t.Helper()
+
+	var isDefault bool
+	err := db.AuthDB.TestsRawSQLQuery(t.Context(),
+		"SELECT is_default FROM public.users_teams WHERE team_id = $1 AND user_id = $2",
+		func(rows pgx.Rows) error {
+			rows.Next()
+
+			return rows.Scan(&isDefault)
+		}, teamID, userID)
+	require.NoError(t, err)
+
+	return isDefault
 }
 
 func publicUserExists(t *testing.T, db *testutils.Database, userID uuid.UUID) bool {
@@ -73,47 +89,6 @@ func identityOwner(t *testing.T, db *testutils.Database, identity ProjectMemberI
 	require.NoError(t, err)
 
 	return userID
-}
-
-func accessTokenCount(t *testing.T, db *testutils.Database, userID uuid.UUID) int {
-	t.Helper()
-
-	var count int
-	err := db.AuthDB.TestsRawSQLQuery(t.Context(),
-		"SELECT count(*) FROM public.access_tokens WHERE user_id = $1",
-		func(rows pgx.Rows) error {
-			rows.Next()
-
-			return rows.Scan(&count)
-		}, userID)
-	require.NoError(t, err)
-
-	return count
-}
-
-func TestPurgeUserAccessTokens(t *testing.T) {
-	t.Parallel()
-
-	db := testutils.SetupDatabase(t)
-	service, _ := newService(db)
-	userID := uuid.New()
-	require.NoError(t, db.AuthDB.UpsertPublicUser(t.Context(), userID))
-	_, err := db.AuthDB.CreateAccessToken(t.Context(), authqueries.CreateAccessTokenParams{
-		ID:                    uuid.New(),
-		UserID:                userID,
-		AccessTokenHash:       "access-token-hash",
-		AccessTokenPrefix:     "e2b_",
-		AccessTokenLength:     32,
-		AccessTokenMaskPrefix: "e2b_",
-		AccessTokenMaskSuffix: "token",
-		Name:                  "default",
-	})
-	require.NoError(t, err)
-	require.Equal(t, 1, accessTokenCount(t, db, userID))
-
-	require.NoError(t, service.PurgeUserAccessTokens(t.Context(), userID))
-
-	require.Zero(t, accessTokenCount(t, db, userID))
 }
 
 type memberKey struct {
@@ -153,10 +128,6 @@ var _ sharedauth.Service = noopAuthService{}
 
 func (noopAuthService) ValidateAPIKey(context.Context, *gin.Context, string) (*authtypes.Team, *sharedauth.APIError) {
 	return nil, nil
-}
-
-func (noopAuthService) ValidateAccessToken(context.Context, *gin.Context, string) (uuid.UUID, *sharedauth.APIError) {
-	return uuid.Nil, nil
 }
 
 func (noopAuthService) ValidateAuthProviderToken(context.Context, *gin.Context, string) (uuid.UUID, *sharedauth.APIError) {

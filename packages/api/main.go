@@ -30,11 +30,14 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/handlers"
 	customMiddleware "github.com/e2b-dev/infra/packages/api/internal/middleware"
+	"github.com/e2b-dev/infra/packages/api/internal/middleware/idempotency"
 	"github.com/e2b-dev/infra/packages/api/internal/middleware/ratelimit"
 	"github.com/e2b-dev/infra/packages/api/internal/oauth"
+	"github.com/e2b-dev/infra/packages/api/internal/openapispec"
 	"github.com/e2b-dev/infra/packages/api/internal/utils"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
+	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/factories"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
@@ -46,12 +49,12 @@ import (
 	sharedmiddleware "github.com/e2b-dev/infra/packages/shared/pkg/middleware"
 	metricsMiddleware "github.com/e2b-dev/infra/packages/shared/pkg/middleware/otel/metrics"
 	tracingMiddleware "github.com/e2b-dev/infra/packages/shared/pkg/middleware/otel/tracing"
+	"github.com/e2b-dev/infra/packages/shared/pkg/removedroutes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 const (
-	serviceVersion     = "1.0.0"
 	serviceName        = "orchestration-api"
 	maxMultipartMemory = 1 << 23 // 8 MiB
 	maxUploadLimit     = 1 << 24 // 16 MiB
@@ -95,9 +98,17 @@ const (
 var (
 	commitSHA                  string
 	expectedMigrationTimestamp string
+	serviceVersion             = "0.14.1" // x-release-please-version
 )
 
-func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client, l logger.Logger, apiStore *handlers.APIStore, redisClient redis.UniversalClient, ff *featureflags.Client, swagger *openapi3.T, port int) *http.Server {
+func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client, l logger.Logger, apiStore *handlers.APIStore, adminJWTVerifier *auth.JWKSVerifier, redisClient redis.UniversalClient, ff *featureflags.Client, swagger *openapi3.T, port int) *http.Server {
+	// Rendered before the servers are cleared below, so the served document
+	// keeps them.
+	openAPISpec, err := openapispec.Handler(swagger)
+	if err != nil {
+		l.Fatal(ctx, "failed to render the OpenAPI document", zap.Error(err))
+	}
+
 	// Clear out the servers array in the swagger spec, that skips validating
 	// that server names match. We don't know how this thing will be run.
 	swagger.Servers = nil
@@ -132,7 +143,10 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 			"/sandboxes/:sandboxID/connect",
 			"/sandboxes/:sandboxID/resume",
 			"/sandboxes/:sandboxID/snapshots",
+			"/v2/sandboxes",
+			"/v2/sandboxes/:sandboxID/connect",
 		),
+		customMiddleware.LabelMetricsWithTeam(),
 		sharedmiddleware.LoggingMiddleware(l, sharedmiddleware.Config{ //nolint:contextcheck // ctx is captured before c.Next() intentionally to avoid seeing child context cancellations from inner middleware
 			TimeFormat:   time.RFC3339Nano,
 			UTC:          true,
@@ -162,14 +176,28 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 
 	r.Use(customMiddleware.CORS())
 
+	// Removed routes are registered before the OpenAPI validator middleware
+	// (which rejects paths missing from the spec) so old clients get a clear
+	// 410 instead of a 404.
+	for _, route := range removedroutes.Routes {
+		r.Handle(route.Method, route.GinPath(), func(c *gin.Context) {
+			apierrors.SendAPIStoreError(c, http.StatusGone, route.Message)
+		})
+	}
+
+	// The spec does not declare its own document, so it is registered before
+	// the validator, like the removed routes.
+	r.GET(openapispec.Path, openAPISpec)
+	r.HEAD(openapispec.Path, openAPISpec)
+
 	// Create a team API Key auth validator
 	AuthenticationFunc := auth.CreateAuthenticationFunc(
 		[]auth.Authenticator{
 			auth.NewApiKeyAuthenticator(apiStore.GetTeamFromAPIKey),
-			auth.NewAccessTokenAuthenticator(apiStore.GetUserFromAccessToken),
 			auth.NewAuthProviderBearerAuthenticator(apiStore.GetUserIDFromAuthProviderToken),
 			auth.NewAuthProviderTeamAuthenticator(apiStore.GetTeamFromAuthProviderToken),
 			auth.NewAdminApiKeyAuthenticator(config.AdminToken),
+			auth.NewAdminJWTAuthenticator(adminJWTVerifier),
 			auth.NewAdminTeamAuthenticator(apiStore.GetTeamFromAdminToken),
 		},
 		metricsMiddleware.SetProcessingStartTime,
@@ -188,7 +216,7 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 				},
 				MultiErrorHandler: utils.MultiErrorHandler,
 				Options: openapi3filter.Options{
-					AuthenticationFunc: AuthenticationFunc,
+					AuthenticationFunc: customMiddleware.WithAPIGroup(AuthenticationFunc),
 					// Handle multiple errors as MultiError type
 					MultiError: true,
 				},
@@ -197,15 +225,18 @@ func NewGinServer(ctx context.Context, config cfg.Config, tel *telemetry.Client,
 
 	r.Use(customMiddleware.InitLaunchDarklyContext)
 
-	// Per-team rate limiting (after auth + LD context, before handlers).
-	// Only applied to connect and resume endpoints. Gated by feature flag.
 	limiter := ratelimit.NewLimiter(redisClient)
-	r.Use(ratelimit.Middleware(limiter, ratelimit.Config{FailOpen: true}, ff)) //nolint:contextcheck // Gin middleware sets context via c.Request.WithContext
+	rateLimitMiddleware, err := ratelimit.Middleware(limiter, ratelimit.Config{FailOpen: true}, ff, tel.MeterProvider, l) //nolint:contextcheck // Gin middleware gets context from the request.
+	if err != nil {
+		l.Fatal(ctx, "failed to create rate limit middleware", zap.Error(err))
+	}
+	r.Use(rateLimitMiddleware)
 
 	// Deny blocked teams on every mutating route unless allowlisted in
 	// EnforceBlockedTeam. Must run after auth (which populates team info on
 	// the gin context) and before the handlers.
 	r.Use(customMiddleware.EnforceBlockedTeam())
+	r.Use(idempotency.Middleware(redisClient, ff)) //nolint:contextcheck // Gin middleware gets context from the request.
 
 	// We now register our store above as the handler for the interface
 	api.RegisterHandlersWithOptions(r, apiStore, api.GinServerOptions{
@@ -260,7 +291,7 @@ func run() int {
 	serviceInstanceID := uuid.New().String()
 	nodeID := env.GetNodeID()
 
-	tel, err := telemetry.New(ctx, nodeID, serviceName, commitSHA, serviceVersion, serviceInstanceID)
+	tel, err := telemetry.NewWithOptions(ctx, nodeID, serviceName, commitSHA, serviceVersion, serviceInstanceID, telemetry.WithDeltaTemporality())
 	if err != nil {
 		logger.L().Fatal(ctx, "failed to create metrics exporter", zap.Error(err))
 	}
@@ -393,14 +424,11 @@ func run() int {
 		return redisClient.Close()
 	})
 
-	featureFlags, err := featureflags.NewClient()
+	featureFlags, err := featureflags.NewClient(config.DeploymentEnvironment, serviceName, serviceVersion, featureflags.WithStartOnInitTimeout())
 	if err != nil {
 		logger.L().Fatal(ctx, "failed to create feature flags client", zap.Error(err))
 	}
 	cleanupFns = append(cleanupFns, featureFlags.Close)
-
-	featureFlags.SetServiceName(serviceName)
-	featureFlags.SetDeploymentName(config.DomainName)
 
 	// External sandbox logger routes through LaunchDarkly (LogsWriteConfigFlag),
 	// falling back to the fixed collector address. Created here so it can use the
@@ -423,6 +451,23 @@ func run() int {
 	//   context so it doesn't exit first.)
 	apiStore := handlers.NewAPIStore(ctx, tel, redisClient, featureFlags, config)
 	cleanupFns = append(cleanupFns, apiStore.Close)
+
+	riverOutbox, err := apiStore.NewOutbox(l)
+	if err != nil {
+		l.Error(ctx, "initializing the outbox", zap.Error(err))
+
+		return 1
+	}
+
+	adminJWTVerifier, err := auth.NewJWKSVerifier(ctx, config.AdminAuthProvider, http.DefaultClient)
+	if err != nil {
+		l.Error(ctx, "initializing admin JWT verifier", zap.Error(err))
+
+		return 1
+	}
+	if adminJWTVerifier == nil {
+		l.Warn(ctx, "ADMIN_AUTH_PROVIDER_CONFIG is not configured; admin JWT requests will return 401")
+	}
 
 	grpcAddr := fmt.Sprintf("0.0.0.0:%d", config.APIInternalGrpcPort)
 	grpcListener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", grpcAddr)
@@ -450,7 +495,13 @@ func run() int {
 	proxygrpc.RegisterSandboxServiceServer(edgeGrpcServer, handlers.NewSandboxService(apiStore, true, clientProxyOAuthVerifier))
 
 	// Pass ctx so in-flight requests survive the serve goroutines' exit during graceful shutdown.
-	s := NewGinServer(ctx, config, tel, l, apiStore, redisClient, featureFlags, swagger, port)
+	s := NewGinServer(ctx, config, tel, l, apiStore, adminJWTVerifier, redisClient, featureFlags, swagger, port)
+
+	if err := riverOutbox.Start(ctx); err != nil {
+		l.Error(ctx, "starting the outbox", zap.Error(err))
+
+		return 1
+	}
 
 	// ////////////////////////
 	//
@@ -543,7 +594,7 @@ func run() int {
 		// to signal that the service is shutting down.
 		// This is a bit of a hack, but this way we can properly propagate
 		// the health status to the load balancer.
-		apiStore.Healthy.Store(false)
+		apiStore.BeginDrain()
 
 		// Skip the delay in local environment for instant shutdown
 		if !env.IsLocal() {
@@ -576,6 +627,21 @@ func run() int {
 			}
 		})
 		drainWG.Wait()
+
+		// A pause outlives the request that started it and writes its snapshot
+		// past the HTTP drain budget, so wait for it here: cleanup below closes
+		// the database and Redis clients it is still using.
+		if err := apiStore.Drain(ctx); err != nil {
+			l.Error(ctx, "sandbox work did not finish before shutdown", zap.Error(err))
+		}
+
+		// Outbox jobs use the same clients. One still running at the deadline
+		// is rescued and retried by another replica; every step is idempotent.
+		outboxStopCtx, outboxStopCancel := context.WithTimeout(ctx, shutdownTimeout)
+		defer outboxStopCancel()
+		if err := riverOutbox.Stop(outboxStopCtx); err != nil {
+			l.Error(ctx, "outbox shutdown error", zap.Error(err))
+		}
 
 		// Drain pprof after, so that it is still available during the shutdown process for debugging if needed.
 		pprofShutdownCtx, pprofCancel := context.WithTimeout(ctx, pprofShutdownTimeout)

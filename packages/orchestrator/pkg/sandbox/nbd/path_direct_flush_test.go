@@ -17,6 +17,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd/testutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
@@ -45,7 +46,7 @@ func (f *failingWriteDevice) WriteZeroesAt(_, _ int64) (int, error) {
 func TestPathDirect_FlushReportsFailedWriteback(t *testing.T) {
 	t.Parallel()
 
-	featureFlags, err := featureflags.NewClient()
+	featureFlags, err := featureflags.NewClient("", "", "")
 	require.NoError(t, err)
 
 	overlay := setupOverlay(t, 10*1024*1024)
@@ -73,7 +74,7 @@ func TestPathDirect_FlushReportsFailedWriteback(t *testing.T) {
 func TestPathDirect_FlushReportsWritebackFailedBeforeFlush(t *testing.T) {
 	t.Parallel()
 
-	featureFlags, err := featureflags.NewClient()
+	featureFlags, err := featureflags.NewClient("", "", "")
 	require.NoError(t, err)
 
 	overlay := setupOverlay(t, 10*1024*1024)
@@ -98,7 +99,7 @@ func TestPathDirect_FlushReportsWritebackFailedBeforeFlush(t *testing.T) {
 func TestPathDirect_FlushPushesBufferedWrites(t *testing.T) {
 	t.Parallel()
 
-	featureFlags, err := featureflags.NewClient()
+	featureFlags, err := featureflags.NewClient("", "", "")
 	require.NoError(t, err)
 
 	overlay := setupOverlay(t, 10*1024*1024)
@@ -152,38 +153,24 @@ func setupOverlay(t *testing.T, size int64) *block.Overlay {
 
 // setupNBDMount is setupNBDDevice's sibling for tests that drive the mount
 // itself rather than the device path it exposes.
-func setupNBDMount(t *testing.T, featureFlags *featureflags.Client, backend block.Device) (*DirectPathMount, string) {
+func setupNBDMount(t *testing.T, featureFlags *featureflags.Client, backend block.Device, mountOpts ...MountOption) (*DirectPathMount, string) {
 	t.Helper()
 
-	devicePool, err := NewDevicePool(64)
-	require.NoError(t, err, "failed to create device pool")
+	devicePool := newPartitionedPool(t)
 
-	poolCtx, poolCancel := context.WithCancel(context.Background())
-	poolClosed := make(chan struct{})
-
-	go func() {
-		devicePool.Populate(poolCtx)
-		close(poolClosed)
-	}()
-
-	mnt := NewDirectPathMount(backend, devicePool, featureFlags)
+	mnt := NewDirectPathMount(backend, devicePool, featureFlags, logger.L(), mountOpts...)
 
 	deviceIndex, err := mnt.Open(t.Context())
 	require.NoError(t, err, "failed to open nbd mount")
 
+	// Registered after newPartitionedPool's cleanup, so the mount closes
+	// before the pool does.
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
 
 		if err := mnt.Close(ctx); err != nil {
 			t.Logf("failed to close nbd mount: %v", err)
-		}
-
-		poolCancel()
-		<-poolClosed
-
-		if err := devicePool.Close(ctx); err != nil {
-			t.Logf("failed to close device pool: %v", err)
 		}
 	})
 

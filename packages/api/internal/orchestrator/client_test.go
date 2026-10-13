@@ -22,11 +22,12 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
-	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	infogrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery/nomad"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
@@ -35,7 +36,7 @@ import (
 // needed for node lookup / discovery tests. Production fields (sandboxStore,
 // analytics, redis, etc.) are left nil because the code paths under test never
 // touch them.
-func newTestOrchestrator(t *testing.T, nomad *nomadapi.Client) *Orchestrator {
+func newTestOrchestrator(t *testing.T, nomadClient *nomadapi.Client) *Orchestrator {
 	t.Helper()
 
 	ctx := t.Context()
@@ -43,7 +44,7 @@ func newTestOrchestrator(t *testing.T, nomad *nomadapi.Client) *Orchestrator {
 
 	return &Orchestrator{
 		nodes:         smap.New[*nodemanager.Node](),
-		nodeDiscovery: discovery.NewNomad(nomad, []string{"orchestrator"}),
+		nodeDiscovery: nomad.NewServices(nomadClient, []string{"orchestrator"}),
 		tel:           telemetry.NewNoopClient(),
 	}
 }
@@ -223,7 +224,7 @@ func TestGetOrConnectNode_ConcurrentCacheMiss_SharesDiscovery(t *testing.T) {
 }
 
 // TestConnectToNode_SingleflightDedup verifies that concurrent connectToNode
-// calls for the same NomadNodeShortID share a single connection attempt
+// calls for the same WorkloadID share a single connection attempt
 func TestConnectToNode_SingleflightDedup(t *testing.T) {
 	t.Parallel()
 
@@ -231,8 +232,8 @@ func TestConnectToNode_SingleflightDedup(t *testing.T) {
 
 	// grpc.NewClient is lazy — it returns immediately — and nodemanager.New
 	// then fails at the ServiceInfo RPC call
-	discovery := nodemanager.NomadServiceDiscovery{
-		NomadNodeShortID:    "abcdef12",
+	discovery := nodemanager.NodePlaneInstance{
+		WorkloadID:          "abcdef12",
 		OrchestratorAddress: "127.0.0.1:1",
 		IPAddress:           "127.0.0.1",
 	}
@@ -305,7 +306,8 @@ func TestGetOrConnectNode_CacheMiss_DiscoversAndConnects(t *testing.T) {
 	node := o.getOrConnectNode(t.Context(), consts.LocalClusterID, orchestratorNodeID)
 	require.NotNil(t, node, "getOrConnectNode must discover and connect the node via Nomad")
 	assert.Equal(t, orchestratorNodeID, node.ID)
-	assert.Equal(t, nomadFullID[:consts.NodeIDLength], node.NomadNodeShortID)
+	assert.Equal(t, nomadFullID[:consts.NodeIDLength], node.WorkloadID)
+	assert.Equal(t, servicediscovery.BackendNomad, node.Backend, "the discovering backend's platform must reach the node catalog")
 }
 
 // TestRegisterNode_NoDuplicates verifies that registerNode is idempotent
@@ -396,4 +398,103 @@ func TestConnectToClusterNode_SkipsLocalCluster(t *testing.T) {
 	o.connectToClusterNode(t.Context(), &clusters.Cluster{ID: consts.LocalClusterID}, nil)
 
 	assert.Zero(t, o.nodes.Count())
+}
+
+// fixedDiscovery returns a canned instance list, so a test can drive the node
+// plane with a backend value the Nomad listers cannot produce.
+type fixedDiscovery struct {
+	instances []servicediscovery.Instance
+}
+
+func (d *fixedDiscovery) ListInstances(context.Context) ([]servicediscovery.Instance, error) {
+	return d.instances, nil
+}
+
+func (d *fixedDiscovery) Start(context.Context) {}
+
+func (d *fixedDiscovery) Stop(context.Context) {}
+
+// Both hops of the tag — discovered instance to node-plane instance, and that
+// to the catalog node — are satisfied by a constant while the only test driving
+// them discovers through Nomad. Hardcoding "nomad" at either site was green.
+func TestGetOrConnectNode_CarriesTheDiscoveryBackendToTheCatalog(t *testing.T) {
+	t.Parallel()
+
+	for name, platform := range map[string]string{
+		"nomad":      servicediscovery.BackendNomad,
+		"kubernetes": servicediscovery.BackendKubernetes,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			nodeID := "orch-" + name
+			port := startFakeOrchestratorGRPC(t, nodeID)
+
+			o := &Orchestrator{
+				nodes: smap.New[*nodemanager.Node](),
+				nodeDiscovery: &fixedDiscovery{instances: []servicediscovery.Instance{{
+					WorkloadID: "workload-" + name,
+					IPAddress:  "127.0.0.1",
+					Port:       uint16(port),
+					Backend:    platform,
+				}}},
+				tel: telemetry.NewNoopClient(),
+			}
+
+			node := o.getOrConnectNode(t.Context(), consts.LocalClusterID, nodeID)
+			require.NotNil(t, node)
+			assert.Equal(t, platform, node.Backend)
+		})
+	}
+}
+
+// countingDiscovery records whether the node plane was consulted.
+type countingDiscovery struct {
+	calls atomic.Int64
+}
+
+func (d *countingDiscovery) ListInstances(context.Context) ([]servicediscovery.Instance, error) {
+	d.calls.Add(1)
+
+	return nil, nil
+}
+
+func (d *countingDiscovery) Start(context.Context) {}
+
+func (d *countingDiscovery) Stop(context.Context) {}
+
+// When the local clusters registry owns orchestrator nodes, the on-demand path
+// must not also discover them through the node plane. Both would register the
+// same process — once under the node ID it reports over gRPC, once under its
+// discovery item ID — and its capacity and sandboxes would count twice. The
+// periodic loop already honours this; the on-demand path used to be a no-op
+// only because the node plane happened to fail in a local environment.
+func TestGetOrConnectNode_LocalRegistryOwnershipSkipsTheNodePlane(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		registryOwns bool
+		wantCalls    int64
+	}{
+		"registry owns orchestrators: the node plane is not consulted": {registryOwns: true, wantCalls: 0},
+		"registry does not own them: the node plane is":                {registryOwns: false, wantCalls: 1},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			discovery := &countingDiscovery{}
+			o := &Orchestrator{
+				nodes:                         smap.New[*nodemanager.Node](),
+				nodeDiscovery:                 discovery,
+				clusters:                      clusters.NewTestPool(),
+				localClusterOwnsOrchestrators: tt.registryOwns,
+			}
+
+			o.getOrConnectNode(t.Context(), consts.LocalClusterID, "absent-node")
+
+			assert.Equal(t, tt.wantCalls, discovery.calls.Load())
+		})
+	}
 }

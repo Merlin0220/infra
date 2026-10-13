@@ -5,10 +5,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
@@ -19,14 +21,22 @@ import (
 const (
 	defaultOidcIssuer  = "http://localhost:4444/"
 	defaultOidcSubject = "local-dev-user"
+
+	// SEED_TEAM_API_KEY=random asks for a freshly generated team API key.
+	randomTeamAPIKey = "random"
+	// The shortest key accepted from SEED_TEAM_API_KEY or its file, in bytes
+	// after the prefix; the fixed development key is exactly this long.
+	minTeamAPIKeyBytes = 16
+	teamAPIKeyFileMode = 0o600
+	// seedTeamAPIKeyName marks the rows this program manages, so a rotation
+	// revokes earlier seed keys and never a key someone created elsewhere.
+	seedTeamAPIKeyName = "local dev seed token"
 )
 
 var (
 	teamID         = uuid.MustParse("0b8a3ded-4489-4722-afd1-1d82e64ec2d5")
-	tokenID        = uuid.MustParse("3d98c426-d348-446b-bdf6-5be3ca4123e2")
-	userTokenValue = "89215020937a4c989cde33d7bc647715"
 	teamTokenValue = "53ae1fed82754c17ad8077fbc8bcdd90"
-	userID         = uuid.MustParse("fb69f46f-eb51-4a87-a14e-306f7a3fd89c")
+	defaultUserID  = uuid.MustParse("fb69f46f-eb51-4a87-a14e-306f7a3fd89c")
 )
 
 func main() {
@@ -38,6 +48,15 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	userID := defaultUserID
+	if raw := strings.TrimSpace(os.Getenv("SEED_USER_ID")); raw != "" {
+		var err error
+		userID, err = uuid.Parse(raw)
+		if err != nil || userID == uuid.Nil {
+			return errors.New("SEED_USER_ID must be a nonzero UUID")
+		}
+	}
+
 	connectionString := os.Getenv("POSTGRES_CONNECTION_STRING")
 
 	if connectionString == "" {
@@ -61,7 +80,7 @@ func run(ctx context.Context) error {
 	defer authDb.Close()
 
 	// create user
-	if err := upsertUser(ctx, authDb); err != nil {
+	if err := upsertUser(ctx, authDb, userID); err != nil {
 		return fmt.Errorf("failed to upsert user: %w", err)
 	}
 
@@ -71,22 +90,37 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("failed to upsert team: %w", err)
 	}
 
-	if err = ensureUserIsOnTeam(ctx, authDb, teamID); err != nil {
+	if err = ensureUserIsOnTeam(ctx, authDb, userID, teamID); err != nil {
 		return fmt.Errorf("failed to ensure user is on team: %w", err)
 	}
 
-	if err = upsertUserIdentity(ctx, authDb, oidcIssuer, oidcSubject); err != nil {
+	if err = upsertUserIdentity(ctx, authDb, userID, oidcIssuer, oidcSubject); err != nil {
 		return fmt.Errorf("failed to upsert user identity: %w", err)
 	}
 
-	// create user token
-	if err = upsertUserToken(ctx, authDb, keys.AccessTokenPrefix, userTokenValue); err != nil {
+	// create team token
+	teamAPIKeyFile := os.Getenv("SEED_TEAM_API_KEY_FILE")
+	teamAPIKey, err := resolveTeamAPIKey(os.Getenv("SEED_TEAM_API_KEY"), teamAPIKeyFile, generateTeamAPIKey)
+	if err != nil {
+		return err
+	}
+
+	if err = rejectForeignTeamAPIKey(ctx, authDb, teamID, teamAPIKey); err != nil {
+		return err
+	}
+
+	if err = upsertTeamAPIKey(ctx, authDb, userID, teamID, keys.ApiKeyPrefix, teamAPIKey); err != nil {
 		return fmt.Errorf("failed to upsert token: %w", err)
 	}
 
-	// create team token
-	if err = upsertTeamAPIKey(ctx, authDb, teamID, keys.ApiKeyPrefix, teamTokenValue); err != nil {
-		return fmt.Errorf("failed to upsert token: %w", err)
+	if teamAPIKey != keys.ApiKeyPrefix+teamTokenValue {
+		if err = revokeOtherSeedKeys(ctx, authDb, teamID, teamAPIKey); err != nil {
+			return fmt.Errorf("failed to revoke the earlier seed keys: %w", err)
+		}
+	}
+
+	if teamAPIKeyFile != "" {
+		fmt.Printf("team api key %s written to %s\n", keys.MaskToken(keys.ApiKeyPrefix, teamAPIKey), teamAPIKeyFile)
 	}
 
 	// create local cluster
@@ -97,7 +131,164 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func upsertTeamAPIKey(ctx context.Context, db *authdb.Client, teamID uuid.UUID, tokenPrefix, token string) error {
+// resolveTeamAPIKey picks the team API key the seed inserts.
+//
+// value is SEED_TEAM_API_KEY: unset or empty keeps the fixed development key,
+// "random" generates one, anything else is the key itself (a value that is only
+// whitespace is a malformed key, not the default). file is SEED_TEAM_API_KEY_FILE:
+// when set, the resolved key is written there, mode 0600, for other processes
+// to read, and in random mode a key already in the file is reused, so a stack
+// keeps its key across re-runs of the seed; an empty file counts as no key yet,
+// which is what an interrupted first run leaves behind. Random mode needs the
+// file: a generated key that nobody records is lost, and the seed does not
+// print secrets.
+func resolveTeamAPIKey(value, file string, generate func() (string, error)) (string, error) {
+	var key string
+
+	trimmed := strings.TrimSpace(value)
+
+	switch {
+	case value == "":
+		key = keys.ApiKeyPrefix + teamTokenValue
+	case trimmed == randomTeamAPIKey:
+		if file == "" {
+			return "", errors.New("SEED_TEAM_API_KEY=random needs SEED_TEAM_API_KEY_FILE, the file the generated key is kept in")
+		}
+
+		stored, err := os.ReadFile(file)
+		switch {
+		case err != nil && !errors.Is(err, fs.ErrNotExist):
+			return "", fmt.Errorf("failed to read SEED_TEAM_API_KEY_FILE %s: %w", file, err)
+		case err == nil && strings.TrimSpace(string(stored)) != "":
+			// Reused, and rewritten below so the file ends up 0600 and normalised
+			// whatever created it.
+			key, err = parseTeamAPIKey(string(stored))
+			if err != nil {
+				return "", fmt.Errorf("SEED_TEAM_API_KEY_FILE %s: %w", file, err)
+			}
+		default:
+			key, err = generate()
+			if err != nil {
+				return "", fmt.Errorf("failed to generate a team api key: %w", err)
+			}
+		}
+	default:
+		var err error
+
+		key, err = parseTeamAPIKey(trimmed)
+		if err != nil {
+			return "", fmt.Errorf("SEED_TEAM_API_KEY: %w", err)
+		}
+	}
+
+	if file != "" {
+		if err := writeTeamAPIKeyFile(file, key); err != nil {
+			return "", fmt.Errorf("failed to write SEED_TEAM_API_KEY_FILE %s: %w", file, err)
+		}
+	}
+
+	return key, nil
+}
+
+// writeTeamAPIKeyFile truncates or creates file, forces its mode to 0600 and
+// only then writes the key, so a pre-existing world-readable file never holds
+// it (os.WriteFile applies the mode only when it creates the file).
+func writeTeamAPIKeyFile(file, key string) error {
+	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, teamAPIKeyFileMode)
+	if err != nil {
+		return err
+	}
+
+	if err := f.Chmod(teamAPIKeyFileMode); err != nil {
+		_ = f.Close()
+
+		return err
+	}
+
+	if _, err := f.WriteString(key + "\n"); err != nil {
+		_ = f.Close()
+
+		return err
+	}
+
+	return f.Close()
+}
+
+// parseTeamAPIKey accepts the form the SDK sends: the e2b_ prefix followed by
+// the hex of at least minTeamAPIKeyBytes bytes.
+func parseTeamAPIKey(raw string) (string, error) {
+	key := strings.TrimSpace(raw)
+	if !strings.HasPrefix(key, keys.ApiKeyPrefix) {
+		return "", fmt.Errorf("a team api key starts with %q", keys.ApiKeyPrefix)
+	}
+
+	value, err := hex.DecodeString(strings.TrimPrefix(key, keys.ApiKeyPrefix))
+	if err != nil {
+		return "", errors.New("a team api key is hex after the prefix")
+	}
+
+	if len(value) < minTeamAPIKeyBytes {
+		return "", fmt.Errorf("a team api key has at least %d hex characters after the prefix", 2*minTeamAPIKeyBytes)
+	}
+
+	return key, nil
+}
+
+func generateTeamAPIKey() (string, error) {
+	key, err := keys.GenerateKey(keys.ApiKeyPrefix)
+	if err != nil {
+		return "", err
+	}
+
+	return key.PrefixedRawValue, nil
+}
+
+// rejectForeignTeamAPIKey refuses a key that already authenticates another
+// team. The hash column is unique, so inserting it for this team would be
+// swallowed as a duplicate and the seed would then revoke this team's own key
+// while the configured one kept working as the other team's.
+func rejectForeignTeamAPIKey(ctx context.Context, db *authdb.Client, teamID uuid.UUID, key string) error {
+	hash, _, err := createTokenHash(keys.ApiKeyPrefix, key)
+	if err != nil {
+		return err
+	}
+
+	var others int
+	err = db.TestsRawSQLQuery(ctx, `SELECT count(*) FROM team_api_keys WHERE api_key_hash = $1 AND team_id <> $2`, func(rows pgx.Rows) error {
+		for rows.Next() {
+			if err := rows.Scan(&others); err != nil {
+				return err
+			}
+		}
+
+		return rows.Err()
+	}, hash, teamID)
+	if err != nil {
+		return fmt.Errorf("failed to check the team api key's owner: %w", err)
+	}
+
+	if others > 0 {
+		return errors.New("SEED_TEAM_API_KEY is already the key of another team; choose another key")
+	}
+
+	return nil
+}
+
+// revokeOtherSeedKeys deletes every other key this program inserted for the
+// team, so a rotation (a new explicit key, or a new generated one after the
+// file was removed) leaves exactly one seed key, and an in-place upgrade of
+// an install seeded with the fixed development key stops accepting it. Keys
+// created elsewhere carry other names and are never touched.
+func revokeOtherSeedKeys(ctx context.Context, db *authdb.Client, teamID uuid.UUID, key string) error {
+	hash, _, err := createTokenHash(keys.ApiKeyPrefix, key)
+	if err != nil {
+		return err
+	}
+
+	return db.TestsRawSQL(ctx, `DELETE FROM team_api_keys WHERE team_id = $1 AND name = $2 AND api_key_hash <> $3`, teamID, seedTeamAPIKeyName, hash)
+}
+
+func upsertTeamAPIKey(ctx context.Context, db *authdb.Client, userID, teamID uuid.UUID, tokenPrefix, token string) error {
 	tokenHash, tokenMask, err := createTokenHash(tokenPrefix, token)
 	if err != nil {
 		return fmt.Errorf("failed to create token hash: %w", err)
@@ -111,7 +302,7 @@ func upsertTeamAPIKey(ctx context.Context, db *authdb.Client, teamID uuid.UUID, 
 		ApiKeyLength:     int32(tokenMask.ValueLength),
 		ApiKeyMaskPrefix: tokenMask.MaskedValuePrefix,
 		ApiKeyMaskSuffix: tokenMask.MaskedValueSuffix,
-		Name:             "local dev seed token",
+		Name:             seedTeamAPIKeyName,
 	}); ignoreConstraints(err) != nil {
 		return fmt.Errorf("failed to create team api key: %w", err)
 	}
@@ -119,7 +310,7 @@ func upsertTeamAPIKey(ctx context.Context, db *authdb.Client, teamID uuid.UUID, 
 	return nil
 }
 
-func upsertUserIdentity(ctx context.Context, db *authdb.Client, oidcIssuer, oidcSubject string) error {
+func upsertUserIdentity(ctx context.Context, db *authdb.Client, userID uuid.UUID, oidcIssuer, oidcSubject string) error {
 	if _, err := db.UpsertPublicIdentity(ctx, authqueries.UpsertPublicIdentityParams{
 		OidcIss: oidcIssuer,
 		OidcSub: oidcSubject,
@@ -131,42 +322,13 @@ func upsertUserIdentity(ctx context.Context, db *authdb.Client, oidcIssuer, oidc
 	return nil
 }
 
-func ensureUserIsOnTeam(ctx context.Context, db *authdb.Client, teamID uuid.UUID) error {
+func ensureUserIsOnTeam(ctx context.Context, db *authdb.Client, userID, teamID uuid.UUID) error {
 	if err := db.TestsRawSQL(ctx, `
 INSERT INTO users_teams (user_id, team_id, is_default)
-VALUES ($1, $2, $3)
-ON CONFLICT DO NOTHING;`, userID, teamID, true); err != nil {
+VALUES ($1, $2, NOT EXISTS (SELECT 1 FROM users_teams WHERE user_id = $1 AND is_default))
+ON CONFLICT (team_id, user_id) DO UPDATE
+SET is_default = users_teams.is_default OR EXCLUDED.is_default;`, userID, teamID); err != nil {
 		return fmt.Errorf("failed to add user to team: %w", err)
-	}
-
-	if err := db.TestsRawSQL(ctx, `
-UPDATE users_teams 
-SET is_default = CASE WHEN team_id = $2 THEN true ELSE false END 
-WHERE user_id = $1
-`, userID, teamID); err != nil {
-		return fmt.Errorf("failed to set test team as default: %w", err)
-	}
-
-	return nil
-}
-
-func upsertUserToken(ctx context.Context, db *authdb.Client, tokenPrefix, token string) error {
-	tokenHash, tokenMask, err := createTokenHash(tokenPrefix, token)
-	if err != nil {
-		return fmt.Errorf("failed to create token hash: %w", err)
-	}
-
-	if _, err = db.CreateAccessToken(ctx, authqueries.CreateAccessTokenParams{
-		ID:                    tokenID,
-		UserID:                userID,
-		AccessTokenHash:       tokenHash,
-		AccessTokenPrefix:     tokenMask.Prefix,
-		AccessTokenLength:     int32(tokenMask.ValueLength),
-		AccessTokenMaskPrefix: tokenMask.MaskedValuePrefix,
-		AccessTokenMaskSuffix: tokenMask.MaskedValueSuffix,
-		Name:                  "local dev seed token",
-	}); ignoreConstraints(err) != nil {
-		return fmt.Errorf("failed to create token: %w", err)
 	}
 
 	return nil
@@ -174,8 +336,7 @@ func upsertUserToken(ctx context.Context, db *authdb.Client, tokenPrefix, token 
 
 func ignoreConstraints(err error) error {
 	// sqlc check
-	var pgconnErr *pgconn.PgError
-	if errors.As(err, &pgconnErr) {
+	if pgconnErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		if pgconnErr.Code == "23505" {
 			return nil
 		}
@@ -201,7 +362,7 @@ ON CONFLICT (id) DO UPDATE SET
 	return teamID, nil
 }
 
-func upsertUser(ctx context.Context, db *authdb.Client) error {
+func upsertUser(ctx context.Context, db *authdb.Client, userID uuid.UUID) error {
 	err := db.TestsRawSQL(ctx, `
 INSERT INTO auth.users (id, email)
 VALUES ($1, $2)

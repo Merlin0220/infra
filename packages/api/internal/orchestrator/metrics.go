@@ -49,6 +49,7 @@ func (o *Orchestrator) setupMetrics(meterProvider metric.MeterProvider) error {
 				obs.ObserveInt64(gauge, 1, metric.WithAttributes(
 					attribute.String("status", string(node.Status())),
 					attribute.String("node.id", node.ID),
+					attribute.String("backend", node.Backend),
 				))
 			}
 
@@ -64,6 +65,10 @@ func (o *Orchestrator) setupMetrics(meterProvider metric.MeterProvider) error {
 
 	if o.resumeOriginNodeRemapCounter, err = telemetry.GetCounter(meter, telemetry.ApiOrchestratorResumeOriginNodeRemap); err != nil {
 		return fmt.Errorf("failed to create resume origin node remap counter: %w", err)
+	}
+
+	if o.pauseRefusalRestoreCounter, err = telemetry.GetCounter(meter, telemetry.ApiOrchestratorPauseRefusalRestore); err != nil {
+		return fmt.Errorf("failed to create pause refusal restore counter: %w", err)
 	}
 
 	// Observable gauge that reads sandbox counts from Redis on each collection interval.

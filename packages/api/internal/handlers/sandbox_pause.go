@@ -23,6 +23,25 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
+// pauseOrchestrator is the slice of *orchestrator.Orchestrator the pause
+// handler consumes — an interface so the load-bearing wiring (the fs-only
+// gate's refusal landing BEFORE RemoveSandbox commits) is testable without a
+// real orchestrator.
+type pauseOrchestrator interface {
+	GetSandbox(ctx context.Context, teamID uuid.UUID, sandboxID string) (sandbox.Sandbox, error)
+	RemoveSandbox(ctx context.Context, teamID uuid.UUID, sandboxID string, opts sandbox.RemoveOpts) error
+}
+
+// pauseBackend returns the pause handler's orchestrator slice, overridable in
+// tests via pauseBackendOverride.
+func (a *APIStore) pauseBackend() pauseOrchestrator {
+	if a.pauseBackendOverride != nil {
+		return a.pauseBackendOverride
+	}
+
+	return a.orchestrator
+}
+
 func (a *APIStore) PostSandboxesSandboxIDPause(c *gin.Context, sandboxID api.SandboxID) {
 	ctx := c.Request.Context()
 	// Get team from context, use TeamContextKey
@@ -55,34 +74,55 @@ func (a *APIStore) PostSandboxesSandboxIDPause(c *gin.Context, sandboxID api.San
 	}
 	filesystemOnly := body.Memory != nil && !*body.Memory
 
-	pause.LogInitiated(ctx, sandboxID, teamID.String(), pause.ReasonRequest)
+	// Version-gate filesystem-only snapshots HERE, before the pause chain
+	// commits: RemoveSandbox tears down routing and store state regardless of
+	// the orchestrator RPC's outcome, so a refusal any later than this would
+	// leave a live VM for the orphan reconciler to kill. Refused here, the
+	// sandbox keeps running untouched. The check is EXACT — no flag
+	// re-resolution — so for records carrying the orchestrator-resolved
+	// version it cannot disagree with the orchestrator's own gate;
+	backend := a.pauseBackend()
 
-	err = a.orchestrator.RemoveSandbox(ctx, teamID, sandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionPause, FilesystemOnly: filesystemOnly})
+	pause.LogInitiated(ctx, sandboxID, teamID.String(), pause.ReasonRequest, filesystemOnly)
+
+	err = backend.RemoveSandbox(ctx, teamID, sandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionPause, FilesystemOnly: filesystemOnly})
 	var transErr *sandbox.InvalidStateTransitionError
 
 	switch {
 	case err == nil:
-		pause.LogSuccess(ctx, sandboxID, teamID.String(), pause.ReasonRequest)
+		pause.LogSuccess(ctx, sandboxID, teamID.String(), pause.ReasonRequest, filesystemOnly)
 	case errors.Is(err, orchestrator.ErrSandboxNotFound):
 		apiErr := pauseHandleNotRunningSandbox(ctx, a.snapshotCache, sandboxID, teamID)
 		switch apiErr.Code {
 		case http.StatusConflict:
-			pause.LogSkipped(ctx, sandboxID, teamID.String(), pause.ReasonRequest, pause.SkipReasonAlreadyPaused)
+			pause.LogSkipped(ctx, sandboxID, teamID.String(), pause.ReasonRequest, pause.SkipReasonAlreadyPaused, filesystemOnly)
 		case http.StatusNotFound:
-			pause.LogSkipped(ctx, sandboxID, teamID.String(), pause.ReasonRequest, pause.SkipReasonNotFound)
+			pause.LogSkipped(ctx, sandboxID, teamID.String(), pause.ReasonRequest, pause.SkipReasonNotFound, filesystemOnly)
 		default:
-			pause.LogFailure(ctx, sandboxID, teamID.String(), pause.ReasonRequest, err)
+			pause.LogFailure(ctx, sandboxID, teamID.String(), pause.ReasonRequest, filesystemOnly, err)
 		}
 		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
 
 		return
 	case errors.As(err, &transErr):
-		pause.LogFailure(ctx, sandboxID, teamID.String(), pause.ReasonRequest, err)
+		pause.LogFailure(ctx, sandboxID, teamID.String(), pause.ReasonRequest, filesystemOnly, err)
 		a.sendAPIStoreError(c, http.StatusConflict, fmt.Sprintf("Sandbox '%s' cannot be paused while in '%s' state", sandboxID, transErr.CurrentState))
 
 		return
+	// Reached only after the API restored the sandbox, so the retry can succeed.
+	case errors.Is(err, orchestrator.PauseQueueExhaustedError{}):
+		pause.LogSkipped(ctx, sandboxID, teamID.String(), pause.ReasonRequest, pause.SkipReasonAdmissionRefused, filesystemOnly)
+		a.sendAPIStoreError(c, http.StatusServiceUnavailable, fmt.Sprintf("Sandbox '%s' cannot be paused right now because its node is busy, please retry", sandboxID))
+
+		return
+	// The sandbox is untouched: another replica, or a retry here, can pause it.
+	case errors.Is(err, orchestrator.ErrDraining):
+		pause.LogSkipped(ctx, sandboxID, teamID.String(), pause.ReasonRequest, pause.SkipReasonDraining, filesystemOnly)
+		a.sendAPIStoreError(c, http.StatusServiceUnavailable, fmt.Sprintf("Sandbox '%s' cannot be paused right now because the server is shutting down, please retry", sandboxID))
+
+		return
 	default:
-		pause.LogFailure(ctx, sandboxID, teamID.String(), pause.ReasonRequest, err)
+		pause.LogFailure(ctx, sandboxID, teamID.String(), pause.ReasonRequest, filesystemOnly, err)
 		telemetry.ReportError(ctx, "error pausing sandbox", err)
 
 		a.sendAPIStoreError(c, http.StatusInternalServerError, "Error pausing sandbox")

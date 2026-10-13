@@ -105,22 +105,43 @@ func TestSandboxRecordDoesNotExposeApiKeyAuth(t *testing.T) {
 	require.False(t, securityIncludesScheme(operation.Security, "ApiKeyAuth"), "sandbox recording must stay out of API-key auth")
 }
 
-func TestTeamStatusRouteUsesBearerOrAdminAuth(t *testing.T) {
+func TestTeamStatusRouteUsesTeamOrAdminAuth(t *testing.T) {
 	t.Parallel()
 
 	swagger, err := GetSwagger()
 	require.NoError(t, err)
 
-	operation := operationForRoute(t, swagger, http.MethodGet, "/teams/{teamID}/status")
-	require.NotNil(t, operation.Security)
-	require.Len(t, *operation.Security, 2)
-	assert.True(t, securityIncludesScheme(operation.Security, "AuthProviderBearerAuth"))
-	assert.True(t, securityIncludesScheme(operation.Security, "AdminApiKeyAuth"))
-	assert.False(t, securityIncludesScheme(operation.Security, "AuthProviderTeamAuth"))
+	assertTeamOrAdminAuth(t, swagger, "/teams/{teamID}/status")
+}
 
-	for _, requirement := range *operation.Security {
-		assert.Len(t, requirement, 1)
-	}
+func TestTeamLimitsRouteUsesTeamOrAdminAuth(t *testing.T) {
+	t.Parallel()
+
+	swagger, err := GetSwagger()
+	require.NoError(t, err)
+
+	assertTeamOrAdminAuth(t, swagger, "/teams/{teamID}/limits")
+}
+
+func assertTeamOrAdminAuth(t *testing.T, swagger *openapi3.T, path string) {
+	t.Helper()
+
+	operation := operationForRoute(t, swagger, http.MethodGet, path)
+	require.NotNil(t, operation.Security)
+	require.Len(t, *operation.Security, 3)
+
+	teamRequirement := (*operation.Security)[0]
+	assert.Len(t, teamRequirement, 2)
+	assert.Contains(t, teamRequirement, "AuthProviderBearerAuth")
+	assert.Contains(t, teamRequirement, "AuthProviderTeamAuth")
+
+	adminTokenRequirement := (*operation.Security)[1]
+	assert.Len(t, adminTokenRequirement, 1)
+	assert.Contains(t, adminTokenRequirement, "AdminApiKeyAuth")
+
+	adminJWTRequirement := (*operation.Security)[2]
+	assert.Len(t, adminJWTRequirement, 1)
+	assert.Contains(t, adminJWTRequirement, "AdminJWTAuth")
 }
 
 func TestProjectMemberApplyRequestIsBounded(t *testing.T) {

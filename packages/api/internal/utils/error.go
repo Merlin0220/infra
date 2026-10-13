@@ -63,9 +63,24 @@ func ErrorHandler(c *gin.Context, message string, statusCode int) {
 		strings.HasPrefix(c.Request.URL.Path, "/envs"):
 		errMsg = fmt.Errorf("OpenAPI validation error, old endpoints: %s", message)
 		message = "Endpoints are deprecated, please update your SDK to use the new endpoints."
-	case strings.HasPrefix(c.Request.URL.Path, "/templates") && strings.HasPrefix(c.Request.Header.Get("Content-Type"), "multipart/form-data"):
-		errMsg = fmt.Errorf("OpenAPI validation error, old CLI: %s", message)
-		message = "Endpoint deprecated please update your CLI to the latest version"
+	case strings.HasPrefix(c.Request.URL.Path, "/events/webhooks"):
+		// A webhook create or update body carries the caller's signing secret,
+		// which is enough to forge a delivery for that team, so the body is
+		// not read into the error the way it is below. The validator's own
+		// account of what it refused is kept: the spec documents these 400s,
+		// and the message names the field rather than quoting its value.
+		errMsg = fmt.Errorf("OpenAPI validation error: %s", message)
+	case strings.HasPrefix(c.Request.URL.Path, "/v2/templates/") && strings.Contains(c.Request.URL.Path, "/builds/"):
+		// A template build start body can carry the caller's private registry
+		// credentials (fromImageRegistry), so it is not read into the error
+		// either; the validator's message names the refused field.
+		errMsg = fmt.Errorf("OpenAPI validation error: %s", message)
+	case isAuthFailure(message):
+		// The validator checks credentials before the body, so the body plays
+		// no part in an authentication failure. It is not read into the error:
+		// a request reaching a server that does not hold the caller's key
+		// would otherwise have its body logged there.
+		errMsg = fmt.Errorf("OpenAPI security error: %s", message)
 	default:
 		data, err := c.GetRawData()
 		if err == nil {
@@ -110,6 +125,18 @@ func ErrorHandler(c *gin.Context, message string, statusCode int) {
 	}
 
 	c.AbortWithStatusJSON(statusCode, gin.H{"code": statusCode, "message": fmt.Errorf("validation error: %s", message).Error()})
+}
+
+// isAuthFailure reports whether message is a rejection ProcessSecurityErrors
+// produced: a missing or invalid credential, or a forbidden or blocked team.
+func isAuthFailure(message string) bool {
+	for _, prefix := range []string{sharedauth.SecurityErrPrefix, sharedauth.ForbiddenErrPrefix, sharedauth.BlockedErrPrefix} {
+		if strings.HasPrefix(message, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // MultiErrorHandler handles wrapped SecurityRequirementsError, so there are no multiple errors returned to the user.

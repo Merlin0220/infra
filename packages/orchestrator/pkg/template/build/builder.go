@@ -35,8 +35,6 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases/steps"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases/user"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/storage/cache"
-	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/writer"
-	artifactsregistry "github.com/e2b-dev/infra/packages/shared/pkg/artifacts-registry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/dockerhub"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	orchestratorgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
@@ -49,8 +47,6 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-const progressDelay = 5 * time.Second
-
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build")
 
 type Builder struct {
@@ -60,7 +56,6 @@ type Builder struct {
 	sandboxFactory      *sandbox.Factory
 	templateStorage     storage.StorageProvider
 	buildStorage        storage.StorageProvider
-	artifactRegistry    artifactsregistry.ArtifactsRegistry
 	dockerhubRepository dockerhub.RemoteRepository
 	proxy               *proxy.SandboxProxy
 	sandboxes           *sandbox.Map
@@ -77,7 +72,6 @@ func NewBuilder(
 	sandboxFactory *sandbox.Factory,
 	templateStorage storage.StorageProvider,
 	buildStorage storage.StorageProvider,
-	artifactRegistry artifactsregistry.ArtifactsRegistry,
 	dockerhubRepository dockerhub.RemoteRepository,
 	proxy *proxy.SandboxProxy,
 	sandboxes *sandbox.Map,
@@ -92,7 +86,6 @@ func NewBuilder(
 		sandboxFactory:      sandboxFactory,
 		templateStorage:     templateStorage,
 		buildStorage:        buildStorage,
-		artifactRegistry:    artifactRegistry,
 		dockerhubRepository: dockerhubRepository,
 		proxy:               proxy,
 		sandboxes:           sandboxes,
@@ -125,6 +118,9 @@ type Result struct {
 // 8. Snapshot
 // 9. Upload template (and all not yet uploaded layers)
 func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.TemplateConfig, logsCore zapcore.Core) (r *Result, e error) {
+	// The caller's span (template-background-build for gRPC builds); captured
+	// before we open our own so the result attribute lands on both.
+	parentSpan := trace.SpanFromContext(ctx)
 	ctx, childSpan := tracer.Start(ctx, "build")
 	defer childSpan.End()
 
@@ -135,34 +131,37 @@ func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.Tem
 		featureflags.TeamContext(cfg.TeamID),
 	)
 
-	// Record build duration and result at the end
+	// Record build duration and result at the end. This defer is registered
+	// first so it runs last, after the deferred WrapContextAsUserError below has
+	// produced the final error; the metric label and the span attribute are
+	// derived from that same final error so they can never disagree.
 	startTime := time.Now()
 	defer func() {
 		duration := time.Since(startTime)
 		success := e == nil && r != nil
-		b.metrics.RecordBuildDuration(ctx, duration, success)
+		b.metrics.RecordBuildDuration(ctx, cfg.TeamID, duration, success)
 
+		resultType := ClassifyBuildResult(r, e)
+		b.metrics.RecordBuildResult(ctx, cfg.TeamID, resultType)
 		if success {
-			b.metrics.RecordBuildResult(ctx, cfg.TeamID, metrics.BuildResultSuccess)
-			b.metrics.RecordRootfsSize(ctx, units.MBToBytes(r.RootfsSizeMB))
-		} else {
-			// Determine if the error is a user error or internal error
-			var resultType metrics.BuildResultType
-			if builderrors.IsUserError(e) {
-				resultType = metrics.BuildResultUserError
-			} else {
-				resultType = metrics.BuildResultInternalError
-			}
-			b.metrics.RecordBuildResult(ctx, cfg.TeamID, resultType)
+			b.metrics.RecordRootfsSize(ctx, cfg.TeamID, units.MBToBytes(r.RootfsSizeMB))
 		}
+
+		// Stamp the classification on the build span and on the caller's span
+		// (template-background-build for gRPC builds) so any span in the trace
+		// can be filtered by build.result without knowing which span carries an
+		// Error status. Child spans keep Error status for every failed
+		// operation, including user command failures; this attribute is the
+		// only place that says whose fault it was.
+		resultAttr := metrics.BuildResultAttribute(resultType)
+		childSpan.SetAttributes(resultAttr)
+		parentSpan.SetAttributes(resultAttr)
 	}()
 
 	cacheScope := cfg.CacheScope
 
 	// Validate template, update force layers if needed
 	cfg = forceSteps(cfg)
-
-	isV1Build := utils.IsVersion(cfg.Version, templates.TemplateV1Version) || (cfg.FromImage == "" && cfg.FromTemplate == nil)
 
 	l := logger.NewTracedLoggerFromCore(logsCore)
 	defer func(ctx context.Context) {
@@ -202,12 +201,6 @@ func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.Tem
 		}
 	}()
 
-	if isV1Build {
-		hookedCore, done := writer.NewPostProcessor(ctx, progressDelay, logsCore)
-		defer done()
-		l = logger.NewTracedLoggerFromCore(hookedCore)
-	}
-
 	l.Info(ctx, fmt.Sprintf("Building template %s/%s", cfg.TemplateID, paths.BuildID))
 
 	defer func(ctx context.Context) {
@@ -222,7 +215,20 @@ func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.Tem
 		}
 	}(context.WithoutCancel(ctx))
 
-	envdVersion, err := envd.GetEnvdVersion(ctx, b.config.HostEnvdPath)
+	// The envd baked into this build is selected per build by the
+	// build-envd-version flag (default: the node-local promoted binary),
+	// exactly like BuildKernelVersion / BuildFirecrackerVersion — a version
+	// roll is a flag change, never a process restart or node change. The ctx
+	// carries the template/team LD context, so cohort canaries work. The
+	// resolved path is threaded to every consumer through the BuildContext's
+	// BuilderConfig copy.
+	envdTarget := b.featureFlags.StringFlag(ctx, featureflags.BuildEnvdVersion)
+	hostEnvdPath, err := envd.ResolveBuildBinary(ctx, envdTarget, b.config.HostEnvdPath)
+	if err != nil {
+		return nil, fmt.Errorf("error resolving envd binary for build: %w", err)
+	}
+
+	envdVersion, err := envd.GetEnvdVersion(ctx, hostEnvdPath)
 	if err != nil {
 		return nil, fmt.Errorf("error getting envd version: %w", err)
 	}
@@ -257,18 +263,35 @@ func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.Tem
 		}
 	}()
 
+	builderConfig := b.config
+	builderConfig.HostEnvdPath = hostEnvdPath
+
 	buildContext := buildcontext.BuildContext{
-		BuilderConfig:  b.config,
+		BuilderConfig:  builderConfig,
 		Config:         cfg,
 		Template:       paths,
 		UploadErrGroup: uploadErrGroup,
 		EnvdVersion:    envdVersion,
 		CacheScope:     cacheScope,
-		IsV1Build:      isV1Build,
 		Version:        cfg.Version,
+		Rootfs:         resolveRootfsOptions(ctx, b.featureFlags, cfg),
 	}
 
 	return runBuild(ctx, l, buildContext, b)
+}
+
+// resolveRootfsOptions evaluates, once per build, the flags that shape the
+// baked rootfs files; buildcontext.RootfsOptions says why once. It uses the
+// template and team contexts, as the provision version does.
+func resolveRootfsOptions(ctx context.Context, featureFlags *featureflags.Client, cfg config.TemplateConfig) buildcontext.RootfsOptions {
+	return buildcontext.RootfsOptions{
+		EnvdMemoryProtection: featureFlags.BoolFlag(
+			ctx,
+			featureflags.BuildEnvdMemoryProtection,
+			featureflags.TemplateContext(cfg.TemplateID),
+			featureflags.TeamContext(cfg.TeamID),
+		),
+	}
 }
 
 func (b *Builder) useNFSCache(ctx context.Context) (string, bool) {
@@ -322,7 +345,6 @@ func runBuild(
 		builder.logger,
 		builder.proxy,
 		templateStorage,
-		builder.artifactRegistry,
 		builder.dockerhubRepository,
 		layerExecutor,
 		index,
@@ -440,9 +462,10 @@ func runBuild(
 }
 
 func templateSchedulingMetadata(ctx context.Context, cache *sbxtemplate.Cache, buildID string) *orchestratorgrpc.SchedulingMetadata {
-	// Use GetTemplate (not GetCachedTemplate): the optimize phase invalidates
-	// the final build from the cache, so re-fetch to resolve its headers.
-	t, err := cache.GetTemplate(ctx, buildID, false, false)
+	// A lookup that fetches on a miss: the optimize phase invalidates the final
+	// build from the cache, so re-fetch to resolve its headers.
+	t, release, err := cache.GetTemplatePinned(ctx, buildID, false, false)
+	defer release()
 	if err != nil {
 		return nil
 	}

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -16,7 +18,6 @@ import (
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/api/internal/metrics"
-	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/evictor"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/nodemanager"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator/placement"
@@ -24,10 +25,9 @@ import (
 	redisreservations "github.com/e2b-dev/infra/packages/api/internal/sandbox/reservations/redis"
 	redisbackend "github.com/e2b-dev/infra/packages/api/internal/sandbox/storage/redis"
 	sqlcdb "github.com/e2b-dev/infra/packages/db/client"
-	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
-	e2bcatalog "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-catalog"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
@@ -35,7 +35,19 @@ import (
 
 const statusLogInterval = time.Second * 20
 
+// trackedWorkBound is the longest a tracked pause can hold its count: the
+// pause budget, then the terminal build-status write, which opens a fresh
+// budget once the pause context has expired.
+const trackedWorkBound = pauseTimeout + buildStatusWriteTimeout
+
+// workDrainGrace pads trackedWorkBound so the drain outlasts the work.
+const workDrainGrace = 5 * time.Second
+
 var ErrNodeNotFound = errors.New("node not found")
+
+// ErrDraining is defined in the sandbox package so the evictor can classify it
+// without an import cycle.
+var ErrDraining = sandbox.ErrDraining
 
 // SnapshotCacheInvalidator invalidates cached snapshot entries.
 type SnapshotCacheInvalidator interface {
@@ -44,14 +56,13 @@ type SnapshotCacheInvalidator interface {
 
 type Orchestrator struct {
 	httpClient                    *http.Client
-	nodeDiscovery                 discovery.Discovery
+	nodeDiscovery                 servicediscovery.Discoverer
 	sandboxStore                  *sandbox.Store
 	nodes                         *smap.Map[*nodemanager.Node]
 	placementAlgorithm            *placement.BestOfK
 	featureFlagsClient            *featureflags.Client
 	analytics                     *analyticscollector.Analytics
 	posthogClient                 *analyticscollector.PosthogClient
-	routingCatalog                e2bcatalog.SandboxesCatalog
 	sqlcDB                        *sqlcdb.Client
 	tel                           *telemetry.Client
 	clusters                      *clusters.Pool
@@ -59,6 +70,7 @@ type Orchestrator struct {
 	sandboxCountGaugeRegistration metric.Registration
 	createdSandboxesCounter       metric.Int64Counter
 	resumeOriginNodeRemapCounter  metric.Int64Counter
+	pauseRefusalRestoreCounter    metric.Int64Counter
 	teamMetricsObserver           *metrics.TeamObserver
 	accessTokenGenerator          *sandbox.AccessTokenGenerator
 	createdCounter                metric.Int64Counter
@@ -66,6 +78,14 @@ type Orchestrator struct {
 
 	snapshotUpsertSem *utils.AdjustableSemaphore
 	redisStorage      *redisbackend.Storage
+
+	// work tracks operations that continue after their caller is gone, so a
+	// drain waits for them instead of killing them mid-write.
+	work            sync.WaitGroup
+	outstandingWork atomic.Int64
+	drainMu         sync.RWMutex
+	draining        bool
+	scoreHugepages  bool
 
 	// localClusterOwnsOrchestrators makes connectToClusterNode register
 	// local-cluster instances that report the Orchestrator role as nodes.
@@ -83,7 +103,7 @@ type Orchestrator struct {
 	localClusterOwnsOrchestrators bool
 
 	// connectGroup deduplicates concurrent dial+register attempts for the same
-	// physical node. It is keyed by NomadNodeShortID (Nomad-managed nodes) or
+	// physical node. It is keyed by WorkloadID (Nomad-managed nodes) or
 	// scopedNodeID(clusterID, instanceNodeID) (cluster nodes) and is held inside
 	// connectToNode / connectToClusterNode, so it guards every connection path
 	// regardless of what triggered the attempt.
@@ -96,13 +116,16 @@ type Orchestrator struct {
 	// same string, and nesting Do calls for the same key on the same Group would
 	// block forever.
 	discoveryGroup singleflight.Group
+
+	startup *startupGate
 }
 
 func New(
 	ctx context.Context,
 	config cfg.Config,
 	tel *telemetry.Client,
-	nodeDiscovery discovery.Discovery,
+	nodeDiscovery servicediscovery.Discoverer,
+	localRegistryOwnsOrchestrators bool,
 	posthogClient *analyticscollector.PosthogClient,
 	redisClient redis.UniversalClient,
 	sqlcDB *sqlcdb.Client,
@@ -124,8 +147,6 @@ func New(
 	}
 	analyticsInstance.Init(ctx)
 
-	routingCatalog := e2bcatalog.NewRedisSandboxCatalog(redisClient)
-
 	// We will need to either use Redis or Consul's KV for storing active sandboxes to keep everything in sync,
 	// right now we load them from Orchestrator
 	meter := tel.MeterProvider.Meter("github.com/e2b-dev/infra/packages/api/internal/orchestrator")
@@ -141,7 +162,7 @@ func New(
 		Timeout: nodeHealthCheckTimeout,
 	}
 
-	bestOfKAlgorithm := placement.NewBestOfK(getBestOfKConfig(ctx, featureFlags)).(*placement.BestOfK)
+	bestOfKAlgorithm := placement.NewBestOfK(getBestOfKConfig(ctx, featureFlags, config.BestOfKHugepageMemory)).(*placement.BestOfK)
 
 	redisStorage, err := redisbackend.NewStorage(redisClient, tel.MeterProvider, featureFlags)
 	if err != nil {
@@ -149,9 +170,13 @@ func New(
 	}
 	go redisStorage.Start(ctx)
 
-	// For local development and testing, we skip the Nomad sync
-	// Local cluster is used for single-node setups instead
-	skipNomadSync := env.IsLocal()
+	// The local clusters registry is the only source of orchestrator nodes
+	// exactly when the discovery provider is the static local one: there both
+	// planes are the same single instance and the registry registers it. Under
+	// nomad or kubernetes the node plane lists orchestrators itself, local
+	// environment or not — deriving this from the environment instead of the
+	// resolved provider builds a node plane nothing ever consults.
+	skipNomadSync := localRegistryOwnsOrchestrators
 
 	o := Orchestrator{
 		httpClient:           httpClient,
@@ -160,9 +185,9 @@ func New(
 		nodeDiscovery:        nodeDiscovery,
 		nodes:                smap.New[*nodemanager.Node](),
 		placementAlgorithm:   bestOfKAlgorithm,
+		scoreHugepages:       config.BestOfKHugepageMemory,
 		featureFlagsClient:   featureFlags,
 		accessTokenGenerator: accessTokenGenerator,
-		routingCatalog:       routingCatalog,
 		sqlcDB:               sqlcDB,
 		snapshotCache:        snapshotCache,
 		tel:                  tel,
@@ -182,11 +207,12 @@ func New(
 		redisStorage,
 		redisreservations.NewReservationStorage(redisClient, redisStorage.Notifier()),
 		sandbox.Callbacks{
-			AddSandboxToRoutingTable: o.addSandboxToRoutingTable,
 			AsyncNewlyCreatedSandbox: o.handleNewlyCreatedSandbox,
 			KillOrphanSandbox:        o.killOrphanSandbox,
 		},
 	)
+
+	o.startup = newStartupGate(ctx, clusters.StartupReady(), o.syncClusterDiscoveredNodes)
 
 	// Evict old sandboxes
 	sandboxEvictor, err := evictor.New(ctx, o.sandboxStore, o.RemoveSandbox, o.featureFlagsClient, meter)
@@ -216,6 +242,12 @@ func New(
 	go o.updateBestOfKConfig(ctx)
 
 	return &o, nil
+}
+
+// StartupReady closes once startup has observed a local node, completed the
+// initial cluster registry gate, and projected those snapshots into placement.
+func (o *Orchestrator) StartupReady() <-chan struct{} {
+	return o.startup.Ready()
 }
 
 func (o *Orchestrator) startStatusLogging(ctx context.Context) {
@@ -268,6 +300,54 @@ func (o *Orchestrator) startStatusLogging(ctx context.Context) {
 	}
 }
 
+// TrackWork registers an operation that outlives its caller. It reports false
+// once the drain has started, so new work cannot be admitted behind a drain
+// that already stopped waiting.
+func (o *Orchestrator) TrackWork() (func(), bool) {
+	o.drainMu.RLock()
+	defer o.drainMu.RUnlock()
+
+	if o.draining {
+		return nil, false
+	}
+
+	o.work.Add(1)
+	o.outstandingWork.Add(1)
+
+	return func() {
+		o.outstandingWork.Add(-1)
+		o.work.Done()
+	}, true
+}
+
+func (o *Orchestrator) OutstandingWork() int64 {
+	return o.outstandingWork.Load()
+}
+
+// Drain stops admitting tracked work and waits for what is in flight, bounded
+// by the budget that work stops itself at.
+func (o *Orchestrator) Drain(ctx context.Context) error {
+	o.drainMu.Lock()
+	o.draining = true
+	o.drainMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, trackedWorkBound+workDrainGrace)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		o.work.Wait()
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (o *Orchestrator) Close(ctx context.Context) error {
 	var errs []error
 
@@ -302,10 +382,6 @@ func (o *Orchestrator) Close(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
-	if err := o.routingCatalog.Close(ctx); err != nil {
-		errs = append(errs, err)
-	}
-
 	o.redisStorage.Close(ctx)
 
 	return errors.Join(errs...)
@@ -321,7 +397,7 @@ func (o *Orchestrator) updateBestOfKConfig(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			config := getBestOfKConfig(ctx, o.featureFlagsClient)
+			config := getBestOfKConfig(ctx, o.featureFlagsClient, o.scoreHugepages)
 
 			// Update the config
 			o.placementAlgorithm.UpdateConfig(config)
@@ -329,7 +405,7 @@ func (o *Orchestrator) updateBestOfKConfig(ctx context.Context) {
 	}
 }
 
-func getBestOfKConfig(ctx context.Context, featureFlagsClient *featureflags.Client) placement.BestOfKConfig {
+func getBestOfKConfig(ctx context.Context, featureFlagsClient *featureflags.Client, scoreHugepages bool) placement.BestOfKConfig {
 	k := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKSampleSize)
 
 	maxOvercommitPercent := featureFlagsClient.IntFlag(ctx, featureflags.BestOfKMaxOvercommit)
@@ -341,8 +417,9 @@ func getBestOfKConfig(ctx context.Context, featureFlagsClient *featureflags.Clie
 	maxOvercommit := float64(maxOvercommitPercent) / 100.0
 
 	return placement.BestOfKConfig{
-		R:     maxOvercommit,
-		K:     k,
-		Alpha: alpha,
+		R:              maxOvercommit,
+		K:              k,
+		Alpha:          alpha,
+		ScoreHugepages: scoreHugepages,
 	}
 }

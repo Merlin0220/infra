@@ -25,13 +25,24 @@ import (
 var (
 	logForwardMeter      = otel.Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/hyperloopserver/handlers")
 	logForwardWriteCount = mustLogForwardCounter(
-		"hyperloop_log_forward_write_count",
+		logForwardWriteCountName,
 		"Number of hyperloop log forward HTTP attempts by route and result",
 	)
 	logForwardShadowInflight = mustLogForwardUpDownCounter(
 		"hyperloop_log_forward_shadow_inflight",
 		"Current number of in-flight best-effort shadow log forwards",
 	)
+)
+
+const (
+	logForwardWriteCountName = "orchestrator.hyperloop.log_forward.write_count"
+	// staleLogWarningInterval is a sampler tick bucketed on entry.Time (the wall clock): the sampler
+	// stores resetAt = entry.Time + tick, so after a backward clock step warnings stay suppressed until
+	// the wall clock catches back up past resetAt -- silence lasting roughly the step size, self-healing
+	// once time recovers. Accepted trade-off of using the stock zap sampler; the per-drop metric is
+	// unaffected and still records every drop. Emitted warnings deliberately omit a suppressed count;
+	// the per-drop metric carries the magnitude.
+	staleLogWarningInterval = 30 * time.Second
 )
 
 func mustLogForwardCounter(name, description string) metric.Int64Counter {
@@ -85,15 +96,27 @@ func (h *APIStore) Logs(c *gin.Context) {
 
 	if hasStaleLogTimestamp(payload, sbx.LifecycleStartedAt) {
 		h.sendAPIStoreError(c, http.StatusBadRequest, "Log timestamp predates this sandbox's resume")
-		h.logger.Warn(ctx, "dropping envd log with a stale pre-resume timestamp", logger.WithSandboxID(sbxID))
+		recordLogForwardWrite(ctx, "ingest", "dropped", "stale_timestamp")
+		h.staleWarnLogger.Warn(
+			ctx,
+			"dropping envd log with a stale pre-resume timestamp",
+			logger.WithSandboxID(sbxID),
+		)
 
 		return
 	}
 
-	// Overwrite instanceID, envID, and teamID to avoid spoofing
-	payload["instanceID"] = sbxID
-	payload["envID"] = sbx.Runtime.TemplateID
-	payload["teamID"] = sbx.Runtime.TeamID
+	// Downstream normalization relies on one trusted value for each identity field.
+	setTrustedLogIdentity(
+		payload,
+		sbxID,
+		sbx.Runtime.TemplateID,
+		sbx.Runtime.TeamID,
+		sbx.Runtime.BuildID,
+	)
+	if sbx.Runtime.TeamID == "" {
+		recordLogForwardWrite(ctx, "ingest", "degraded", "missing_team_id")
+	}
 
 	logs, err := json.Marshal(payload)
 	if err != nil {
@@ -104,8 +127,8 @@ func (h *APIStore) Logs(c *gin.Context) {
 	}
 
 	// Resolve log destinations from LaunchDarkly (cached behind a short TTL),
-	// falling back to the fixed collector address. This lets operators retarget
-	// logs without a redeploy.
+	// merged over the collector address and LOGS_WRITE_* defaults. This lets
+	// operators retarget logs without a redeploy.
 	route := h.logWriteConfig.Resolve(ctx)
 
 	// Fire-and-forget shadow writes: never affect the response. Concurrency is
@@ -151,6 +174,26 @@ func (h *APIStore) Logs(c *gin.Context) {
 	recordLogForwardWrite(ctx, "primary", "success", "")
 
 	c.Status(http.StatusOK)
+}
+
+func setTrustedLogIdentity(payload map[string]any, sandboxID, templateID, teamID, buildID string) {
+	for _, field := range [...]string{
+		"instanceID", "sandboxID", "sandbox_id", "sandbox.id",
+		"envID", "env_id", "env.id", "templateID", "template_id", "template.id",
+		"teamID", "team_id", "team.id",
+		"buildID", "build_id", "build.id",
+		// The collector routes on internal; only the platform may set it.
+		"internal",
+	} {
+		delete(payload, field)
+	}
+
+	payload["instanceID"] = sandboxID
+	payload["envID"] = templateID
+	payload["teamID"] = teamID
+	if buildID != "" {
+		payload["buildID"] = buildID
+	}
 }
 
 func (h *APIStore) tryAcquireShadow(maxInflight int64) bool {

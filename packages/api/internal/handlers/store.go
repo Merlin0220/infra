@@ -17,7 +17,6 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 
 	analyticscollector "github.com/e2b-dev/infra/packages/api/internal/analytics_collector"
 	"github.com/e2b-dev/infra/packages/api/internal/api"
@@ -26,9 +25,8 @@ import (
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
 	"github.com/e2b-dev/infra/packages/api/internal/cfg"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
-	clustersdiscovery "github.com/e2b-dev/infra/packages/api/internal/clusters/discovery"
 	"github.com/e2b-dev/infra/packages/api/internal/orchestrator"
-	orchdiscovery "github.com/e2b-dev/infra/packages/api/internal/orchestrator/discovery"
+	"github.com/e2b-dev/infra/packages/api/internal/outbox"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	managementv1 "github.com/e2b-dev/infra/packages/api/internal/secretsstore/management/v1"
 	template_manager "github.com/e2b-dev/infra/packages/api/internal/template-manager"
@@ -42,28 +40,150 @@ import (
 	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
 	"github.com/e2b-dev/infra/packages/db/pkg/pool"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
-	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	sharedclusters "github.com/e2b-dev/infra/packages/shared/pkg/clusters/discovery"
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+	webhookevents "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/webhooks/events"
+	webhookmanagement "github.com/e2b-dev/infra/packages/shared/pkg/grpc/contracts/webhooks/management"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logs/loki"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery/kube"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery/nomad"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	sharedutils "github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
-// newInClusterKubeClient builds a Kubernetes API client using the pod's
-// in-cluster ServiceAccount token. The api Pod must be running in K8s with a
-// projected SA token (the default for any pod with a ServiceAccount).
-func newInClusterKubeClient() (kubernetes.Interface, error) {
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, fmt.Errorf("rest.InClusterConfig: %w", err)
+// kubeClientFactory builds the client the Kubernetes discovery backends list
+// pods with. Injected so the provider wiring is testable without a cluster.
+type kubeClientFactory func(ctx context.Context, endpoint string) (kubernetes.Interface, error)
+
+// serviceDiscovery is the pair of discovery backends the API runs on: the node
+// plane (orchestrators) and the template-builder plane.
+// Both planes are the same interface over the same package now; they differ in
+// what they list, not in how.
+type serviceDiscovery struct {
+	nodes            servicediscovery.Discoverer
+	templateBuilders servicediscovery.Discoverer
+}
+
+// newServiceDiscovery builds both discovery planes for
+// cfg.ServiceDiscoveryProvider:
+//
+//	nomad            - both go through the local Nomad agent
+//	kubernetes       - both list pods via the K8s API
+//	nomad+kubernetes - both are the deduplicated union of the two above
+//	local            - both point at one statically configured address
+func newServiceDiscovery(ctx context.Context, config cfg.Config, newKube kubeClientFactory, provider string) (serviceDiscovery, error) {
+	switch provider {
+	case cfg.ServiceDiscoveryProviderKubernetes:
+		return newKubernetesServiceDiscovery(ctx, config, newKube)
+	case cfg.ServiceDiscoveryProviderNomadKubernetes:
+		return newComposedServiceDiscovery(ctx, config, newKube)
+	case cfg.ServiceDiscoveryProviderLocal:
+		return newLocalServiceDiscovery(config)
+	default: // ServiceDiscoveryProviderNomad
+		return newNomadServiceDiscovery(config)
 	}
-	c, err := kubernetes.NewForConfig(cfg)
+}
+
+// newComposedServiceDiscovery unions the Nomad and Kubernetes backends on both
+// planes. Nomad is the primary, so its entries win a dedup conflict and its own
+// union over the legacy node listing stays nested intact inside this one.
+func newComposedServiceDiscovery(ctx context.Context, config cfg.Config, newKube kubeClientFactory) (serviceDiscovery, error) {
+	nomadPlanes, err := newNomadServiceDiscovery(config)
 	if err != nil {
-		return nil, fmt.Errorf("kubernetes.NewForConfig: %w", err)
+		return serviceDiscovery{}, err
 	}
 
-	return c, nil
+	kubePlanes, err := newKubernetesServiceDiscovery(ctx, config, newKube)
+	if err != nil {
+		return serviceDiscovery{}, err
+	}
+
+	return serviceDiscovery{
+		nodes:            servicediscovery.NewMerged(nomadPlanes.nodes, kubePlanes.nodes),
+		templateBuilders: servicediscovery.NewMerged(nomadPlanes.templateBuilders, kubePlanes.templateBuilders),
+	}, nil
+}
+
+// serviceDiscoveryProvider resolves which provider to build. A provider the
+// operator named always wins, including nomad: someone running a local Nomad
+// agent has to be able to say so. Only an unset provider defaults, and it
+// defaults to local in a local environment because no Nomad agent runs there
+// and the builder plane would otherwise dial nothing.
+func serviceDiscoveryProvider(config cfg.Config, localEnv bool) string {
+	if config.ServiceDiscoveryProvider != "" {
+		return config.ServiceDiscoveryProvider
+	}
+
+	if localEnv {
+		return cfg.ServiceDiscoveryProviderLocal
+	}
+
+	return cfg.ServiceDiscoveryProviderNomad
+}
+
+func newKubernetesServiceDiscovery(ctx context.Context, config cfg.Config, newKube kubeClientFactory) (serviceDiscovery, error) {
+	client, err := newKube(ctx, config.K8sAPIEndpoint)
+	if err != nil {
+		return serviceDiscovery{}, fmt.Errorf("kubernetes client: %w", err)
+	}
+
+	return serviceDiscovery{
+		nodes: kube.NewPods(
+			client,
+			config.K8sNamespace,
+			config.K8sOrchestratorPodLabelSelector,
+		),
+		templateBuilders: kube.NewPods(
+			client,
+			config.K8sNamespace,
+			config.K8sTemplateManagerPodLabelSelector,
+		),
+	}, nil
+}
+
+func newLocalServiceDiscovery(config cfg.Config) (serviceDiscovery, error) {
+	nodes, err := servicediscovery.NewLocal(config.LocalOrchestratorAddress)
+	if err != nil {
+		return serviceDiscovery{}, fmt.Errorf("local orchestrator discovery: %w", err)
+	}
+
+	// The local orchestrator doubles as the template builder when it is started
+	// with ORCHESTRATOR_SERVICES=orchestrator,template-manager, so both planes
+	// point at the same address — the same backend, now that there is only one.
+	// An instance that does not report the TemplateBuilder role (the darwin
+	// dummy) registers with IsBuilder=false and is never selected for builds.
+	return serviceDiscovery{nodes: nodes, templateBuilders: nodes}, nil
+}
+
+func newNomadServiceDiscovery(config cfg.Config) (serviceDiscovery, error) {
+	client, err := nomadapi.NewClient(&nomadapi.Config{
+		Address:  config.NomadAddress,
+		SecretID: config.NomadToken,
+	})
+	if err != nil {
+		return serviceDiscovery{}, fmt.Errorf("nomad client: %w", err)
+	}
+
+	nodes := nomad.NewServices(client, config.NomadOrchestratorServiceNames)
+	// Migration fallback: orchestrator jobs deployed from jobspecs that
+	// predate the service port-label fix register their service with an
+	// empty Address, so service discovery alone would miss them until
+	// they are redeployed. Union in the legacy node-pool listing (service
+	// entries win on conflict) so the API flip has no rollout ordering
+	// constraint. Disable via NOMAD_ORCHESTRATOR_LEGACY_DISCOVERY_ENABLED
+	// once no legacy jobs remain. The pool is hardcoded: legacy jobs only
+	// ever ran on the "default" pool.
+	if config.NomadOrchestratorLegacyDiscoveryEnabled {
+		nodes = servicediscovery.NewMerged(nodes, nomad.NewNodePool(client, "default"))
+	}
+
+	return serviceDiscovery{
+		nodes:            nodes,
+		templateBuilders: nomad.NewAllocations(client, sharedclusters.FilterTemplateBuilders),
+	}, nil
 }
 
 var _ api.ServerInterface = (*APIStore)(nil)
@@ -72,37 +192,68 @@ type teamRunningSandboxCounter interface {
 	TeamRunningSandboxCounts(ctx context.Context) (map[uuid.UUID]int64, error)
 }
 
+type sandboxLifecycleReader interface {
+	QuerySandboxLifecycle(ctx context.Context, sandboxID string) (clickhouse.SandboxLifecycle, error)
+}
+
 type APIStore struct {
-	Healthy               atomic.Bool
-	config                cfg.Config
-	posthog               *analyticscollector.PosthogClient
-	Telemetry             *telemetry.Client
-	orchestrator          *orchestrator.Orchestrator
-	teamSandboxCounter    teamRunningSandboxCounter
-	templateManager       *template_manager.TemplateManager
-	sqlcDB                *sqlcdb.Client
-	authDB                *authdb.Client
-	redisClient           redis.UniversalClient
-	templateCache         *templatecache.TemplateCache
-	templateBuildsCache   *templatecache.TemplatesBuildCache
-	snapshotCache         *snapshotcache.SnapshotCache
-	authService           sharedauth.Service
-	templateSpawnCounter  *utils.TemplateSpawnCounter
-	clickhouseStore       clickhouse.Clickhouse
-	sandboxLogsReader     *sandboxlogs.Reader
-	accessTokenGenerator  *sandbox.AccessTokenGenerator
-	featureFlags          *featureflags.Client
-	clusters              *clusters.Pool
-	snapshotUpsertSem     *sharedutils.AdjustableSemaphore
-	sandboxListSem        *sharedutils.AdjustableSemaphore
-	snapshotBuildQuerySem *sharedutils.AdjustableSemaphore
+	startupState atomic.Uint32
+	config       cfg.Config
+	posthog      *analyticscollector.PosthogClient
+	Telemetry    *telemetry.Client
+	orchestrator *orchestrator.Orchestrator
+	// pauseBackendOverride, when non-nil, replaces the orchestrator for the
+	// pause handler's two calls — tests use it to assert the gate's wiring
+	// (refusal before RemoveSandbox) without a real orchestrator.
+	pauseBackendOverride   pauseOrchestrator
+	resumeBackendOverride  resumeWaitOrchestrator
+	connectBackendOverride connectOrchestrator
+	// snapshotBackendOverride does the same for the snapshot-template
+	// handler: the memory:false refusals must land before the sandbox leaves
+	// Running.
+	snapshotBackendOverride snapshotOrchestrator
+	// autoResumeBackendOverride does the same for the client-proxy auto-resume
+	// RPC: a running sandbox is routed before its snapshot kind is consulted.
+	autoResumeBackendOverride autoResumeOrchestrator
+	teamSandboxCounter        teamRunningSandboxCounter
+	sandboxLifecycles         sandboxLifecycleReader
+	templateManager           *template_manager.TemplateManager
+	sqlcDB                    *sqlcdb.Client
+	sqlcReadDB                *sqlcdb.Client
+	authDB                    *authdb.Client
+	redisClient               redis.UniversalClient
+	templateCache             *templatecache.TemplateCache
+	templateBuildsCache       *templatecache.TemplatesBuildCache
+	snapshotCache             *snapshotcache.SnapshotCache
+	authService               sharedauth.Service
+	templateSpawnCounter      *utils.TemplateSpawnCounter
+	clickhouseStore           clickhouse.Clickhouse
+	sandboxLogsReader         *sandboxlogs.Reader
+	accessTokenGenerator      *sandbox.AccessTokenGenerator
+	featureFlags              *featureflags.Client
+	clusters                  *clusters.Pool
+	snapshotUpsertSem         *sharedutils.AdjustableSemaphore
+	sandboxListSem            *sharedutils.AdjustableSemaphore
+	snapshotBuildQuerySem     *sharedutils.AdjustableSemaphore
 
 	// secretsConn and secretsManagement are nil when no secrets store backend
 	// address is configured. The routes stay registered either way and answer
 	// as they do when the feature gate is closed.
 	secretsConn       *grpc.ClientConn
 	secretsManagement managementv1.SecretManagementServiceClient
+
+	// The sandbox events and webhook management backend, dialed only when an
+	// address is configured. Its routes stay registered either way.
+	webhooksConn      *grpc.ClientConn
+	webhookManagement webhookmanagement.WebhookManagementServiceClient
+	sandboxEvents     webhookevents.SandboxEventsServiceClient
 }
+
+const (
+	startupStateStarting uint32 = iota
+	startupStateReady
+	startupStateDraining
+)
 
 func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.UniversalClient, featureFlags *featureflags.Client, config cfg.Config) *APIStore {
 	logger.L().Info(ctx, "Initializing API store and services")
@@ -110,6 +261,16 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 	sqlcDB, err := sqlcdb.NewClient(ctx, config.PostgresConnectionString, pool.WithMaxConnections(config.DBMaxOpenConnections), pool.WithMinIdle(config.DBMinIdleConnections))
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing SQLC client", zap.Error(err))
+	}
+
+	// Read-only queries that tolerate replica lag go to sqlcReadDB: the read
+	// replica when one is configured, otherwise the primary.
+	sqlcReadDB := sqlcDB
+	if config.PostgresReadReplicaConnectionString != "" {
+		sqlcReadDB, err = sqlcdb.NewReadClient(ctx, config.PostgresReadReplicaConnectionString, pool.WithMaxConnections(config.DBMaxOpenConnections), pool.WithMinIdle(config.DBMinIdleConnections))
+		if err != nil {
+			logger.L().Fatal(ctx, "Initializing read SQLC client", zap.Error(err))
+		}
 	}
 
 	authDB, err := authdb.NewClient(
@@ -162,79 +323,28 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		logger.L().Fatal(ctx, "Initializing Posthog client", zap.Error(posthogErr))
 	}
 
-	// Build the orchestrator-discovery and template-builder-discovery backends
-	// based on cfg.ServiceDiscoveryProvider:
-	//   nomad      - both go through the local Nomad agent
-	//   kubernetes - both list pods via the in-cluster K8s API
-	var (
-		nodeDiscovery            orchdiscovery.Discovery
-		templateBuilderDiscovery clustersdiscovery.Discovery
-	)
-	switch config.ServiceDiscoveryProvider {
-	case cfg.ServiceDiscoveryProviderKubernetes:
-		k8sClient, k8sErr := newInClusterKubeClient()
-		if k8sErr != nil {
-			logger.L().Fatal(ctx, "Initializing in-cluster Kubernetes client", zap.Error(k8sErr))
-		}
-		nodeDiscovery = orchdiscovery.NewKubernetes(
-			k8sClient,
-			config.K8sNamespace,
-			config.K8sOrchestratorPodLabelSelector,
-		)
-		templateBuilderDiscovery = clustersdiscovery.NewKubernetesDiscovery(
-			consts.LocalClusterID,
-			k8sClient,
-			config.K8sNamespace,
-			config.K8sTemplateManagerPodLabelSelector,
-		)
-	case cfg.ServiceDiscoveryProviderLocal:
-		localND, localErr := orchdiscovery.NewLocal(config.LocalOrchestratorAddress)
-		if localErr != nil {
-			logger.L().Fatal(ctx, "Initializing local orchestrator discovery", zap.Error(localErr))
-		}
-		nodeDiscovery = localND
-		// The local orchestrator doubles as the template builder when it is
-		// started with ORCHESTRATOR_SERVICES=orchestrator,template-manager, so
-		// point builder discovery at the same address. Instances that do not
-		// report the TemplateBuilder role (the darwin dummy orchestrator) are
-		// registered with IsBuilder=false and never selected for builds, which
-		// keeps the dummy setup behaving as before.
-		templateBuilderDiscovery, err = clustersdiscovery.NewStaticFromAddress(config.LocalOrchestratorAddress)
-		if err != nil {
-			logger.L().Fatal(ctx, "Initializing local template builder discovery", zap.Error(err))
-		}
-	default: // ServiceDiscoveryProviderNomad
-		nomadClient, nomadErr := nomadapi.NewClient(&nomadapi.Config{
-			Address:  config.NomadAddress,
-			SecretID: config.NomadToken,
-		})
-		if nomadErr != nil {
-			logger.L().Fatal(ctx, "Initializing Nomad client", zap.Error(nomadErr))
-		}
-		nodeDiscovery = orchdiscovery.NewNomad(nomadClient, config.NomadOrchestratorServiceNames)
-		// Migration fallback: orchestrator jobs deployed from jobspecs that
-		// predate the service port-label fix register their service with an
-		// empty Address, so service discovery alone would miss them until
-		// they are redeployed. Union in the legacy node-pool listing (service
-		// entries win on conflict) so the API flip has no rollout ordering
-		// constraint. Disable via NOMAD_ORCHESTRATOR_LEGACY_DISCOVERY_ENABLED
-		// once no legacy jobs remain. The pool is hardcoded: legacy jobs only
-		// ever ran on the "default" pool.
-		if config.NomadOrchestratorLegacyDiscoveryEnabled {
-			nodeDiscovery = orchdiscovery.NewMerged(
-				nodeDiscovery,
-				orchdiscovery.NewNomadNodePool(nomadClient, "default"),
-			)
-		}
-		templateBuilderDiscovery = clustersdiscovery.NewLocalDiscovery(consts.LocalClusterID, nomadClient)
-	}
+	provider := serviceDiscoveryProvider(config, env.IsLocal())
 
-	queryLogsProvider, err := loki.NewLokiQueryProvider(config.LokiURL, config.LokiUser, config.LokiPassword)
+	sd, err := newServiceDiscovery(ctx, config, kube.NewClient, provider)
 	if err != nil {
-		logger.L().Fatal(ctx, "error when getting logs query provider", zap.Error(err))
+		logger.L().Fatal(ctx, "Initializing service discovery", zap.Error(err))
 	}
 
-	clusters, err := clusters.NewPool(ctx, tel, sqlcDB, templateBuilderDiscovery, clickhouseStore, queryLogsProvider, clusterLogsReader, featureFlags, config)
+	if err := noLogStoreError(config.LokiURL, config.ClickhouseConnectionString); err != nil {
+		logger.L().Fatal(ctx, "no log store configured", zap.Error(err))
+	}
+
+	var queryLogsProvider *loki.LokiQueryProvider
+	if config.LokiURL == "" {
+		logger.L().Warn(ctx, "LOKI_URL is not set: sandbox and build log reads need logs-read-config on (ClickHouse) or they fail")
+	} else {
+		queryLogsProvider, err = loki.NewLokiQueryProvider(config.LokiURL, config.LokiUser, config.LokiPassword)
+		if err != nil {
+			logger.L().Fatal(ctx, "error when getting logs query provider", zap.Error(err))
+		}
+	}
+
+	clusters, err := clusters.NewPool(ctx, tel, sqlcDB, sd.templateBuilders, clickhouseStore, queryLogsProvider, clusterLogsReader, featureFlags, config)
 	if err != nil {
 		logger.L().Fatal(ctx, "initializing edge clusters pool failed", zap.Error(err))
 	}
@@ -261,7 +371,7 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		logger.L().Fatal(ctx, "failed to create snapshot build query semaphore", zap.Error(err))
 	}
 
-	orch, err := orchestrator.New(ctx, config, tel, nodeDiscovery, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem)
+	orch, err := orchestrator.New(ctx, config, tel, sd.nodes, provider == cfg.ServiceDiscoveryProviderLocal, posthogClient, redisClient, sqlcDB, clusters, featureFlags, accessTokenGenerator, snapshotCache, snapshotUpsertSem)
 	if err != nil {
 		logger.L().Fatal(ctx, "Initializing Orchestrator client", zap.Error(err))
 	}
@@ -300,12 +410,29 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		secretsManagement = managementv1.NewSecretManagementServiceClient(secretsConn)
 	}
 
+	var (
+		webhooksConn      *grpc.ClientConn
+		webhookManagement webhookmanagement.WebhookManagementServiceClient
+		sandboxEvents     webhookevents.SandboxEventsServiceClient
+	)
+	if config.WebhooksBackendGrpcAddress != "" {
+		webhooksConn, err = newWebhooksClient(config.WebhooksBackendGrpcAddress)
+		if err != nil {
+			logger.L().Fatal(ctx, "Initializing webhooks backend client", zap.Error(err))
+		}
+
+		webhookManagement = webhookmanagement.NewWebhookManagementServiceClient(webhooksConn)
+		sandboxEvents = webhookevents.NewSandboxEventsServiceClient(webhooksConn)
+	}
+
 	a := &APIStore{
 		config:                config,
 		orchestrator:          orch,
 		teamSandboxCounter:    sandboxcountscache.NewCountsCache(orch, redisClient),
+		sandboxLifecycles:     clickhouseStore,
 		templateManager:       templateManager,
 		sqlcDB:                sqlcDB,
+		sqlcReadDB:            sqlcReadDB,
 		authDB:                authDB,
 		Telemetry:             tel,
 		posthog:               posthogClient,
@@ -324,30 +451,54 @@ func NewAPIStore(ctx context.Context, tel *telemetry.Client, redisClient redis.U
 		sandboxListSem:        sandboxListSem,
 		snapshotBuildQuerySem: snapshotBuildQuerySem,
 		secretsConn:           secretsConn,
+		webhooksConn:          webhooksConn,
+		webhookManagement:     webhookManagement,
+		sandboxEvents:         sandboxEvents,
 		secretsManagement:     secretsManagement,
 	}
 
 	go a.updateDBThrottleLimits(ctx)
 
-	// Wait till there's at least one, otherwise we can't create sandboxes yet
+	// Health stays blocked until the orchestrator has completed both startup
+	// gates and projected its initial cluster snapshots into placement.
 	go func() {
-		ticker := time.NewTicker(5 * time.Millisecond)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if orch.NodeCount() != 0 {
-					logger.L().Info(ctx, "Nodes are ready, setting API as healthy")
-					a.Healthy.Store(true)
-
-					return
-				}
-			}
+		select {
+		case <-ctx.Done():
+			return
+		case <-orch.StartupReady():
+			logger.L().Info(ctx, "Startup readiness completed, setting API as healthy")
+			a.markStartupReady()
 		}
 	}()
 
 	return a
+}
+
+// NewOutbox builds the River client that works the API's outbox jobs on the
+// store's clients. Stop it before Close.
+func (a *APIStore) NewOutbox(l logger.Logger) (*outbox.River, error) {
+	return outbox.New(outbox.Dependencies{
+		Pool:      a.sqlcDB.Pool(),
+		Sandboxes: a.orchestrator,
+		Teams:     a.authDB,
+		Logger:    l,
+		Telemetry: a.Telemetry,
+		Config: outbox.Config{
+			MaxWorkers:      a.config.OutboxMaxWorkers,
+			BacklogInterval: a.config.OutboxBacklogInterval,
+		},
+	})
+}
+
+// Drain stops admitting sandbox work that outlives its request and waits for
+// what is in flight. It runs before Close, which tears down the clients that
+// work uses.
+func (a *APIStore) Drain(ctx context.Context) error {
+	if a.orchestrator == nil {
+		return nil
+	}
+
+	return a.orchestrator.Drain(ctx)
 }
 
 func (a *APIStore) Close(ctx context.Context) error {
@@ -380,6 +531,12 @@ func (a *APIStore) Close(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("closing auth database client: %w", err))
 	}
 
+	if a.sqlcReadDB != a.sqlcDB {
+		if err := a.sqlcReadDB.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing read sqlc database client: %w", err))
+		}
+	}
+
 	if err := a.sqlcDB.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("closing sqlc database client: %w", err))
 	}
@@ -408,6 +565,12 @@ func (a *APIStore) Close(ctx context.Context) error {
 	if a.secretsConn != nil {
 		if err := a.secretsConn.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing secrets store management client: %w", err))
+		}
+	}
+
+	if a.webhooksConn != nil {
+		if err := a.webhooksConn.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing webhooks backend client: %w", err))
 		}
 	}
 
@@ -447,7 +610,7 @@ func (a *APIStore) sendAPIStoreError(c *gin.Context, code int, message string) {
 }
 
 func (a *APIStore) GetHealth(c *gin.Context) {
-	if a.Healthy.Load() {
+	if a.startupState.Load() == startupStateReady {
 		c.String(http.StatusOK, "Health check successful")
 
 		return
@@ -456,33 +619,21 @@ func (a *APIStore) GetHealth(c *gin.Context) {
 	c.String(http.StatusServiceUnavailable, "Service is unavailable")
 }
 
+func (a *APIStore) markStartupReady() {
+	a.startupState.CompareAndSwap(startupStateStarting, startupStateReady)
+}
+
+// BeginDrain permanently marks this API instance unhealthy. Startup completion
+// racing with shutdown cannot restore readiness after the drain begins.
+func (a *APIStore) BeginDrain() {
+	a.startupState.Store(startupStateDraining)
+}
+
 func (a *APIStore) GetTeamFromAPIKey(ctx context.Context, ginCtx *gin.Context, apiKey string) (*types.Team, *api.APIError) {
 	ctx, span := tracer.Start(ctx, "get team from api key")
 	defer span.End()
 
 	return a.authService.ValidateAPIKey(ctx, ginCtx, apiKey)
-}
-
-func (a *APIStore) GetUserFromAccessToken(ctx context.Context, ginCtx *gin.Context, accessToken string) (uuid.UUID, *api.APIError) {
-	ctx, span := tracer.Start(ctx, "get user from access token")
-	defer span.End()
-
-	userID, apiErr := a.authService.ValidateAccessToken(ctx, ginCtx, accessToken)
-	if apiErr != nil {
-		return uuid.UUID{}, apiErr
-	}
-
-	// Access token acceptance is gated after validation so the flag can be
-	// rolled out per-user via LD targeting during the deprecation cutover.
-	if a.featureFlags.BoolFlag(ctx, featureflags.DisableE2BAccessTokenAuthFlag, featureflags.UserContext(userID.String())) {
-		return uuid.UUID{}, &api.APIError{
-			Err:       errors.New("access token authentication is disabled"),
-			ClientMsg: "E2B_ACCESS_TOKEN is deprecated and no longer accepted. Use an API key (E2B_API_KEY) instead. See https://e2b.dev/docs/migration/access-token-deprecation",
-			Code:      http.StatusUnauthorized,
-		}
-	}
-
-	return userID, nil
 }
 
 func (a *APIStore) GetUserIDFromAuthProviderToken(ctx context.Context, ginCtx *gin.Context, token string) (uuid.UUID, *api.APIError) {
@@ -514,8 +665,7 @@ func (a *APIStore) GetTeamFromAdminToken(ctx context.Context, _ *gin.Context, te
 
 	team, err := a.authService.GetTeamByID(ctx, teamUUID)
 	if err != nil {
-		var forbiddenErr *sharedauth.TeamForbiddenError
-		if errors.As(err, &forbiddenErr) {
+		if _, ok := errors.AsType[*sharedauth.TeamForbiddenError](err); ok {
 			return nil, &api.APIError{
 				Code:      http.StatusForbidden,
 				ClientMsg: err.Error(),

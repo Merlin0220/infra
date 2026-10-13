@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -35,6 +36,12 @@ const (
 	testToken      = "test-token"
 	uploadsPath    = "uploads"
 )
+
+type multipartRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f multipartRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 // createTestMultipartUploader creates a test uploader with a mock HTTP client
 func createTestMultipartUploader(t *testing.T, handler http.HandlerFunc, retryConfig ...RetryConfig) *MultipartUploader {
@@ -68,6 +75,7 @@ func TestMultipartUploader_PartUploaderContract(t *testing.T) {
 	t.Parallel()
 
 	testPartUploaderContract(t, partUploaderTestAdapter{
+		abortsOnClose: true,
 		new: func(t *testing.T, recorder *partUploaderRecorder) partUploader {
 			t.Helper()
 
@@ -92,6 +100,152 @@ func TestMultipartUploader_PartUploaderContract(t *testing.T) {
 				}
 			})
 		},
+	})
+}
+
+// abortRecordingUploader builds a test uploader whose part uploads always
+// fail, recording whether the failure path issued the abort DELETE.
+func abortRecordingUploader(t *testing.T, uploadID string, aborted *atomic.Bool) *MultipartUploader {
+	t.Helper()
+
+	return createTestMultipartUploader(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == uploadsPath:
+			xmlData, _ := xml.Marshal(InitiateMultipartUploadResult{Bucket: testBucketName, Key: testObjectName, UploadID: uploadID})
+			w.WriteHeader(http.StatusOK)
+			w.Write(xmlData)
+		case r.Method == http.MethodPut && strings.Contains(r.URL.RawQuery, "partNumber="):
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodDelete && r.URL.RawQuery == "uploadId="+uploadID:
+			aborted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected GCP multipart request: %s %s", r.Method, r.URL.String())
+		}
+	}, fastRetryConfig())
+}
+
+func TestGCPCompressedStoreFileAbortsMultipartUploadOnFailure(t *testing.T) {
+	t.Parallel()
+
+	inputPath := writeTempFile(t, []byte(strings.Repeat("compressible-data", 1024)))
+	var aborted atomic.Bool
+	uploader := abortRecordingUploader(t, "compressed-abort-upload-id", &aborted)
+
+	_, _, err := storeFileCompressed(t.Context(), inputPath, testCompressConfig(), 4, PutOptions{},
+		func(ObjectMetadata) (partUploader, error) { return uploader, nil })
+	require.Error(t, err)
+	require.True(t, aborted.Load(), "failed compressed upload should abort the multipart upload")
+}
+
+// The uncompressed >=50MB path has no deferred Close from compressStream and
+// must abort on its own.
+func TestGCPUploadFileInParallelAbortsOnPartFailure(t *testing.T) {
+	t.Parallel()
+
+	inputPath := writeTempFile(t, []byte("parallel-upload-that-fails"))
+	var aborted atomic.Bool
+	uploader := abortRecordingUploader(t, "parallel-abort-upload-id", &aborted)
+
+	_, err := uploader.UploadFileInParallel(t.Context(), inputPath, 2, nil)
+	require.Error(t, err)
+	require.True(t, aborted.Load(), "failed parallel upload should abort the multipart upload")
+}
+
+func TestMultipartUploaderUploadPartsZeroConcurrencyDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
+
+	inputPath := writeTempFile(t, []byte("x"))
+	input, err := os.Open(inputPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, input.Close()) })
+
+	uploader := createTestMultipartUploader(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("unexpected request method: %s", r.Method)
+
+			return
+		}
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("read request body: %v", err)
+
+			return
+		}
+		w.Header().Set("ETag", `"etag"`)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := uploader.uploadParts(t.Context(), 0, 1, 1, input, "upload-id")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("zero upload concurrency blocked part admission")
+	}
+}
+
+func TestMultipartUploaderUploadPartsNegativeConcurrencyUsesOneWorker(t *testing.T) {
+	t.Parallel()
+
+	inputPath := filepath.Join(t.TempDir(), "multipart.bin")
+	input, err := os.OpenFile(inputPath, os.O_CREATE|os.O_RDWR, 0o600)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, input.Close()) })
+	require.NoError(t, input.Truncate(gcpMultipartUploadChunkSize+1))
+
+	synctest.Test(t, func(t *testing.T) {
+		var active atomic.Int32
+		var maxActive atomic.Int32
+		release := make(chan struct{})
+
+		client := retryablehttp.NewClient()
+		client.RetryMax = 0
+		client.Logger = nil
+		client.HTTPClient.Transport = multipartRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			current := active.Add(1)
+			defer active.Add(-1)
+			for {
+				previous := maxActive.Load()
+				if current <= previous || maxActive.CompareAndSwap(previous, current) {
+					break
+				}
+			}
+
+			<-release
+
+			response := new(http.Response)
+			response.StatusCode = http.StatusOK
+			response.Header = make(http.Header)
+			response.Header.Set("ETag", `"etag"`)
+			response.Body = http.NoBody
+			response.Request = req
+
+			return response, nil
+		})
+
+		uploader := new(MultipartUploader)
+		uploader.objectName = "object"
+		uploader.token = "token"
+		uploader.client = client
+		uploader.baseURL = "http://storage.test"
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := uploader.uploadParts(t.Context(), -1, 2, gcpMultipartUploadChunkSize+1, input, "upload-id")
+			done <- err
+		}()
+
+		synctest.Wait()
+		gotMax := maxActive.Load()
+		close(release)
+		require.NoError(t, <-done)
+		require.Equal(t, int32(1), gotMax, "negative concurrency admitted multiple GCS parts")
+		require.Zero(t, active.Load())
 	})
 }
 
@@ -494,7 +648,7 @@ func TestMultipartUploader_RandomFailures_ChaosTest(t *testing.T) {
 			}
 
 			atomic.AddInt32(&successCount, 1)
-			partNum := strings.Split(strings.Split(r.URL.RawQuery, "partNumber=")[1], "&")[0]
+			partNum := r.URL.Query().Get("partNumber")
 			w.Header().Set("ETag", fmt.Sprintf(`"chaos-etag-%s"`, partNum))
 			w.WriteHeader(http.StatusOK)
 
@@ -546,7 +700,7 @@ func TestMultipartUploader_PartialFailures_Recovery(t *testing.T) {
 			w.Write(xmlData)
 
 		case strings.Contains(r.URL.RawQuery, "partNumber"):
-			partNumStr := strings.Split(strings.Split(r.URL.RawQuery, "partNumber=")[1], "&")[0]
+			partNumStr := r.URL.Query().Get("partNumber")
 
 			// Track attempts per part
 			val, _ := partAttempts.LoadOrStore(partNumStr, new(int32(0)))
@@ -756,7 +910,7 @@ func TestMultipartUploader_ResourceExhaustion_TooManyConcurrentUploads(t *testin
 			// Simulate work that takes time
 			time.Sleep(10 * time.Millisecond)
 
-			partNum := strings.Split(strings.Split(r.URL.RawQuery, "partNumber=")[1], "&")[0]
+			partNum := r.URL.Query().Get("partNumber")
 			w.Header().Set("ETag", fmt.Sprintf(`"resource-etag-%s"`, partNum))
 			w.WriteHeader(http.StatusOK)
 
@@ -807,7 +961,7 @@ func TestMultipartUploader_BoundaryConditions_ExactChunkSize(t *testing.T) {
 			partSizes = append(partSizes, len(body))
 			partSizesMu.Unlock()
 
-			partNum := strings.Split(strings.Split(r.URL.RawQuery, "partNumber=")[1], "&")[0]
+			partNum := r.URL.Query().Get("partNumber")
 			w.Header().Set("ETag", fmt.Sprintf(`"boundary-etag-%s"`, partNum))
 			w.WriteHeader(http.StatusOK)
 
@@ -864,7 +1018,7 @@ func TestMultipartUploader_ConcurrentRetries_RaceCondition(t *testing.T) {
 			w.Write(xmlData)
 
 		case strings.Contains(r.URL.RawQuery, "partNumber"):
-			partNumStr := strings.Split(strings.Split(r.URL.RawQuery, "partNumber=")[1], "&")[0]
+			partNumStr := r.URL.Query().Get("partNumber")
 
 			// Track retry attempts per part with race-safe operations
 			val, _ := retryAttempts.LoadOrStore(partNumStr, new(int32(0)))
@@ -1199,13 +1353,13 @@ func TestGCPCompleteRetriesTruncatedBody(t *testing.T) {
 	require.Equal(t, int32(3), attempts.Load(), "a failed body read must be retried to the budget")
 }
 
-// gcsXMLBackend starts MinIO and opens its bucket for anonymous access so the
-// GCS XML MultipartUploader (bearer-token auth, unverifiable by MinIO) can
+// gcsXMLBackend starts RustFS and opens its bucket for anonymous access so the
+// GCS XML MultipartUploader (bearer-token auth, unverifiable by RustFS) can
 // upload without request signing.
 func gcsXMLBackend(t *testing.T) *s3TestBackend {
 	t.Helper()
 
-	backend := startMinioBackend(t)
+	backend := startS3Backend(t)
 
 	policy := fmt.Sprintf(`{
 		"Version": "2012-10-17",
@@ -1221,14 +1375,14 @@ func gcsXMLBackend(t *testing.T) *s3TestBackend {
 		Bucket: aws.String(backend.bucket),
 		Policy: aws.String(policy),
 	})
-	require.NoError(t, err, "allow anonymous access on minio bucket")
+	require.NoError(t, err, "allow anonymous access on the emulator bucket")
 
 	return backend
 }
 
 // authStrippingTransport removes the Authorization header (the uploader's
-// bearer token) so requests reach MinIO as anonymous — MinIO cannot validate
-// Google OAuth tokens. Nothing else is adapted: in particular, MinIO's 411
+// bearer token) so requests reach RustFS as anonymous — RustFS cannot validate
+// Google OAuth tokens. Nothing else is adapted: in particular, RustFS's 411
 // rejection of chunked uploads guards the uploader's explicit Content-Length
 // (via multiSliceReader.Len) against regressions.
 type authStrippingTransport struct {
@@ -1242,7 +1396,7 @@ func (a authStrippingTransport) RoundTrip(req *http.Request) (*http.Response, er
 	return a.inner.RoundTrip(clone)
 }
 
-// gcsXMLUploader builds a MultipartUploader pointed at the MinIO backend,
+// gcsXMLUploader builds a MultipartUploader pointed at the RustFS backend,
 // bypassing NewMultipartUploaderWithRetryConfig (which requires real Google
 // credentials and hardcodes the production URL). transport is optional and
 // sits between the retryable client and the network (e.g. fault injection).
@@ -1290,7 +1444,7 @@ func anonymousGet(t *testing.T, backend *s3TestBackend, key string) []byte {
 }
 
 // TestGCSXMLPartUploaderContract drives MultipartUploader directly against
-// MinIO's XML multipart implementation: out-of-order part numbers, a
+// RustFS's XML multipart implementation: out-of-order part numbers, a
 // multi-slice part body, Content-MD5 validation by a real server, and
 // ordered reassembly on Complete.
 func TestGCSXMLPartUploaderContract(t *testing.T) {
@@ -1319,8 +1473,28 @@ func TestGCSXMLPartUploaderContract(t *testing.T) {
 		"parts must reassemble in part-number order, not upload order")
 }
 
+// Mirrors TestS3PartUploaderAbortOnClose for the GCS XML uploader.
+func TestGCSXMLPartUploaderAbortOnClose(t *testing.T) {
+	t.Parallel()
+
+	backend := gcsXMLBackend(t)
+	key := testKey("gcs-part-abort")
+	up := gcsXMLUploader(t, backend, key, nil, nil)
+
+	require.NoError(t, up.Start(t.Context()))
+	require.NoError(t, up.UploadPart(t.Context(), 1, []byte("abandoned-part")))
+	require.NoError(t, up.Close())
+
+	list, err := backend.newClient(t, nil).ListMultipartUploads(t.Context(), &s3.ListMultipartUploadsInput{
+		Bucket: aws.String(backend.bucket),
+		Prefix: aws.String(key),
+	})
+	require.NoError(t, err)
+	require.Empty(t, list.Uploads, "abort must leave no orphaned multipart upload")
+}
+
 // TestGCSXMLCompressedRoundTrip runs the production compressed upload path
-// (storeFileCompressed) with the GCS XML uploader against MinIO, then
+// (storeFileCompressed) with the GCS XML uploader against RustFS, then
 // verifies the stored blob decompresses back to the original.
 func TestGCSXMLCompressedRoundTrip(t *testing.T) {
 	t.Parallel()
@@ -1452,7 +1626,7 @@ func TestGCSXMLRetryOnTransientFailure(t *testing.T) {
 }
 
 // TestGCSXMLUploadFileInParallel exercises the uncompressed >=50MB multipart
-// path (UploadFileInParallel) against MinIO: fixed 50 MB chunks uploaded
+// path (UploadFileInParallel) against RustFS: fixed 50 MB chunks uploaded
 // concurrently, with the overlapped checksum hasher.
 func TestGCSXMLUploadFileInParallel(t *testing.T) {
 	t.Parallel()
@@ -1478,7 +1652,7 @@ func TestGCSXMLUploadFileInParallel(t *testing.T) {
 
 // TestGCPUploadFileInParallelEmptyFile verifies the empty-file path ships its
 // single zero-byte part with an explicit Content-Length rather than chunked
-// transfer encoding, which S3-compatible XML backends (MinIO here) reject with
+// transfer encoding, which S3-compatible XML backends (RustFS here) reject with
 // 411 MissingContentLength.
 func TestGCPUploadFileInParallelEmptyFile(t *testing.T) {
 	t.Parallel()

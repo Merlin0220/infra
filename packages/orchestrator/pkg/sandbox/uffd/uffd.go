@@ -38,6 +38,10 @@ const (
 )
 
 type Uffd struct {
+	handshakeMu   sync.Mutex
+	handshakeConn *net.UnixConn
+	stopping      bool
+
 	exit       *utils.ErrorOnce
 	readyCh    chan struct{}
 	readyOnce  sync.Once
@@ -47,6 +51,14 @@ type Uffd struct {
 	memfd      atomic.Pointer[block.Memfd]
 	handler    utils.SetOnce[*userfaultfd.Userfaultfd]
 	fdExit     utils.SetOnce[*fdexit.FdExit]
+	// balloonMode is applied to the handler when it is created, or at once if
+	// it already exists; the read that sets it races FC connecting.
+	balloonMode atomic.Uint32
+
+	// logger carries the sandbox's identity (sandbox, template, team and
+	// build ids), so the serve loop and every component it hands the logger
+	// to inherit it instead of re-tagging each line.
+	logger logger.Logger
 
 	// syncWP records whether the paired Firecracker was resumed with
 	// use_sync_wp (synchronous WP fault delivery). Set once at resume from
@@ -61,7 +73,9 @@ var (
 	_ CoWExporter   = (*Uffd)(nil)
 )
 
-func New(memfile block.ReadonlyDevice, socketPath string) *Uffd {
+// New builds a UFFD memory backend. lg is required and is expected to carry
+// the sandbox's identity fields.
+func New(memfile block.ReadonlyDevice, socketPath string, lg logger.Logger) *Uffd {
 	return &Uffd{
 		exit:       utils.NewErrorOnce(),
 		readyCh:    make(chan struct{}),
@@ -69,6 +83,7 @@ func New(memfile block.ReadonlyDevice, socketPath string) *Uffd {
 		memfile:    memfile,
 		handler:    *utils.NewSetOnce[*userfaultfd.Userfaultfd](),
 		fdExit:     *utils.NewSetOnce[*fdexit.FdExit](),
+		logger:     lg,
 	}
 }
 
@@ -86,7 +101,7 @@ func (u *Uffd) Prefault(ctx context.Context, offset int64, data []byte) (install
 	return handler.Prefault(ctx, offset, data)
 }
 
-func (u *Uffd) Start(ctx context.Context, sandboxId string) error {
+func (u *Uffd) Start(ctx context.Context) error {
 	lis, err := net.ListenUnix("unix", &net.UnixAddr{Name: u.socketPath, Net: "unix"})
 	if err != nil {
 		return fmt.Errorf("failed listening on socket: %w", err)
@@ -115,18 +130,28 @@ func (u *Uffd) Start(ctx context.Context, sandboxId string) error {
 		defer span.End()
 
 		// TODO: If the handle function fails, we should kill the sandbox
-		handleErr := u.handle(ctx, sandboxId, fdExit)
+		handleErr := u.handle(ctx, fdExit)
 
 		// If handle failed before setting the handler value, set an error to unblock
 		// any waiters (e.g., prefetcher goroutines waiting on Prefault).
 		if handleErr != nil {
 			u.handler.SetError(handleErr)
 		}
+		exitErr := handleErr
+		u.handshakeMu.Lock()
+		stopping := u.stopping
+		u.handshakeMu.Unlock()
+		if stopping && (errors.Is(handleErr, net.ErrClosed) || errors.Is(handleErr, context.Canceled)) {
+			exitErr = nil
+		}
 
 		closeErr := u.lis.Close()
+		if errors.Is(closeErr, net.ErrClosed) {
+			closeErr = nil
+		}
 		fdExitErr := fdExit.Close()
 
-		u.exit.SetError(errors.Join(handleErr, closeErr, fdExitErr))
+		u.exit.SetError(errors.Join(exitErr, closeErr, fdExitErr))
 
 		// Close the ready channel to unblock any waiters (safe to call multiple times via Once)
 		u.readyOnce.Do(func() { close(u.readyCh) })
@@ -135,7 +160,7 @@ func (u *Uffd) Start(ctx context.Context, sandboxId string) error {
 	return nil
 }
 
-func (u *Uffd) handle(ctx context.Context, sandboxId string, fdExit *fdexit.FdExit) error {
+func (u *Uffd) handle(ctx context.Context, fdExit *fdexit.FdExit) error {
 	err := u.lis.SetDeadline(time.Now().Add(uffdMsgListenerTimeout))
 	if err != nil {
 		return fmt.Errorf("failed setting listener deadline: %w", err)
@@ -147,41 +172,63 @@ func (u *Uffd) handle(ctx context.Context, sandboxId string, fdExit *fdexit.FdEx
 	}
 
 	unixConn := conn.(*net.UnixConn)
+	u.handshakeMu.Lock()
+	if u.stopping {
+		u.handshakeMu.Unlock()
+		_ = unixConn.Close()
+
+		return context.Canceled
+	}
+	u.handshakeConn = unixConn
+	u.handshakeMu.Unlock()
+	defer func() {
+		u.handshakeMu.Lock()
+		if u.handshakeConn == unixConn {
+			u.handshakeConn = nil
+		}
+		u.handshakeMu.Unlock()
+		_ = unixConn.Close()
+	}()
 
 	regionMappingsBuf := make([]byte, regionMappingsSize)
 	// Firecracker may send 1 fd (UFFD) or 2 (UFFD + memfd, on newer versions).
 	fdBuf := make([]byte, syscall.CmsgSpace(2*fdSize))
 
-	numBytesMappings, numBytesFd, _, _, err := unixConn.ReadMsgUnix(regionMappingsBuf, fdBuf)
-	if err != nil {
-		return fmt.Errorf("failed to read unix msg from connection: %w", err)
-	}
+	numBytesMappings, numBytesFd, msgFlags, _, readErr := unixConn.ReadMsgUnix(regionMappingsBuf, fdBuf)
 
-	regionMappingsBuf = regionMappingsBuf[:numBytesMappings]
-
-	var regions []memory.Region
-
-	err = json.Unmarshal(regionMappingsBuf, &regions)
-	if err != nil {
-		return fmt.Errorf("failed parsing memory mapping data: %w", err)
-	}
-
+	// Received rights are owned even when the body or transport is invalid.
 	controlMsgs, err := syscall.ParseSocketControlMessage(fdBuf[:numBytesFd])
 	if err != nil {
 		return fmt.Errorf("failed parsing control messages: %w", err)
 	}
-
-	if len(controlMsgs) != 1 {
-		return fmt.Errorf("expected 1 control message containing UFFD and (maybe) memfd: found %d", len(controlMsgs))
+	var fds []int
+	defer func() {
+		for _, fd := range fds {
+			if fd >= 0 {
+				_ = syscall.Close(fd)
+			}
+		}
+	}()
+	for _, message := range controlMsgs {
+		received, err := syscall.ParseUnixRights(&message)
+		if err != nil {
+			return fmt.Errorf("failed parsing unix rights: %w", err)
+		}
+		fds = append(fds, received...)
 	}
-
-	fds, err := syscall.ParseUnixRights(&controlMsgs[0])
-	if err != nil {
-		return fmt.Errorf("failed parsing unix write: %w", err)
+	if readErr != nil {
+		return fmt.Errorf("failed to read unix msg from connection: %w", readErr)
 	}
-
-	if len(fds) == 0 {
-		return errors.New("expected at least 1 file descriptor")
+	if msgFlags&(syscall.MSG_CTRUNC|syscall.MSG_TRUNC) != 0 {
+		return errors.New("truncated memory handshake")
+	}
+	if len(controlMsgs) != 1 || len(fds) < 1 || len(fds) > 2 {
+		return fmt.Errorf("expected one control message with one or two memory descriptors, got %d messages and %d descriptors", len(controlMsgs), len(fds))
+	}
+	regionMappingsBuf = regionMappingsBuf[:numBytesMappings]
+	var regions []memory.Region
+	if err := json.Unmarshal(regionMappingsBuf, &regions); err != nil {
+		return fmt.Errorf("failed parsing memory mapping data: %w", err)
 	}
 
 	m := memory.NewMapping(regions)
@@ -198,35 +245,33 @@ func (u *Uffd) handle(ctx context.Context, sandboxId string, fdExit *fdexit.FdEx
 		u.memfile,
 		m,
 		generation,
-		logger.L().With(logger.WithSandboxID(sandboxId)),
+		u.logger,
 	)
 	if err != nil {
-		for _, fd := range fds {
-			_ = syscall.Close(fd)
-		}
-
 		return fmt.Errorf("failed to create uffd: %w", err)
 	}
+	fds[0] = -1 // The handler owns this descriptor after construction succeeds.
 
 	defer func() {
 		// A live CoW window reads pre-images from the memfd mmap below: cancel
 		// and drain it first so no copy is in flight when the view is unmapped.
-		uffd.CancelActiveCoWWindow(errors.New("uffd teardown"))
+		uffd.CancelActiveCoWWindow(ctx, errors.New("uffd teardown"))
 
 		closeErr := uffd.Close()
 		if closeErr != nil {
-			logger.L().Error(ctx, "failed to close uffd", logger.WithSandboxID(sandboxId), zap.String("socket_path", u.socketPath), zap.Error(closeErr))
+			u.logger.Error(ctx, "failed to close uffd", zap.String("socket_path", u.socketPath), zap.Error(closeErr))
 		}
 
 		if m := u.memfd.Swap(nil); m != nil {
 			if closeErr := m.Close(); closeErr != nil {
-				logger.L().Error(ctx, "failed to close memfd", logger.WithSandboxID(sandboxId), zap.Error(closeErr))
+				u.logger.Error(ctx, "failed to close memfd", zap.Error(closeErr))
 			}
 		}
 	}()
 
 	if len(fds) > 1 {
 		memfd, err := block.NewFromFd(fds[1])
+		fds[1] = -1 // NewFromFd consumes the descriptor even on error.
 		if err != nil {
 			return fmt.Errorf("failed to wrap memfd: %w", err)
 		}
@@ -234,6 +279,8 @@ func (u *Uffd) handle(ctx context.Context, sandboxId string, fdExit *fdexit.FdEx
 	}
 
 	u.handler.SetValue(uffd)
+	// Publish first: a label stored before this line lands here, one stored after it lands in SetBalloonMode.
+	uffd.SetBalloonMode(userfaultfd.BalloonMode(u.balloonMode.Load()))
 
 	u.readyOnce.Do(func() { close(u.readyCh) })
 
@@ -254,7 +301,26 @@ func (u *Uffd) Stop() error {
 		return fmt.Errorf("fdExit not set or failed: %w", err)
 	}
 
-	return fdExit.SignalExit()
+	// The exit pipe is observed only by Serve, not Accept or ReadMsgUnix.
+	// Stop those owned socket operations too so Exit can join early teardown.
+	u.handshakeMu.Lock()
+	u.stopping = true
+	conn := u.handshakeConn
+	u.handshakeMu.Unlock()
+	signalErr := fdExit.SignalExit()
+	var connErr error
+	if conn != nil {
+		connErr = conn.Close()
+		if errors.Is(connErr, net.ErrClosed) {
+			connErr = nil
+		}
+	}
+	listenerErr := u.lis.Close()
+	if errors.Is(listenerErr, net.ErrClosed) {
+		listenerErr = nil
+	}
+
+	return errors.Join(signalErr, connErr, listenerErr)
 }
 
 func (u *Uffd) Ready() chan struct{} {
@@ -318,7 +384,7 @@ func (u *Uffd) DiffMetadata(ctx context.Context, f *fc.Process, useTrackerDirty 
 		empty.AndNot(faulted)
 
 		handler.Logger().Info(ctx, "dirty source: page tracker (sync-WP)",
-			zap.String("build_id", buildID),
+			zap.String("metadata_build_id", buildID),
 			zap.Uint64("tracker_dirty_pages", faulted.GetCardinality()),
 			zap.Uint64("tracker_empty_pages", empty.GetCardinality()))
 
@@ -353,7 +419,7 @@ func (u *Uffd) DiffMetadata(ctx context.Context, f *fc.Process, useTrackerDirty 
 		dirtyDivergencePages.Record(ctx, int64(pagemapOnly), dirtyDivergenceAttrs["pagemap_only"])
 		dirtyDivergencePages.Record(ctx, int64(pagemapDirty), dirtyDivergenceAttrs["pagemap_dirty"])
 		handler.Logger().Info(ctx, "dirty-source divergence (tracker vs pagemap)",
-			zap.String("build_id", buildID),
+			zap.String("metadata_build_id", buildID),
 			zap.Uint64("tracker_only_pages", trackerOnly),
 			zap.Uint64("pagemap_only_pages", pagemapOnly),
 			zap.Uint64("tracker_dirty_pages", faulted.GetCardinality()),
@@ -419,6 +485,16 @@ func (u *Uffd) EndCoWExport(w *userfaultfd.CoWWindow) {
 // swaps it out). The running VM keeps using it after an in-place snapshot.
 func (u *Uffd) PeekMemfd(_ context.Context) *block.Memfd {
 	return u.memfd.Load()
+}
+
+var _ BalloonModeLabeler = (*Uffd)(nil)
+
+// SetBalloonMode labels the serve metrics; it never blocks on the handler.
+func (u *Uffd) SetBalloonMode(mode userfaultfd.BalloonMode) {
+	u.balloonMode.Store(uint32(mode))
+	if handler, err := u.handler.Result(); err == nil {
+		handler.SetBalloonMode(mode)
+	}
 }
 
 // ServeStats returns a cumulative snapshot of demand faults served so far, or a

@@ -2,6 +2,7 @@ package template
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/e2b-dev/infra/packages/db/pkg/dberrors"
 	dbtypes "github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
+	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -26,18 +28,24 @@ import (
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/api/internal/template")
 
 type RegisterBuildData struct {
-	ClusterID  uuid.UUID
-	TemplateID api.TemplateID
-	UserID     *uuid.UUID
-	Team       *types.Team
-	Dockerfile string
-	Alias      *string
-	Tags       []string
-	StartCmd   *string
-	ReadyCmd   *string
-	CpuCount   *int32
-	MemoryMB   *int32
-	Version    string
+	ReplacesTemplateID string
+	Public             bool
+	ClusterID          uuid.UUID
+	TemplateID         api.TemplateID
+	UserID             *uuid.UUID
+	Team               *types.Team
+	Dockerfile         string
+	Alias              *string
+	Tags               []string
+	StartCmd           *string
+	ReadyCmd           *string
+	CpuCount           *int32
+	MemoryMB           *int32
+	Version            string
+
+	// The requested minimum free space after build steps, or nil for the team's default.
+	// Zero disables requested growth and reaches the row as zero.
+	MinFreeDiskMb *int32
 
 	// TODO(ENG-3852): Remove once the template manager resolves the kernel and firecracker versions itself.
 	//
@@ -48,6 +56,7 @@ type RegisterBuildData struct {
 }
 
 type RegisterBuildResponse struct {
+	Public     bool
 	TemplateID string
 	BuildID    string
 	Aliases    []string
@@ -61,8 +70,47 @@ func RegisterBuild(
 	db *sqlcdb.Client,
 	data RegisterBuildData,
 ) (*RegisterBuildResponse, *api.APIError) {
-	ctx, span := tracer.Start(ctx, "register build")
-	defer span.End()
+	return telemetry.Observe1(ctx, tracer, "register build", func(ctx context.Context) (*RegisterBuildResponse, *api.APIError) {
+		return registerBuild(ctx, templateCache, db, data)
+	})
+}
+
+func registerBuild(
+	ctx context.Context,
+	templateCache *templatecache.TemplateCache,
+	db *sqlcdb.Client,
+	data RegisterBuildData,
+) (*RegisterBuildResponse, *api.APIError) {
+	// On the span before the free-disk resolution below can return, so a refused
+	// registration still says whose request was refused.
+	telemetry.SetAttributes(ctx,
+		telemetry.WithTeamID(data.Team.ID.String()),
+		telemetry.WithTemplateID(data.TemplateID),
+	)
+
+	// Ahead of the concurrency check and the transaction, so a target this team
+	// may not request is refused as the client's error either way, and the value
+	// that reaches the row is the allowance as it stood at registration.
+	freeDiskSizeMB, apiError := team.LimitFreeDiskSize(data.Team.Limits, data.MinFreeDiskMb)
+
+	freeDiskAttrs := []attribute.KeyValue{
+		attribute.Int64("build.free_disk.default_mb", data.Team.Limits.DefaultFreeDiskSizeMb),
+		attribute.Int64("build.free_disk.max_mb", data.Team.Limits.MaxFreeDiskSizeMb),
+	}
+	if data.MinFreeDiskMb != nil {
+		freeDiskAttrs = append(freeDiskAttrs,
+			attribute.Int64("build.free_disk.requested_mb", int64(*data.MinFreeDiskMb)))
+	}
+	telemetry.SetAttributes(ctx, freeDiskAttrs...)
+
+	if apiError != nil {
+		telemetry.ReportErrorByCode(ctx, apiError.Code, "free disk space request refused", apiError.Err,
+			telemetry.WithTeamID(data.Team.ID.String()))
+
+		return nil, apiError
+	}
+
+	telemetry.SetAttributes(ctx, attribute.Int64("build.free_disk.mb", freeDiskSizeMB))
 
 	// Add default tag if no tags are present
 	tags := data.Tags
@@ -113,7 +161,6 @@ func RegisterBuild(
 	telemetry.SetAttributes(ctx,
 		attribute.String("env.team.id", data.Team.ID.String()),
 		attribute.String("env.team.name", data.Team.Name),
-		telemetry.WithTemplateID(data.TemplateID),
 		attribute.String("env.team.tier", data.Team.Tier),
 		telemetry.WithBuildID(buildID.String()),
 		attribute.String("env.dockerfile", data.Dockerfile),
@@ -160,6 +207,27 @@ func RegisterBuild(
 	}
 	defer tx.Rollback(ctx)
 
+	currentCluster, err := client.GetTeamClusterForTemplateBuild(ctx, data.Team.ID)
+	if err != nil {
+		return nil, &api.APIError{Code: http.StatusInternalServerError, ClientMsg: "Error when checking the team's cluster", Err: err}
+	}
+	if clusters.WithClusterFallback(currentCluster) != data.ClusterID {
+		return nil, &api.APIError{Code: http.StatusConflict, ClientMsg: "The team's cluster changed; retry the template build request", Err: errors.New("team cluster changed during template registration")}
+	}
+	if data.ReplacesTemplateID != "" {
+		previous, err := client.GetTemplateForAliasRebuild(ctx, queries.GetTemplateForAliasRebuildParams{
+			TemplateID: data.ReplacesTemplateID, TeamID: data.Team.ID,
+		})
+		if err != nil {
+			if dberrors.IsNotFoundError(err) {
+				return nil, &api.APIError{Code: http.StatusConflict, ClientMsg: "The template changed; retry the template build request", Err: err}
+			}
+
+			return nil, &api.APIError{Code: http.StatusInternalServerError, ClientMsg: "Error when checking the previous template", Err: err}
+		}
+		data.Public = previous.Public
+	}
+
 	var clusterID *uuid.UUID
 	if data.ClusterID != consts.LocalClusterID {
 		clusterID = &data.ClusterID
@@ -172,6 +240,7 @@ func RegisterBuild(
 		TeamID:     data.Team.ID,
 		CreatedBy:  data.UserID,
 		ClusterID:  clusterID,
+		Public:     data.Public,
 	})
 	if err != nil {
 		if dberrors.IsNotFoundError(err) {
@@ -218,12 +287,13 @@ func RegisterBuild(
 	// used in TemplateBuildMetadata and SetFinished overwrites these rows.
 	err = client.CreateTemplateBuild(ctx, queries.CreateTemplateBuildParams{
 		BuildID:            buildID,
+		TemplateID:         data.TemplateID,
 		Status:             dbtypes.BuildStatusWaiting,
 		RamMb:              ramMB,
 		Vcpu:               cpuCount,
 		KernelVersion:      data.KernelVersion,
 		FirecrackerVersion: data.FirecrackerVersion,
-		FreeDiskSizeMb:     data.Team.Limits.DiskMb,
+		FreeDiskSizeMb:     freeDiskSizeMB,
 		StartCmd:           data.StartCmd,
 		ReadyCmd:           data.ReadyCmd,
 		Dockerfile:         new(data.Dockerfile),
@@ -275,7 +345,8 @@ func RegisterBuild(
 			Alias:     alias,
 			Namespace: &data.Team.Slug,
 		})
-		if err != nil {
+		switch {
+		case err != nil:
 			if !dberrors.IsNotFoundError(err) {
 				telemetry.ReportCriticalError(ctx, "error when checking alias", err, attribute.String("alias", alias))
 
@@ -284,6 +355,9 @@ func RegisterBuild(
 					ClientMsg: fmt.Sprintf("Error when querying for alias: %s", err),
 					Code:      http.StatusInternalServerError,
 				}
+			}
+			if data.ReplacesTemplateID != "" {
+				return nil, &api.APIError{Code: http.StatusConflict, ClientMsg: "The template alias changed; retry the template build request", Err: err}
 			}
 
 			aliasKeys, err := client.DeleteOtherTemplateAliases(ctx, data.TemplateID)
@@ -322,7 +396,17 @@ func RegisterBuild(
 			templateCache.InvalidateAlias(context.WithoutCancel(ctx), &data.Team.Slug, alias)
 
 			telemetry.ReportEvent(ctx, "created new alias", attribute.String("env.alias", alias))
-		} else if aliasDB.EnvID != data.TemplateID {
+		case data.ReplacesTemplateID != "":
+			changed, err := client.ReplaceTemplateAlias(ctx, queries.ReplaceTemplateAliasParams{
+				Alias: alias, Namespace: &data.Team.Slug, TemplateID: data.TemplateID, PreviousTemplateID: data.ReplacesTemplateID,
+			})
+			if err != nil {
+				return nil, &api.APIError{Code: http.StatusInternalServerError, ClientMsg: "Error when updating the template alias", Err: err}
+			}
+			if changed != 1 {
+				return nil, &api.APIError{Code: http.StatusConflict, ClientMsg: "The template alias changed; retry the template build request", Err: errors.New("template alias changed during registration")}
+			}
+		case aliasDB.EnvID != data.TemplateID:
 			err := fmt.Errorf("alias '%s' already used", alias)
 
 			return nil, &api.APIError{
@@ -382,6 +466,10 @@ func RegisterBuild(
 		}
 	}
 	telemetry.ReportEvent(ctx, "committed transaction")
+	if data.ReplacesTemplateID != "" && data.Alias != nil {
+		templateCache.InvalidateAllTags(context.WithoutCancel(ctx), data.ReplacesTemplateID)
+		templateCache.InvalidateAlias(context.WithoutCancel(ctx), &data.Team.Slug, id.ExtractAlias(*data.Alias))
+	}
 
 	telemetry.SetAttributes(ctx,
 		attribute.Int64("build.cpu_count", cpuCount),
@@ -392,6 +480,7 @@ func RegisterBuild(
 	logger.L().Info(ctx, "template build requested", logger.WithTemplateID(data.TemplateID), logger.WithBuildID(buildID.String()))
 
 	return &RegisterBuildResponse{
+		Public:     data.Public,
 		TemplateID: data.TemplateID,
 		BuildID:    buildID.String(),
 		Aliases:    aliases,

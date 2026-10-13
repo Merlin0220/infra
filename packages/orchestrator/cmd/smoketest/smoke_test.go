@@ -38,14 +38,16 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/config"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/metrics"
-	artifactsregistry "github.com/e2b-dev/infra/packages/shared/pkg/artifacts-registry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/dockerhub"
+	"github.com/e2b-dev/infra/packages/shared/pkg/fcversion"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/templates"
+	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 const (
@@ -93,6 +95,7 @@ func TestSmokeAllFCVersions(t *testing.T) { //nolint:paralleltest // subtests sh
 					VCpuCount:          2,
 					MemoryMB:           512,
 					DiskSizeMB:         512,
+					FreeDiskSizeMB:     512,
 					HugePages:          true,
 					KernelVersion:      featureflags.DefaultKernelVersion,
 					FirecrackerVersion: fcVersion,
@@ -105,8 +108,9 @@ func TestSmokeAllFCVersions(t *testing.T) { //nolint:paralleltest // subtests sh
 
 			// Phase 2: resume from the build
 			t.Logf("resuming build %s", buildID)
-			tmpl, err := infra.templateCache.GetTemplate(ctx, buildID, false, false)
+			tmpl, releaseTmpl, err := infra.templateCache.GetTemplatePinned(ctx, buildID, false, false)
 			require.NoError(t, err, "load template for FC %s", fcVersion)
+			t.Cleanup(releaseTmpl)
 
 			meta, err := tmpl.Metadata()
 			require.NoError(t, err)
@@ -131,7 +135,7 @@ func TestSmokeAllFCVersions(t *testing.T) { //nolint:paralleltest // subtests sh
 						FirecrackerVersion: meta.Template.FirecrackerVersion,
 					},
 				}),
-				sandbox.RuntimeMetadata{
+				sandboxtypes.RuntimeMetadata{
 					TemplateID:  "smoke-" + fcMajor,
 					TeamID:      "smoke",
 					SandboxID:   fmt.Sprintf("sbx-smoke-%s-%d", fcMajor, time.Now().UnixNano()),
@@ -178,7 +182,7 @@ func newTestInfra(t *testing.T, ctx context.Context) *testInfra {
 	sbxlogger.SetSandboxLoggerInternal(l)
 	sbxlogger.SetSandboxLoggerExternal(l)
 
-	flags, _ := featureflags.NewClientWithLogLevel(ldlog.Error)
+	flags, _ := featureflags.NewClientWithLogLevel("", "", "", ldlog.Error)
 
 	builderConfig, err := cfg.ParseBuilder()
 	require.NoError(t, err)
@@ -223,9 +227,6 @@ func newTestInfra(t *testing.T, ctx context.Context) *testInfra {
 	ti.closers = append(ti.closers, func(ctx context.Context) { networkPool.Close(ctx) })
 
 	// Artifacts / Docker
-	artifactRegistry, err := artifactsregistry.GetArtifactsRegistryProvider(ctx)
-	require.NoError(t, err)
-
 	dockerhubRepo, err := dockerhub.GetRemoteRepository(ctx)
 	require.NoError(t, err)
 	ti.closers = append(ti.closers, func(_ context.Context) { dockerhubRepo.Close() })
@@ -244,13 +245,13 @@ func newTestInfra(t *testing.T, ctx context.Context) *testInfra {
 	ti.closers = append(ti.closers, func(ctx context.Context) { sandboxProxy.Close(ctx) })
 
 	// Factory + Builder
-	factory := sandbox.NewFactory(orcConfig.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
+	factory := sandbox.NewFactory(ctx, orcConfig.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
 	ti.factory = factory
 
 	buildMetrics, _ := metrics.NewBuildMetrics(noop.MeterProvider{})
 	ti.builder = build.NewBuilder(
 		builderConfig, l, flags, factory,
-		persistenceTemplate, persistenceBuild, artifactRegistry,
+		persistenceTemplate, persistenceBuild,
 		dockerhubRepo, sandboxProxy, sandboxes, templateCache, buildMetrics,
 		nil,
 	)
@@ -328,7 +329,8 @@ func locateEnvdSource(t *testing.T) string {
 	wd, err := os.Getwd()
 	require.NoError(t, err)
 
-	// belt keeps envd at go/oss/envd, infra at packages/envd.
+	// The monorepo keeps envd at go/oss/envd, the public layout at
+	// packages/envd.
 	layouts := [][]string{{"go", "oss", "envd"}, {"packages", "envd"}}
 
 	for dir := wd; dir != "/"; dir = filepath.Dir(dir) {
@@ -394,6 +396,25 @@ func downloadKernel(t *testing.T, dataDir string) {
 func downloadFC(t *testing.T, dataDir, version string) {
 	t.Helper()
 
+	dst := filepath.Join(dataDir, "fc-versions", version, artifact.FirecrackerBinaryName)
+
+	// e2b-format releases (vX.Y-a.b.c) are published by the release pipeline
+	// to the public artifact bucket — the corresponding GitHub release
+	// holding the same assets is private, so the bucket is the only
+	// unauthenticated source. Fetch the HOST's arch (the bucket carries
+	// amd64 and arm64) into the arch path that setupFC/the fc config
+	// resolve first.
+	if info, err := fcversion.New(version); err == nil {
+		if _, isE2B := info.E2BVersion(); isE2B {
+			arch := utils.TargetArch()
+			archDst := filepath.Join(dataDir, "fc-versions", version, arch, artifact.FirecrackerBinaryName)
+			url := fmt.Sprintf("https://storage.googleapis.com/e2b-artifact-binaries/firecrackers/%s/%s/firecracker", version, arch)
+			downloadFile(t, url, archDst, 0o755)
+
+			return
+		}
+	}
+
 	// Old releases in https://github.com/e2b-dev/fc-versions/releases don't build
 	// x86_64 and aarch64 binaries. They just build the former and the asset's name
 	// is just 'firecracker'
@@ -403,7 +424,6 @@ func downloadFC(t *testing.T, dataDir, version string) {
 		assetName = artifact.FirecrackerBinaryName
 	}
 
-	dst := filepath.Join(dataDir, "fc-versions", version, artifact.FirecrackerBinaryName)
 	url := fmt.Sprintf("https://github.com/e2b-dev/fc-versions/releases/download/%s/%s", version, assetName)
 	downloadFile(t, url, dst, 0o755)
 }

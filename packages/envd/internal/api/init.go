@@ -11,7 +11,10 @@ import (
 	"net/netip"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/awnumar/memguard"
@@ -22,6 +25,7 @@ import (
 	"github.com/e2b-dev/infra/packages/envd/internal/host"
 	"github.com/e2b-dev/infra/packages/envd/internal/logs"
 	"github.com/e2b-dev/infra/packages/envd/internal/logs/ratelimit"
+	"github.com/e2b-dev/infra/packages/envd/internal/services/cgroups"
 	"github.com/e2b-dev/infra/packages/envd/pkg"
 	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 )
@@ -38,6 +42,7 @@ var (
 const (
 	maxTimeInPast   = 50 * time.Millisecond
 	maxTimeInFuture = 5 * time.Second
+	logFlushTimeout = 2 * time.Second
 )
 
 // validateInitAccessToken validates the access token for /init requests.
@@ -112,6 +117,84 @@ func (a *API) checkMMDSHash(ctx context.Context, requestToken *SecureToken) (boo
 	return keys.HashAccessTokenBytes(tokenBytes) == mmdsHash, true
 }
 
+// freezeAuditHeader carries the resume-time audit of the frozen cgroup set. A header
+// rather than a response body because /init answers 204 and the orchestrator already reads
+// headers off this call.
+//
+// The value is JSON, like X-Envd-Handover on the same response, rather than a bespoke k=v
+// string. Both ends then get field-by-field decoding for free: a reader on an older
+// orchestrator ignores a field this envd adds instead of failing the whole parse, and a
+// reader on a newer one sees a field this envd omits as its zero value. A single header
+// format across the resume path is also one fewer thing to get right.
+const freezeAuditHeader = "X-Envd-Freeze-Audit"
+
+// freezeAudit is the wire form of the audit. Counts are pointers-free and omitempty-free on
+// purpose: a zero violation count is a meaningful report, not an absent one.
+type freezeAudit struct {
+	Visited    int  `json:"visited"`
+	Frozen     int  `json:"frozen"`
+	Escaped    int  `json:"escaped"`
+	Violations int  `json:"violations"`
+	Truncated  bool `json:"truncated"`
+}
+
+// defaultsHeader reports the defaults this envd is EFFECTIVELY serving with, after
+// SetData has applied whatever /init carried. Same JSON-header convention as
+// X-Envd-Handover and X-Envd-Freeze-Audit, on a call the orchestrator already makes.
+//
+// It exists because the orchestrator can otherwise only see what it SENT, never what
+// the guest ended up with — and the two diverging silently is exactly the failure this
+// reports. A re-exec'd envd rebuilds defaults from scratch and depends on /init to
+// repopulate them; if that ever fails to happen, every request that omits a user
+// resolves to the built-in fallback, with a 200 on every RPC and nothing in any log.
+const defaultsHeader = "X-Envd-Defaults"
+
+// effectiveDefaults is the wire form. Workdir is a pointer so "unset" and "set to
+// empty" stay distinguishable — the orchestrator compares against what it sent, and
+// collapsing those two would make a real mismatch look like agreement.
+type effectiveDefaults struct {
+	User    string  `json:"user"`
+	Workdir *string `json:"workdir,omitempty"`
+	// Fallback is true when nothing ever told this envd who to run as, so User is
+	// whatever the binary was compiled with. Deliberately provenance and not
+	// User == BuiltinDefaultUser: a template whose default user genuinely is that value
+	// had its identity DELIVERED, and reporting it as a fallback would both cry wolf on
+	// every resume and hide a real loss behind a value that happens to match.
+	Fallback bool `json:"fallback"`
+}
+
+// memoryHeader reports the memory protection configured on envd's cgroup chain, on
+// every /init response. Same JSON-header convention as its siblings above.
+//
+// It exists because the kernel exposes no file with a cgroup's EFFECTIVE protection:
+// a memory.min that reads back as set on envd.service proves nothing about what envd is
+// granted, since protection is handed down the chain and an ancestor without a value
+// leaves the leaf with none. The orchestrator turns this into a per-start cohort, which
+// is how a resume that ran with envd protected is told apart, fleet-wide, from one that did
+// not.
+//
+// The wire form is cgroups.MemoryProtection itself, whose fields carry the JSON tags:
+// unlike the freeze audit there is no log-only field to hide here, so a copy would only
+// be a second declaration to keep in step.
+const memoryHeader = "X-Envd-Memory"
+
+// unobservedHeader carries the freezer's unobserved-/init count on a /init 204 whose client
+// is still connected when its headers are decided: the number of handlers whose thaw ran
+// and finished with no client left, since the last such response or the last freeze,
+// whichever came later. Always set on that response, so a zero reads as "counted none" and
+// only an envd predating the header sends nothing. An error response carries nothing and
+// resets nothing: the orchestrator is to read the header off a served 204 only.
+const unobservedHeader = "X-Envd-Init-Unobserved"
+
+// thawHeader answers "skip" on a /init that carried thaw: "skip" and so installed no thaw.
+const thawHeader = "X-Envd-Thaw"
+
+// clockCorrectionHeader carries the time, in whole milliseconds truncated, that /init added to
+// its timestamp before the clock gates (see the correction in PostInit). Set whenever the
+// request carried a timestamp and passed auth, whether or not the gates then stepped the
+// clock.
+const clockCorrectionHeader = "X-Envd-Init-Clock-Correction"
+
 func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
@@ -119,6 +202,11 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 	// ones) so the orchestrator can read the live version off the resume-path
 	// call it already makes — no extra round-trip. Set before any WriteHeader.
 	w.Header().Set("X-Envd-Version", pkg.Version)
+
+	// The memory protection on envd's cgroup chain, read once at construction and only
+	// serialised here, so the resume path does no extra reading. On every response,
+	// error ones included, for the same reason as the version above.
+	a.reportMemoryProtection(w)
 
 	// If this envd booted from a live-upgrade handover, advertise its outcome on
 	// /init so the orchestrator can record it — the envd-side result (re-adopted
@@ -136,6 +224,18 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 	operationID := logs.AssignOperationID()
 	logger := a.logger.With().Str(string(logs.OperationIDKey), operationID).Logger()
 
+	// Why this request's cpuCount was refused, reported on its own response only.
+	var cpuErr error
+
+	// Read on entry, before the first body read and before the /init lock, and compared
+	// again by the thaw below: a freeze that lands at any point before that thaw, including
+	// while this handler waits on either, has voided it. Under an Expect: 100-continue request the 100 Continue, and so the
+	// body, goes out only at the first body read, after this read: a handler that entered
+	// after a freeze holds the new generation and thaws, and one that entered before it keeps
+	// the old one whatever it then waits on. A request sent with its body is dispatched
+	// whenever the guest gets to it, so for it the entry is only as early as the dispatch.
+	freezeGen := a.workloadFreezer.FreezeGeneration(ctx)
+
 	if r.Body != nil {
 		// Read raw body so we can wipe it after parsing
 		body, err := io.ReadAll(r.Body)
@@ -147,6 +247,9 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
+		// The timestamp is the host's time when the body was sent, so this is the reading the
+		// correction below measures this handler's own delay from.
+		bodyRead := a.now()
 
 		var initRequest PostInitJSONBody
 		if len(body) > 0 {
@@ -164,6 +267,13 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 		// Safe because Destroy() is nil-safe and TakeFrom clears the source.
 		defer initRequest.AccessToken.Destroy()
 
+		// After the body is read, and before auth or SetData. Acquiring earlier would let
+		// an unauthenticated caller hold this semaphore for as long as it withholds the
+		// rest of its body: /init is auth-excluded (MMDS-validated instead) and the server
+		// sets no ReadTimeout, and the orchestrator's own /init would then block here.
+		// The Release is deferred to function exit, not block exit, so the lock is still
+		// held across reportEffectiveDefaults below -- which is what serialises that read
+		// against SetData.
 		if err := a.initLock.Acquire(ctx, 1); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 
@@ -179,9 +289,43 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Audit the frozen set BEFORE anything thaws it, and advertise the counts on the
+		// response header so the orchestrator can record them fleet-wide. envd exports no
+		// metrics of its own, and the guest's logs land somewhere the freeze dashboards
+		// cannot join against, so the header is the only channel that turns this into a
+		// number rather than a story. It rides a call the orchestrator already makes, the
+		// same way X-Envd-Version does.
+		//
+		// Two things it can see that nothing else can: a cgroup that was never frozen
+		// although it was the sweep's business (created in the window between the sweep and
+		// the snapshot, which no freeze-on-create semantics exist to prevent), and a cgroup
+		// frozen that must not have been. The second is the one that catches bugs.
+		a.auditFrozenSet(w, logger)
+
 		// Run on every /init regardless of the Timestamp guard, so stale/replayed
-		// requests still thaw cgroups after pre-pause freeze.
-		defer a.unfreezeUserCgroups(ctx, logger)
+		// requests still thaw cgroups after pre-pause freeze, unless a freeze came after
+		// this handler entered or the request asked to skip the thaw. Once: the success path
+		// runs it before the response is decided, and the defer covers the error returns.
+		thaw := func() {}
+		if skipThaw(initRequest.Thaw) {
+			// Set when decided, so an error response this handler still writes says it too.
+			w.Header().Set(thawHeader, string(Skip))
+		} else {
+			thaw = sync.OnceFunc(func() { a.unfreezeUserCgroups(ctx, logger, freezeGen) })
+			defer thaw()
+		}
+
+		if initRequest.Timestamp != nil {
+			// The host minted the timestamp before it sent the body; everything since this
+			// handler read it -- the lock, the token check, the audit -- is time the guest clock
+			// would otherwise lose. Moving the target forward cannot cause a backward step, and
+			// the newest-wins compare and the step's bands apply to the corrected value.
+			correction := a.now().Sub(bodyRead)
+			corrected := initRequest.Timestamp.Add(correction)
+			initRequest.Timestamp = &corrected
+			w.Header().Set(clockCorrectionHeader, strconv.FormatInt(correction.Milliseconds(), 10))
+			logger.Info().Dur("clock_correction", correction).Msg("corrected the /init timestamp by the handler's delay")
+		}
 
 		// Restore the access token (and env) BEFORE marking the envd initialized.
 		// On a live-upgraded envd, WithAuthorization only fails CLOSED while
@@ -197,6 +341,14 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 
 				return
 			}
+
+			// A refused count must not fail the resume.
+			// The refusal is reported as "rejected" on the X-Envd-Cpus header.
+			if initRequest.CpuCount != nil {
+				if cpuErr = a.cpuManager.SetTarget(*initRequest.CpuCount); cpuErr != nil {
+					logger.Warn().Err(cpuErr).Int("cpu_count", *initRequest.CpuCount).Msg("ignoring cpu count")
+				}
+			}
 		}
 
 		// Auth passed and token restored: mark the envd initialized so the
@@ -204,6 +356,19 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 		// up — a guest process that can't pass auth can't flip this and drive an
 		// unauthenticated upgrade.
 		a.initialized.Store(true)
+
+		// Before the response is decided: a bodiless 204 reaches the wire only when the
+		// handler returns, after the thaw, so a client that leaves during a slow thaw must be
+		// seen as gone below rather than handed the count in a response it will never read.
+		thaw()
+
+		// Only a response whose client is still connected when its headers are decided
+		// carries the count; one written into a connection already dead would reset it
+		// unread. (A client that leaves between this check and the handler's return is
+		// handed the count anyway: the header bytes leave only at return.)
+		if ctx.Err() == nil {
+			w.Header().Set(unobservedHeader, strconv.FormatInt(a.workloadFreezer.TakeUnobservedInits(), 10))
+		}
 	}
 
 	go func() { //nolint:contextcheck // TODO: fix this later
@@ -212,9 +377,58 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 		host.PollForMMDSOpts(ctx, a.mmdsChan, a.defaults.EnvVars)
 	}()
 
+	// After SetData, so this reports what is actually in effect rather than what was
+	// requested. Set before WriteHeader.
+	a.reportEffectiveDefaults(w, logger)
+	a.reportCPUs(w, cpuErr)
+
 	w.Header().Set("Cache-Control", "no-store")
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// reportEffectiveDefaults advertises the in-effect defaults on the /init response, and
+// warns when a live-upgraded envd ends up on the built-in fallback.
+//
+// The warn is deliberately scoped to a handover boot. On a cold boot the fallback is
+// legitimate and momentary — /init has not necessarily arrived yet — so warning there
+// would be noise. On a handover boot it means the swap dropped an identity the outgoing
+// process was holding, which is never expected and never self-heals.
+func (a *API) reportEffectiveDefaults(w http.ResponseWriter, logger zerolog.Logger) {
+	eff := effectiveDefaults{
+		User:     a.defaults.User,
+		Workdir:  a.defaults.Workdir,
+		Fallback: !a.defaults.UserDelivered,
+	}
+
+	if eff.Fallback && a.handover != nil {
+		logger.Warn().
+			Str("user", eff.User).
+			Msg("live-upgraded envd was never told which user to run as: neither /init nor the " +
+				"handover blob carried one, so every request that omits a user runs as the " +
+				"built-in default")
+	}
+
+	b, err := json.Marshal(eff)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to marshal effective defaults")
+
+		return
+	}
+	w.Header().Set(defaultsHeader, string(b))
+}
+
+// reportMemoryProtection advertises the cached chain protection on the /init response.
+// Marshalling a struct of integers and a bool cannot fail, but the report is advisory and
+// must never fail the /init it rides on, so an error still degrades to no header.
+func (a *API) reportMemoryProtection(w http.ResponseWriter) {
+	b, err := json.Marshal(a.memory)
+	if err != nil {
+		a.logger.Warn().Err(err).Msg("could not encode the memory protection report")
+
+		return
+	}
+	w.Header().Set(memoryHeader, string(b))
 }
 
 func (a *API) SetData(ctx context.Context, logger zerolog.Logger, data PostInitJSONBody) error {
@@ -222,7 +436,7 @@ func (a *API) SetData(ctx context.Context, logger zerolog.Logger, data PostInitJ
 		// Check if current time differs significantly from the received timestamp
 		if shouldSetSystemTime(time.Now(), *data.Timestamp) {
 			logger.Debug().Msgf("Setting sandbox start time to: %v", *data.Timestamp)
-			if err := setSystemTime(*data.Timestamp); err != nil {
+			if err := a.setSystemTime(*data.Timestamp); err != nil {
 				logger.Error().Msgf("Failed to set system time: %v", err)
 			}
 		} else {
@@ -251,6 +465,7 @@ func (a *API) SetData(ctx context.Context, logger zerolog.Logger, data PostInitJ
 	if data.DefaultUser != nil && *data.DefaultUser != "" {
 		logger.Debug().Msgf("Setting default user to: %s", *data.DefaultUser)
 		a.defaults.User = *data.DefaultUser
+		a.defaults.UserDelivered = true
 	}
 
 	if data.DefaultWorkdir != nil && *data.DefaultWorkdir != "" {
@@ -279,6 +494,7 @@ func (a *API) SetData(ctx context.Context, logger zerolog.Logger, data PostInitJ
 // snapshot and /init thaws on resume. Best-effort: tries every cgroup even if
 // one fails so we freeze as many as possible before the snapshot.
 func (a *API) PostFreeze(w http.ResponseWriter, r *http.Request, params PostFreezeParams) {
+	handlerStart := time.Now()
 	defer r.Body.Close()
 
 	logger := a.logger.With().Str(string(logs.OperationIDKey), logs.AssignOperationID()).Logger()
@@ -297,7 +513,23 @@ func (a *API) PostFreeze(w http.ResponseWriter, r *http.Request, params PostFree
 	}
 
 	// Pause stays best-effort: report an incomplete freeze, never fail the pause on it.
-	res, err := a.workloadFreezer.Freeze(r.Context(), maxWait)
+	// The mode is the caller's choice because the flag that selects it lives there. An
+	// absent or unknown value means legacy, so an orchestrator predating the parameter
+	// keeps today's frozen set.
+	mode := cgroups.ModeLegacy
+	if params.Mode != nil && *params.Mode == PostFreezeParamsModeHierarchy {
+		mode = cgroups.ModeHierarchy
+	}
+	var maxCgroups int
+	if params.MaxCgroups != nil {
+		maxCgroups = *params.MaxCgroups
+	}
+
+	res, err := a.workloadFreezer.Freeze(r.Context(), cgroups.FreezeOptions{
+		MaxWait:    maxWait,
+		Mode:       mode,
+		MaxCgroups: maxCgroups,
+	})
 
 	// A failed lock acquire surfaces the ctx error itself, which is what distinguishes it
 	// from a sweep that ran and collected per-cgroup errors -- those are joined, and a
@@ -311,12 +543,30 @@ func (a *API) PostFreeze(w http.ResponseWriter, r *http.Request, params PostFree
 	}
 	if err != nil {
 		// Per-cgroup failures are counted in res.Failed and reported in the body, not
-		// raised as a 500: a threaded cgroup rejecting cgroup.freeze and a cgroup
-		// removed mid-sweep are both expected, and answering with an error would hide
-		// the very counts that make them visible.
+		// raised as a 500: a cgroup that refuses the write is expected, and answering
+		// with an error would hide the very count that makes it visible.
+		//
+		// A WALK-DISCOVERED cgroup that vanished does not reach here -- it is counted
+		// Vanished and raises nothing. One of envd's own static cgroups still does, on
+		// purpose: in legacy mode those are the whole poll set, and a vanish there means
+		// something removed the cgroup from under our tasks rather than a transient unit
+		// exiting. See freezeTarget.tolerateVanish.
 		logger.Error().Err(err).
 			Int("failed", res.Failed).
 			Msg("some cgroups failed to freeze; reporting them in the result")
+	}
+	// The caller's maxWaitMs covers the whole handler, not just the cgroup wait.
+	// Spend only its remainder on sending logs. A legacy caller provides no
+	// observable budget, so an immediately expired context makes this purge-only.
+	flushBudget := time.Duration(0)
+	if report {
+		flushBudget = min(logFlushTimeout, max(maxWait-time.Since(handlerStart), 0))
+	}
+	flushCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), flushBudget)
+	flushErr := a.logFlusher.FlushAndPurge(flushCtx)
+	cancel()
+	if flushErr != nil {
+		logger.Warn().Err(flushErr).Msg("flush and purge logs before pause")
 	}
 	if !report {
 		// Nothing was observed, so there is nothing to say about whether the workload
@@ -346,8 +596,45 @@ func (a *API) PostFreeze(w http.ResponseWriter, r *http.Request, params PostFree
 			Int("frozen", res.Frozen).
 			Int("not_frozen", res.NotFrozen).
 			Int("failed", res.Failed).
+			// Context rather than a cause: a vanished cgroup never makes this warning
+			// fire. Logged because it explains a requested count the other outcomes do
+			// not reach -- but only for one that vanished during the settle poll. One
+			// that vanished at the write was never requested, so it raises the total
+			// instead. FreezeResult's accounting note has the two lines that balance.
+			Int("vanished", res.Vanished).
 			Dur("wait_duration", res.WaitDuration).
 			Msg("pre-pause freeze did not stop the whole workload; snapshot may capture it running")
+	}
+	if res.Vanished > 0 {
+		// The only record of WHICH cgroups went away. A vanish raises no error and does not
+		// hold back AllFrozen, so a sweep that is otherwise clean logs nothing on either
+		// side of the call and the paths would be lost. Debug because it is routine -- the
+		// fleet sees it on roughly 0.02% of pauses -- and because envd's logger has no level
+		// gate, so Debug ships and is retained exactly like Info.
+		logger.Debug().
+			Int("vanished", res.Vanished).
+			Int("requested", res.Requested).
+			Int("frozen", res.Frozen).
+			Strs("vanished_paths", res.VanishedPaths).
+			Msg("cgroups vanished while the freeze was working on them; counted, not failed")
+	}
+	if res.ScanFailed > 0 {
+		// Not an error, but not silent either: the guest-freeze record is incomplete by this
+		// many cgroups, so that many of the guest's own freezes get cleared on resume.
+		logger.Warn().
+			Int("scan_failed", res.ScanFailed).
+			Int("pre_frozen", res.PreFrozen).
+			Msg("could not classify some cgroups as the guest's own; those will be thawed on resume")
+	}
+
+	if res.Truncated {
+		// Coverage is incomplete: cgroups past the bound were never examined, so some of
+		// the workload may still be running. A degradation rather than a failure, but
+		// never a silent one -- if this fires the bound is wrong, and that is the finding.
+		logger.Warn().
+			Int("visited", res.Visited).
+			Int("requested", res.Requested).
+			Msg("freeze walk hit its bound; some cgroups were never examined")
 	}
 	if res.Unobservable > 0 {
 		// Not a failure, but never silent: this guest cannot report freeze state at all,
@@ -359,11 +646,18 @@ func (a *API) PostFreeze(w http.ResponseWriter, r *http.Request, params PostFree
 
 	sweepMs := res.SweepDuration.Milliseconds()
 	waitMs := res.WaitDuration.Milliseconds()
+	resultMode := FreezeResultMode(res.Mode)
 	result := FreezeResult{
+		Mode:         &resultMode,
+		Visited:      &res.Visited,
+		Allowlisted:  &res.Allowlisted,
+		Truncated:    &res.Truncated,
+		PreFrozen:    &res.PreFrozen,
 		Requested:    &res.Requested,
 		Frozen:       &res.Frozen,
 		NotFrozen:    &res.NotFrozen,
 		Failed:       &res.Failed,
+		Vanished:     &res.Vanished,
 		Unobservable: &res.Unobservable,
 		SweepMs:      &sweepMs,
 		WaitMs:       &waitMs,
@@ -377,9 +671,9 @@ func (a *API) PostFreeze(w http.ResponseWriter, r *http.Request, params PostFree
 	}
 }
 
-// PostUnfreeze thaws user/pty cgroups directly. Exists ONLY for the
-// orchestrator's pause-failure rollback path; the resume thaw runs via /init's
-// deferred unfreeze and must not be replaced by this endpoint. Best-effort: tries
+// PostUnfreeze thaws user/pty cgroups directly. Exists for the orchestrator's
+// pause-failure rollback and for the thaw after an in-place checkpoint; the resume thaw
+// runs inside /init, before it answers, and must not be replaced by this endpoint. Best-effort: tries
 // every cgroup even if one fails so a partial failure cannot leave the rest frozen.
 func (a *API) PostUnfreeze(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
@@ -397,11 +691,37 @@ func (a *API) PostUnfreeze(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// unfreezeUserCgroups unfreezes user/pty cgroups (idempotent if not frozen).
-// The freezer detaches the wait from ctx cancellation so the unfreeze always
-// completes.
-func (a *API) unfreezeUserCgroups(ctx context.Context, logger zerolog.Logger) {
-	if err := a.workloadFreezer.Unfreeze(ctx); err != nil {
+// skipThaw reports whether a /init asked to leave the workload frozen. Only "skip" does: an
+// absent field, "inline" and any value this envd does not know thaw, the side on which a
+// guest is never left frozen.
+func skipThaw(v *PostInitJSONBodyThaw) bool {
+	return v != nil && *v == Skip
+}
+
+// unfreezeUserCgroups unfreezes user/pty cgroups (idempotent if not frozen), unless a
+// freeze has advanced the generation since entryGen was read, and this handler must not
+// undo it: a pause's freeze is kept in its snapshot, or thawed through /unfreeze on the
+// pause's own failure or after an in-place checkpoint; the live upgrade's handover freeze
+// is thawed by the outgoing envd if the handover fails, or by the post-upgrade /init in the
+// process that replaces this one, or, if that /init never comes, by the 60 s post-upgrade
+// fallback thaw; the thaw watchdog backs up both freezes. A thaw that finishes with the
+// client gone counts the handler as unobserved, decided after the thaw, which is the event
+// the count is about, and inside the freeze lock, so a freeze cannot zero the count between
+// the thaw and the count. A handler whose thaw is withheld is never counted. The freezer
+// detaches the wait from ctx cancellation so the unfreeze always completes.
+func (a *API) unfreezeUserCgroups(ctx context.Context, logger zerolog.Logger, entryGen uint64) {
+	current, matched, _, err := a.workloadFreezer.ThawIfGeneration(ctx, entryGen, func() {
+		if ctx.Err() != nil {
+			a.workloadFreezer.AddUnobservedInit()
+		}
+	})
+	if !matched {
+		logger.Warn().Uint64("entry_freeze_generation", entryGen).Uint64("current_freeze_generation", current).
+			Msg("a freeze came after this /init entered; not thawing the workload")
+
+		return
+	}
+	if err != nil {
 		logger.Warn().Err(err).Msg("unfreeze workload cgroups")
 	}
 }
@@ -438,9 +758,55 @@ var nfsOptions = strings.Join([]string{
 	// disable caching so that pause/resume works correctly
 	"noac",
 	"lookupcache=none",
+
+	// make a single attempt; a foreground mount otherwise retries for 2 minutes,
+	// far past nfsMountTimeout. mountNFS retries within nfsMountTimeout instead.
+	"retry=0",
 }, ",")
 
-const nfsMountTimeout = 10 * time.Second
+const (
+	nfsMountTimeout = 10 * time.Second
+
+	// nfsCmdWaitDelay bounds how long a canceled mount/umount may keep its
+	// output pipes open before Wait stops reading them.
+	nfsCmdWaitDelay = 2 * time.Second
+
+	// nfsMountRetryDelay is the pause between failed mount attempts.
+	nfsMountRetryDelay = 500 * time.Millisecond
+)
+
+// runNFSCommand runs a mount/umount command, returning its combined output, with
+// a cancellation that cannot outlive ctx. mount and umount fork mount.nfs/umount.nfs
+// helpers that inherit the output pipes, so killing only the direct child leaves
+// the read blocked until the helper exits -- which for a hung NFS server may be
+// never. The command runs in its own process group so cancellation kills the
+// helpers too, and WaitDelay stops waiting on the pipes if a helper survives the
+// kill anyway.
+func runNFSCommand(ctx context.Context, logger zerolog.Logger, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			return cmd.Process.Kill()
+		}
+
+		return nil
+	}
+	cmd.WaitDelay = nfsCmdWaitDelay
+
+	logger = logger.With().Str("cmd", cmd.String()).Logger()
+	logger.Info().Msg("Running NFS command")
+
+	start := time.Now()
+	data, err := cmd.CombinedOutput()
+
+	logger.Info().
+		Err(err).
+		Dur("duration", time.Since(start)).
+		Msg("NFS command finished")
+
+	return data, err
+}
 
 func (a *API) setupNFS(ctx context.Context, logger zerolog.Logger, lifecycleID *string, mounts []VolumeMount) (e error) {
 	// Prevent concurrent mounting attempts
@@ -452,6 +818,7 @@ func (a *API) setupNFS(ctx context.Context, logger zerolog.Logger, lifecycleID *
 	defer a.isMountingNFS.Store(false)
 
 	logger.Debug().Msg("Setting up NFS volumes")
+	start := time.Now()
 
 	ctx = context.WithoutCancel(ctx)                         // don't allow request context cancellation to propagate
 	ctx, cancel := context.WithTimeout(ctx, nfsMountTimeout) // don't let the nfs mount run forever
@@ -483,7 +850,7 @@ func (a *API) setupNFS(ctx context.Context, logger zerolog.Logger, lifecycleID *
 				return fmt.Errorf("failed to unmount stale NFS mount at %q: %w", volume.Path, err)
 			}
 
-			if err := a.mountNFS(wgCtx, volume.NfsTarget, volume.Path); err != nil {
+			if err := a.mountNFS(wgCtx, logger, volume.NfsTarget, volume.Path); err != nil {
 				return fmt.Errorf("failed to mount NFS at %q: %w", volume.Path, err)
 			}
 
@@ -493,13 +860,22 @@ func (a *API) setupNFS(ctx context.Context, logger zerolog.Logger, lifecycleID *
 		})
 	}
 
-	return wg.Wait()
+	if err := wg.Wait(); err != nil {
+		return err
+	}
+
+	logger.Info().
+		Int("volumes", len(mounts)).
+		Dur("duration", time.Since(start)).
+		Msg("NFS volumes set up")
+
+	return nil
 }
 
 func (a *API) unmountNFS(ctx context.Context, logger zerolog.Logger, path string) error {
 	// Check if actually mounted before trying to unmount.
 	// findmnt returns exit code 1 when path is not a mount point - that's not an error.
-	data, err := exec.CommandContext(ctx, "findmnt", "--noheadings", "--output", "SOURCE", path).CombinedOutput()
+	data, err := runNFSCommand(ctx, logger, "findmnt", "--noheadings", "--output", "SOURCE", path)
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
@@ -517,35 +893,85 @@ func (a *API) unmountNFS(ctx context.Context, logger zerolog.Logger, path string
 
 	logger.Debug().Msgf("Unmounting stale NFS mount at %q (was: %s)", path, source)
 
-	if data, err = exec.CommandContext(ctx, "umount", "--force", path).CombinedOutput(); err != nil {
+	start := time.Now()
+	mode := "force"
+	if data, err = runNFSCommand(ctx, logger, "umount", "--force", path); err != nil {
 		logger.Warn().Err(err).Str("path", path).Str("output", string(data)).Msg("Forced NFS umount failed, falling back to lazy")
 		// Fresh ctx so the forced umount running out of budget doesn't kill the fallback.
 		lazyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer cancel()
-		if data, err = exec.CommandContext(lazyCtx, "umount", "--lazy", path).CombinedOutput(); err != nil {
+		mode = "lazy"
+		if data, err = runNFSCommand(lazyCtx, logger, "umount", "--lazy", path); err != nil {
 			return fmt.Errorf("failed to unmount stale NFS mount at %q: %w\n%s", path, err, string(data))
 		}
 	}
 
 	a.mountedPaths.Delete(path)
 
+	logger.Info().
+		Str("path", path).
+		Str("source", source).
+		Str("mode", mode).
+		Dur("duration", time.Since(start)).
+		Msg("Unmounted stale NFS mount")
+
 	return nil
 }
 
-func (a *API) mountNFS(ctx context.Context, nfsTarget, path string) error {
-	commands := [][]string{
-		{"mkdir", "-p", path},
-		{"mount", "-v", "-t", "nfs", "-o", "fg,hard," + nfsOptions, nfsTarget, path},
+func (a *API) mountNFS(ctx context.Context, logger zerolog.Logger, nfsTarget, path string) error {
+	if data, err := runNFSCommand(ctx, logger, "mkdir", "-p", path); err != nil {
+		return fmt.Errorf("`mkdir -p %s` failed: %w\n%s", path, err, string(data))
 	}
 
-	for _, command := range commands {
-		data, err := exec.CommandContext(ctx, command[0], command[1:]...).CombinedOutput()
+	mount := []string{"mount", "-v", "-t", "nfs", "-o", "fg,hard," + nfsOptions, nfsTarget, path}
+
+	start := time.Now()
+	attempts, err := retryUntilDone(ctx, nfsMountRetryDelay, func(ctx context.Context, attempt int) error {
+		data, err := runNFSCommand(ctx, logger, mount[0], mount[1:]...)
 		if err != nil {
-			return fmt.Errorf("`%s` failed: %w\n%s", strings.Join(command, " "), err, string(data))
+			logger.Warn().
+				Err(err).
+				Str("target", nfsTarget).
+				Str("path", path).
+				Int("attempt", attempt).
+				Str("output", string(data)).
+				Msg("NFS mount attempt failed")
+
+			return fmt.Errorf("`%s` failed: %w\n%s", strings.Join(mount, " "), err, string(data))
 		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("after %d attempts: %w", attempts, err)
 	}
+
+	logger.Info().
+		Str("target", nfsTarget).
+		Str("path", path).
+		Int("attempts", attempts).
+		Dur("duration", time.Since(start)).
+		Msg("Mounted NFS volume")
 
 	return nil
+}
+
+// retryUntilDone calls attempt until it succeeds or ctx is done, pausing delay
+// between failures. It returns the number of attempts made and, if none
+// succeeded, the last attempt's error, which says more than ctx.Err() would.
+func retryUntilDone(ctx context.Context, delay time.Duration, attempt func(ctx context.Context, attempt int) error) (int, error) {
+	for attempts := 1; ; attempts++ {
+		err := attempt(ctx, attempts)
+		if err == nil {
+			return attempts, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return attempts, err
+		case <-time.After(delay):
+		}
+	}
 }
 
 // shouldRemountNFS determines if an NFS volume should be remounted based on lifecycle IDs.
@@ -647,4 +1073,75 @@ func getIPFamily(address string) (txeh.IPFamily, error) {
 // maxTimeInPast before the hostTime or more than maxTimeInFuture after the hostTime.
 func shouldSetSystemTime(sandboxTime, hostTime time.Time) bool {
 	return sandboxTime.Before(hostTime.Add(-maxTimeInPast)) || sandboxTime.After(hostTime.Add(maxTimeInFuture))
+}
+
+// auditFrozenSet classifies the frozen cgroups at resume and reports the counts on the
+// /init response header. Advisory throughout: an observer must never be able to fail the
+// resume it is observing, so every error path here degrades to "say nothing".
+func (a *API) auditFrozenSet(w http.ResponseWriter, logger zerolog.Logger) {
+	pm, ok := a.workloadFreezer.Manager().(cgroups.PathManager)
+	if !ok {
+		// No hierarchy to walk (no-op manager, or a non-Linux build). Nothing to audit.
+		return
+	}
+
+	// AuditFrozenSet rather than AuditFrozenState: the freezer owns both the mode and the
+	// guard against a thaw landing mid-walk, so the decision belongs next to that state
+	// rather than here.
+	res, err := a.workloadFreezer.AuditFrozenSet(pm, cgroups.ProcSelfCgroup, cgroups.DefaultThawMaxCgroups)
+	if err != nil {
+		logger.Warn().Err(err).Msg("could not audit the frozen cgroup set at resume")
+
+		return
+	}
+	if !res.Applicable {
+		// Nothing was frozen, so this guest was not resumed from a paused snapshot that
+		// froze anything -- a fresh create, most likely. Reporting escapes here would
+		// count every legitimately running cgroup as one.
+		return
+	}
+
+	// Marshal failure cannot happen for a struct of ints and a bool, but the audit is advisory
+	// and must never fail the resume it observes, so an error still degrades to no header.
+	if b, err := json.Marshal(freezeAudit{
+		Visited:    res.Visited,
+		Frozen:     res.Frozen,
+		Escaped:    res.Escaped,
+		Violations: res.Violations,
+		Truncated:  res.Truncated,
+	}); err == nil {
+		w.Header().Set(freezeAuditHeader, string(b))
+	} else {
+		logger.Warn().Err(err).Msg("could not encode the resume freeze audit")
+	}
+
+	if res.Truncated {
+		// Every count above is a floor, so a zero-violations audit says nothing here.
+		logger.Warn().
+			Int("visited", res.Visited).
+			Msg("the resume audit stopped at its bound; the rest of the hierarchy was not classified")
+	}
+
+	if res.Violations > 0 {
+		// A frozen cgroup that the resume depends on. Not a race and not tolerable: it
+		// means either the allowlist is missing a name or the walk froze a parent of one.
+		logger.Error().
+			Int("violations", res.Violations).
+			Int("frozen", res.Frozen).
+			Int("visited", res.Visited).
+			// Joined into ONE string rather than logged as an array: envd's log pipeline
+			// carries scalar fields and drops the rest, so a Strs() field never reaches
+			// the place an operator reads it -- which was measured on a dev guest, where
+			// the counts arrived and the paths did not. The paths are the whole reason
+			// this line names anything, so they have to survive the transport.
+			Str("paths", strings.Join(res.ViolationPaths, " ")).
+			Msg("cgroups the resume depends on were frozen; the allowlist did not hold")
+	}
+	if res.Escaped > 0 {
+		logger.Warn().
+			Int("escaped", res.Escaped).
+			Int("frozen", res.Frozen).
+			Str("paths", strings.Join(res.EscapedPaths, " ")).
+			Msg("cgroups were running at resume that the pre-pause sweep should have stopped; created after it, or missed by a truncated or failed sweep")
+	}
 }

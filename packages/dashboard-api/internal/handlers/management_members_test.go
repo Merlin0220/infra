@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/e2b-dev/infra/packages/dashboard-api/internal/management"
 	"github.com/e2b-dev/infra/packages/db/pkg/testutils"
@@ -24,8 +25,9 @@ func TestApplyProjectMember(t *testing.T) {
 	userID := uuid.New()
 
 	require.Equal(t, http.StatusNoContent, callApplyProjectMember(t, store, projectID, userID,
-		`{"revision":1,"present":true,"identities":[{"issuer":"https://issuer.test","subject":"subject"}]}`).Code)
+		`{"revision":1,"present":true,"is_default":true,"identities":[{"issuer":"https://issuer.test","subject":"subject"}]}`).Code)
 	require.Equal(t, []uuid.UUID{userID}, handlerTeamMembers(t, db, projectID))
+	require.True(t, handlerTeamMemberIsDefault(t, db, projectID, userID))
 
 	require.Equal(t, http.StatusNoContent, callApplyProjectMember(t, store, projectID, userID,
 		`{"revision":2,"present":false}`).Code)
@@ -76,7 +78,7 @@ func newMembershipStore(db *testutils.Database) *APIStore {
 	return &APIStore{
 		authDB:            db.AuthDB,
 		authService:       auth,
-		managementService: management.NewService(db.AuthDB, db.SqlcClient, auth),
+		managementService: management.NewService(db.AuthDB, db.SqlcClient, auth, noop.NewMeterProvider()),
 	}
 }
 
@@ -114,4 +116,19 @@ func handlerTeamMembers(t *testing.T, db *testutils.Database, projectID uuid.UUI
 	require.NoError(t, err)
 
 	return members
+}
+
+func handlerTeamMemberIsDefault(t *testing.T, db *testutils.Database, projectID, userID uuid.UUID) bool {
+	t.Helper()
+
+	var isDefault bool
+	err := db.AuthDB.TestsRawSQLQuery(t.Context(),
+		"SELECT is_default FROM public.users_teams WHERE team_id = $1 AND user_id = $2", func(rows pgx.Rows) error {
+			rows.Next()
+
+			return rows.Scan(&isDefault)
+		}, projectID, userID)
+	require.NoError(t, err)
+
+	return isDefault
 }

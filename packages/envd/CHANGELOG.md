@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.10.0 (2026-10-12)
+
+
+### Features
+
+* **envd:** bring guest CPUs online to the count requested on /init (5fc4907)
+* **envd:** make the /init thaw freeze-aware and skippable, and correct its clock stamp (69da628)
+* **envd:** report whether a filesystem entry is a symlink (2d11e88)
+* **orchestrator:** warn in the sandbox's logs when it runs out of memory (c2608a7)
+
+
+### Bug Fixes
+
+* **envd:** bound NFS mount commands and log their progress (5da26bc)
+* **envd:** keep process starts out of the cgroup freeze window (0ee8c2d)
+* **envd:** validate keepalive intervals (17855b4)
+
+
+### Code Refactoring
+
+* **envd:** give the OOM watcher its logger when it's created (73a9182)
+* **envd:** remove the deprecated MiB memory fields from /metrics (8076631)
+* **envd:** start the OOM watcher in main and pass it to the API (6cc8efb)
+
+## 0.9.0 (2026-09-10)
+
+
+### Features
+
+* **orch:** report and record the memory protection on envd's cgroup chain per start (8a1809e)
+
+
+### Bug Fixes
+
+* **deps:** update module google.golang.org/grpc to v1.83.2 [security] (7123140)
+
+## 0.8.0 (2026-09-07)
+
+
+### Features
+
+* **envd:** name versioned uploads and promotes by release version (0887574)
+
+
+### Bug Fixes
+
+* **deps:** update module google.golang.org/grpc to v1.83.1 [security] (27006d5)
+* **envd:** flush logs before pause snapshots (f924188)
+* **envd:** report process-start resource exhaustion as resource_exhausted (4e4ca69)
+* **envd:** stop counting a vanished cgroup as a freeze or thaw failure (9c5f26e)
+* **orch:** re-send a sandbox's default user so a live envd upgrade cannot lose it (366ea8f)
+
+## 0.7.0 (2026-08-24)
+
+
+### Features
+
+* **envd:** freeze the customer's cgroups before a pause, not only our own (e117443)
+* **envd:** wait for the pre-pause freeze to stop the workload (99ca5cc)
+* **orch:** forbid envd's private endpoints in the sandbox proxy (b6de7ae)
+* **shared:** use TypeID encoding for object IDs (4a5075b)
+
+
+### Bug Fixes
+
+* **deps:** update module cloud.google.com/go/storage to v1.64.0 (e66f1a8)
+* **deps:** update module github.com/getkin/kin-openapi to v0.146.0 (5307ba8)
+* **deps:** update module google.golang.org/grpc to v1.83.0 (acbefda)
+* **deps:** update opentelemetry-go-contrib monorepo (5852c94)
+* **deps:** update testcontainers-go monorepo to v0.43.0 (08b1cbe)
+
 ## 0.0.1 (2026-07-29)
 
 

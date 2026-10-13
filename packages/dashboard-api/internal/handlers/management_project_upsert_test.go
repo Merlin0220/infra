@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric/noop"
 
 	"github.com/e2b-dev/infra/packages/dashboard-api/internal/api"
 	"github.com/e2b-dev/infra/packages/dashboard-api/internal/management"
@@ -242,7 +243,7 @@ func (p projectFixture) request() api.ManagementProjectUpsertRequest {
 func newUpsertStore(db *testutils.Database) (*APIStore, *recordingCacheAuthService) {
 	auth := &recordingCacheAuthService{}
 
-	return &APIStore{managementService: management.NewService(db.AuthDB, db.SqlcClient, auth)}, auth
+	return &APIStore{managementService: management.NewService(db.AuthDB, db.SqlcClient, auth, noop.NewMeterProvider())}, auth
 }
 
 func callUpsertProject(t *testing.T, store *APIStore, projectID uuid.UUID, request api.ManagementProjectUpsertRequest) *httptest.ResponseRecorder {
@@ -296,4 +297,37 @@ func teamColumn(t *testing.T, db *testutils.Database, teamID uuid.UUID, column s
 	require.NoError(t, err)
 
 	return value
+}
+
+func TestUpsertProjectSynchronizesOptionalCluster(t *testing.T) {
+	t.Parallel()
+	db := testutils.SetupDatabase(t)
+	store, _ := newUpsertStore(db)
+	clusterID := uuid.New()
+	registrationStore := &APIStore{db: db.SqlcClient, authService: &recordingCacheAuthService{}}
+	require.Equal(t, http.StatusNoContent, callManagementRegisterCluster(t, registrationStore, clusterID, managementClusterRegistration()).Code)
+	for range 2 {
+		project := newProjectFixture()
+		request := project.request()
+		request.ClusterId = &clusterID
+		require.Equal(t, http.StatusCreated, callUpsertProject(t, store, project.id, request).Code)
+		require.Equal(t, http.StatusOK, callUpsertProject(t, store, project.id, request).Code)
+		require.Equal(t, http.StatusOK, callUpsertProject(t, store, project.id, project.request()).Code)
+		var stored *uuid.UUID
+		require.NoError(t, db.AuthDB.TestsRawSQLQuery(t.Context(), "SELECT cluster_id FROM public.teams WHERE id=$1", func(rows pgx.Rows) error {
+			require.True(t, rows.Next())
+
+			return rows.Scan(&stored)
+		}, project.id))
+		require.Equal(t, &clusterID, stored)
+	}
+	project := newProjectFixture()
+	require.Equal(t, http.StatusCreated, callUpsertProject(t, store, project.id, project.request()).Code)
+	var stored *uuid.UUID
+	require.NoError(t, db.AuthDB.TestsRawSQLQuery(t.Context(), "SELECT cluster_id FROM public.teams WHERE id=$1", func(rows pgx.Rows) error {
+		require.True(t, rows.Next())
+
+		return rows.Scan(&stored)
+	}, project.id))
+	require.Nil(t, stored)
 }

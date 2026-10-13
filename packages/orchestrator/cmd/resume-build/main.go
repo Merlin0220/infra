@@ -3,7 +3,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -44,10 +46,28 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/envd/process"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
+
+// cpuTemplateOverride wraps a -cpu-template document as the reboot-cpu-template-override
+// value. Empty and null documents mean no template, so they wrap as {} rather than as null,
+// which the flag reads as no override.
+func cpuTemplateOverride(raw []byte) (ldvalue.Value, error) {
+	tmpl := ldvalue.ObjectBuild().Build()
+	if raw = bytes.TrimSpace(raw); len(raw) > 0 {
+		if !json.Valid(raw) {
+			return ldvalue.Null(), errors.New("not valid JSON")
+		}
+		if parsed := ldvalue.Parse(raw); !parsed.IsNull() {
+			tmpl = parsed
+		}
+	}
+
+	return ldvalue.ObjectBuild().Set("template", tmpl).Build(), nil
+}
 
 func main() {
 	fromBuild := flag.String("from-build", "", "build ID (UUID) to resume from (required)")
@@ -67,6 +87,9 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose logging")
 	console := flag.Bool("console", false, "forward Firecracker's output and the guest kernel serial console (tty) to stdout (fresh boot / -reboot only)")
 	firecracker := flag.String("firecracker", "", "override the build's Firecracker version (e.g. when the baked version isn't on this node); safe for a cold boot/-reboot, risky for a memory resume")
+	vcpu := flag.Int64("vcpu", 0, "CPUs the sandbox uses (default: recorded snapshot size; required for an unrecorded memory snapshot)")
+	maxVcpus := flag.Int64("max-vcpus", 0, "VM capacity for a cold boot or legacy memory resume (default: recorded snapshot size, else -vcpu)")
+	envdVersionFlag := flag.String("envd-version", "", fmt.Sprintf("the guest's envd version, which the snapshot does not record (default: %s, a placeholder above every version gate)", placeholderEnvdVersion))
 
 	// Command execution (no pause)
 	cmd := flag.String("cmd", "", "execute command in sandbox and exit (no snapshot)")
@@ -80,11 +103,14 @@ func main() {
 	fsOnly := flag.Bool("fs-only", false, "pause without a memory snapshot (filesystem-only; resume reboots the guest)")
 	reboot := flag.Bool("reboot", false, "cold-boot from the build's rootfs instead of resuming from memory")
 	forceReboot := flag.Bool("force-reboot", false, "cold-boot like -reboot, but bypass the filesystem-only safety gate for memory-snapshot builds (the disk is only crash-consistent)")
+	cpuTemplate := flag.String("cpu-template", "", "with -reboot/-force-reboot, boot this CPU template (a JSON file, or \"none\") instead of the build's (overrides the reboot-cpu-template-override flag)")
 	shell := flag.Bool("shell", false, "attach an interactive PTY shell via envd (no sshd required in the sandbox)")
 
 	fphTimeoutMs := flag.Int("fph-timeout-ms", 0, "override free-page-hinting-config pause timeout LD flag (0 = use LD default)")
 	reclaim := flag.Bool("reclaim", false, "enable pre-pause reclaim chain (fstrim 500ms, sync 500ms, drop_caches 200ms, compact 1s)")
 	collapseEnvdHeap := flag.Bool("collapse-envd-heap", false, "collapse envd's heap before pause (overrides the collapse-envd-heap flag)")
+	envdBinCache := flag.Bool("envd-binary-cache", false, "cache the host envd binary on local disk and gate the resume-time upgrade on a cache hit (overrides the envd-binary-cache flag; -envd-binary-cache=false forces it off)")
+	prebootFsRecovery := flag.Bool("preboot-fs-recovery", false, "run the jailed pre-boot filesystem recovery (journal replay) before a cold boot (overrides the preboot-fs-recovery flag; -reboot/-force-reboot on a non-quiesced snapshot)")
 
 	fphBench := flag.Bool("fph-bench", false, "compare pause memfile size with vs without FPH; requires -cmd-pause workload, uses -iterations (default 3), forces FPR on")
 	fphBenchDelay := flag.Duration("fph-bench-delay", 0, "wait this long between workload completion and pause (lets FPR settle)")
@@ -134,8 +160,22 @@ func main() {
 		featureflags.OverrideBoolFlag(featureflags.SyncWPTrackerDirtyFlag, true)
 	}
 
+	// Overridden in BOTH directions, and only when it was actually passed. This
+	// flag's code fallback is on in development, so a "true means override" form
+	// would make the option a no-op here and leave the off arm of a local A/B
+	// unreachable -- the opposite of every sibling above, whose fallback is off.
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "envd-binary-cache" {
+			featureflags.OverrideBoolFlag(featureflags.EnvdBinaryCacheFlag, *envdBinCache)
+		}
+	})
+
 	if *collapseEnvdHeap {
 		featureflags.OverrideBoolFlag(featureflags.CollapseEnvdHeapFlag, true)
+	}
+
+	if *prebootFsRecovery {
+		featureflags.OverrideBoolFlag(featureflags.PrebootFsRecoveryFlag, true)
 	}
 
 	if *memfileDiffDedup {
@@ -144,8 +184,28 @@ func main() {
 		}))
 	}
 
+	if *cpuTemplate != "" {
+		raw := []byte("{}")
+		if *cpuTemplate != "none" {
+			var err error
+			if raw, err = os.ReadFile(*cpuTemplate); err != nil {
+				log.Fatalf("read -cpu-template: %v", err)
+			}
+		}
+		override, err := cpuTemplateOverride(raw)
+		if err != nil {
+			log.Fatalf("-cpu-template: %v", err)
+		}
+		featureflags.OverrideJSONFlag(featureflags.RebootCPUTemplateOverride, override)
+	}
+
 	if *fromBuild == "" {
 		log.Fatal("-from-build required")
+	}
+
+	envdVer, err := resolveEnvdVersion(*envdVersionFlag)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	if os.Geteuid() != 0 {
@@ -209,6 +269,13 @@ func main() {
 		log.Fatal("-fph-bench requires -cmd-pause and is incompatible with -fph-timeout-ms")
 	}
 
+	if *vcpu < 0 || *maxVcpus < 0 {
+		log.Fatal("-vcpu and -max-vcpus must not be negative")
+	}
+	if *maxVcpus != 0 && *vcpu != 0 && *maxVcpus < *vcpu {
+		log.Fatal("-max-vcpus must be at least -vcpu")
+	}
+
 	// Generate new build ID if not specified and pause mode is enabled
 	outputBuildID := *toBuild
 	if isPauseMode && outputBuildID == "" {
@@ -252,6 +319,9 @@ func main() {
 		iterations:         *iterations,
 		console:            *console,
 		firecrackerVersion: *firecracker,
+		vcpu:               *vcpu,
+		maxVcpus:           *maxVcpus,
+		envdVersion:        envdVer,
 	}
 
 	benchIters := *iterations
@@ -269,7 +339,7 @@ func main() {
 		script:   *gdbScript,
 	}
 
-	err := run(ctx, *fromBuild, *iterations, *coldStart, *noPrefetch, *noEgress, *verbose, *shell, *reboot, *forceReboot, pauseOpts, runOpts, fphBenchOpts, gdbOpts)
+	err = run(ctx, *fromBuild, *iterations, *coldStart, *noPrefetch, *noEgress, *verbose, *shell, *reboot, *forceReboot, pauseOpts, runOpts, fphBenchOpts, gdbOpts)
 	cancel()
 
 	if err != nil {
@@ -314,10 +384,13 @@ type pauseTimings struct {
 }
 
 type runOptions struct {
-	cmd                string // command to run and exit (no pause)
-	iterations         int    // number of iterations (0 = single run)
-	console            bool   // forward the guest kernel console + FC output to stdout/stderr (fresh boot)
-	firecrackerVersion string // override the build's Firecracker version (empty = use the build's own)
+	cmd                string      // command to run and exit (no pause)
+	iterations         int         // number of iterations (0 = single run)
+	console            bool        // forward the guest kernel console + FC output to stdout/stderr (fresh boot)
+	firecrackerVersion string      // override the build's Firecracker version (empty = use the build's own)
+	envdVersion        envdVersion // the guest envd version to report and gate on
+	vcpu               int64       // CPUs the sandbox uses
+	maxVcpus           int64       // requested VM capacity; 0 inherits the recorded size when available
 }
 
 func (r runOptions) enabled() bool {
@@ -388,8 +461,10 @@ func setupEnv(from string, sandboxDir string, storageExplicit bool) error {
 }
 
 type runner struct {
-	factory     *sandbox.Factory
-	tmpl        template.Template
+	factory *sandbox.Factory
+	tmpl    template.Template
+	// tmplPin holds the template cache pin on tmpl; a reload swaps it.
+	tmplPin     *templatePin
 	sbxConfig   *sandbox.Config
 	buildID     string
 	cache       *template.Cache
@@ -407,6 +482,28 @@ type runner struct {
 	gdbOrigVersionsDir string
 }
 
+// templatePin is the cache pin on the runner's current template.
+type templatePin struct {
+	release func()
+}
+
+// Release returns the pin.
+func (p *templatePin) Release() { p.release() }
+
+// reloadTemplate re-acquires the runner's build after a cache invalidation and
+// moves the pin to the new instance.
+func (r *runner) reloadTemplate(ctx context.Context) error {
+	tmpl, release, err := r.cache.GetTemplatePinned(ctx, r.buildID, false, false)
+	if err != nil {
+		return fmt.Errorf("reload template: %w", err)
+	}
+	r.tmplPin.Release()
+	r.tmplPin.release = release
+	r.tmpl = wrapTemplate(tmpl, r.noPrefetch)
+
+	return nil
+}
+
 // wrapTemplate applies the CLI's template masks (-no-prefetch drops the
 // prefetch mapping). -force-reboot needs no mask: it is passed to RebootSandbox
 // as the request-side demand, the same predicate a memory:false resume takes.
@@ -421,7 +518,7 @@ func wrapTemplate(tmpl template.Template, noPrefetch bool) template.Template {
 // startSandbox starts a sandbox from the build, either resuming from its memory
 // snapshot or cold-booting (rebooting) from its rootfs when -reboot or
 // -force-reboot is set.
-func (r *runner) startSandbox(ctx context.Context, runtime sandbox.RuntimeMetadata, start, end time.Time) (*sandbox.Sandbox, error) {
+func (r *runner) startSandbox(ctx context.Context, runtime sandboxtypes.RuntimeMetadata, start, end time.Time) (*sandbox.Sandbox, error) {
 	if r.reboot || r.forceReboot {
 		var procOpts []func(*fc.ProcessOptions)
 		if r.console {
@@ -433,14 +530,14 @@ func (r *runner) startSandbox(ctx context.Context, runtime sandbox.RuntimeMetada
 			})
 		}
 
-		return r.factory.RebootSandbox(ctx, r.tmpl, r.sbxConfig, runtime, end, nil, false, r.forceReboot, procOpts...)
+		return r.factory.RebootSandbox(ctx, r.tmpl, r.sbxConfig, runtime, end, nil, false, r.forceReboot, nil, procOpts...)
 	}
 
 	return r.factory.ResumeSandbox(ctx, r.tmpl, r.sbxConfig, runtime, start, end, nil)
 }
 
 func (r *runner) resumeOnce(ctx context.Context, iter int) (time.Duration, error) {
-	runtime := sandbox.RuntimeMetadata{
+	runtime := sandboxtypes.RuntimeMetadata{
 		TemplateID:  r.buildID,
 		TeamID:      "local",
 		SandboxID:   fmt.Sprintf("sbx-%d-%d", time.Now().UnixNano(), iter),
@@ -459,7 +556,7 @@ func (r *runner) resumeOnce(ctx context.Context, iter int) (time.Duration, error
 }
 
 func (r *runner) interactive(ctx context.Context) error {
-	runtime := sandbox.RuntimeMetadata{
+	runtime := sandboxtypes.RuntimeMetadata{
 		TemplateID:  r.buildID,
 		TeamID:      "local",
 		SandboxID:   fmt.Sprintf("sbx-%d", time.Now().UnixNano()),
@@ -507,7 +604,7 @@ func (r *runner) cmdMode(ctx context.Context, opts runOptions) error {
 }
 
 func (r *runner) cmdOnce(ctx context.Context, opts runOptions, verbose bool) (cmdTimings, error) {
-	runtime := sandbox.RuntimeMetadata{
+	runtime := sandboxtypes.RuntimeMetadata{
 		TemplateID:  r.buildID,
 		TeamID:      "local",
 		SandboxID:   fmt.Sprintf("sbx-%d", time.Now().UnixNano()),
@@ -574,11 +671,9 @@ func (r *runner) cmdBenchmark(ctx context.Context, opts runOptions) error {
 			if err := dropPageCache(); err != nil {
 				return fmt.Errorf("drop page cache: %w", err)
 			}
-			tmpl, err := r.cache.GetTemplate(ctx, r.buildID, false, false)
-			if err != nil {
-				return fmt.Errorf("reload template: %w", err)
+			if err := r.reloadTemplate(ctx); err != nil {
+				return err
 			}
-			r.tmpl = wrapTemplate(tmpl, r.noPrefetch)
 		}
 
 		fmt.Printf("\r[%d/%d] Running...    ", i+1, opts.iterations)
@@ -707,7 +802,7 @@ func (r *runner) pauseMode(ctx context.Context, opts pauseOptions) error {
 }
 
 func (r *runner) pauseOnce(ctx context.Context, opts pauseOptions, verbose bool) (pauseTimings, error) {
-	runtime := sandbox.RuntimeMetadata{
+	runtime := sandboxtypes.RuntimeMetadata{
 		TemplateID:  r.buildID,
 		TeamID:      "local",
 		SandboxID:   fmt.Sprintf("sbx-%d", time.Now().UnixNano()),
@@ -821,7 +916,7 @@ func (r *runner) pauseOnce(ctx context.Context, opts pauseOptions, verbose bool)
 			fmt.Println("💾 Saving snapshot to local storage...")
 		}
 
-		upload, err := sandbox.NewUpload(ctx, nil, snapshot, r.storage, storage.CompressConfig{}, nil, "", nil)
+		upload, err := sandbox.NewUpload(ctx, nil, snapshot, r.storage, storage.CompressConfig{}, nil, "", nil, nil)
 		if err != nil {
 			return timings, fmt.Errorf("failed to prepare upload: %w", err)
 		}
@@ -862,11 +957,9 @@ func (r *runner) pauseBenchmark(ctx context.Context, opts pauseOptions) error {
 			if err := dropPageCache(); err != nil {
 				return fmt.Errorf("drop page cache: %w", err)
 			}
-			tmpl, err := r.cache.GetTemplate(ctx, r.buildID, false, false)
-			if err != nil {
-				return fmt.Errorf("reload template: %w", err)
+			if err := r.reloadTemplate(ctx); err != nil {
+				return err
 			}
-			r.tmpl = wrapTemplate(tmpl, r.noPrefetch)
 		}
 
 		// Generate unique build ID for each iteration (not saved)
@@ -984,7 +1077,8 @@ func (r *runner) collectAndUploadPrefetch(ctx context.Context, opts pauseOptions
 	fmt.Println("\n🔍 Collecting prefetch mapping...")
 
 	r.cache.Invalidate(opts.newBuildID)
-	tmpl, err := r.cache.GetTemplate(ctx, opts.newBuildID, false, false)
+	tmpl, releaseTmpl, err := r.cache.GetTemplatePinned(ctx, opts.newBuildID, false, false)
+	defer releaseTmpl()
 	if err != nil {
 		return fmt.Errorf("load template: %w", err)
 	}
@@ -996,7 +1090,7 @@ func (r *runner) collectAndUploadPrefetch(ctx context.Context, opts pauseOptions
 	for i := range prefetchCollectionIterations {
 		fmt.Printf("   Run %d/%d...", i+1, prefetchCollectionIterations)
 
-		runtime := sandbox.RuntimeMetadata{
+		runtime := sandboxtypes.RuntimeMetadata{
 			TemplateID:  opts.newBuildID,
 			TeamID:      "local",
 			SandboxID:   fmt.Sprintf("prefetch-%d-%d", time.Now().UnixNano(), i),
@@ -1038,6 +1132,7 @@ func (r *runner) collectAndUploadPrefetch(ctx context.Context, opts pauseOptions
 
 	updatedMeta := existingMeta.WithPrefetch(&metadata.Prefetch{
 		Memory: mapping,
+		Origin: metadata.PrefetchOriginBuild,
 	})
 
 	if err := metadata.UploadMetadata(ctx, r.storage, updatedMeta, nil); err != nil {
@@ -1107,11 +1202,9 @@ func (r *runner) benchmark(ctx context.Context, n int) error {
 			if err := dropPageCache(); err != nil {
 				return fmt.Errorf("drop page cache: %w", err)
 			}
-			tmpl, err := r.cache.GetTemplate(ctx, r.buildID, false, false)
-			if err != nil {
-				return fmt.Errorf("reload template: %w", err)
+			if err := r.reloadTemplate(ctx); err != nil {
+				return err
 			}
-			r.tmpl = wrapTemplate(tmpl, r.noPrefetch)
 		}
 
 		fmt.Printf("\r[%d/%d] Running...    ", i+1, n)
@@ -1130,6 +1223,51 @@ func (r *runner) benchmark(ctx context.Context, n int) error {
 	printResults(results)
 
 	return lastErr
+}
+
+// placeholderEnvdVersion is not the guest's real version — see the envd version caveat in the README.
+const placeholderEnvdVersion = "1.0.0"
+
+// envdVersion is the guest envd version the tool reports and gates on. resolveEnvdVersion
+// is its only constructor, and a value it did not produce reports placeholderEnvdVersion.
+type envdVersion struct {
+	value string
+	given bool
+}
+
+// resolveEnvdVersion builds an envdVersion from the -envd-version flag.
+//
+// An unparseable version is refused here because the capability gates read a parse error as
+// "capability absent" and only log it, so a typo would silently leave /freeze, /fsfreeze
+// and /collapse off.
+func resolveEnvdVersion(flagValue string) (envdVersion, error) {
+	if flagValue == "" {
+		return envdVersion{}, nil
+	}
+
+	// The floor never matters; this calls the gates' own parser for its error.
+	if _, err := utils.IsGTEVersion(flagValue, "0.0.0"); err != nil {
+		return envdVersion{}, fmt.Errorf("invalid -envd-version %q: %w", flagValue, err)
+	}
+
+	return envdVersion{value: flagValue, given: true}, nil
+}
+
+func (v envdVersion) String() string {
+	if !v.given {
+		return placeholderEnvdVersion
+	}
+
+	return v.value
+}
+
+// describe reports the version and where it came from.
+func (v envdVersion) describe() string {
+	if v.given {
+		return fmt.Sprintf("%s (-envd-version)", v)
+	}
+
+	return fmt.Sprintf("%s (placeholder, not the guest's version — pass -envd-version)", v)
 }
 
 func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefetch, noEgress, verbose, shell, reboot, forceReboot bool, pauseOpts pauseOptions, runOpts runOptions, fphBenchOpts fphBenchOptions, gdbOpts gdbOptions) error {
@@ -1179,7 +1317,7 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	if verbose {
 		logLevel = ldlog.Info
 	}
-	flags, _ := featureflags.NewClientWithLogLevel(logLevel)
+	flags, _ := featureflags.NewClientWithLogLevel(config.DeploymentEnvironment, "", "", logLevel)
 
 	sandboxes := sandbox.NewSandboxesMap()
 
@@ -1289,10 +1427,23 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	if verbose {
 		fmt.Println("🔧 Creating sandbox factory...")
 	}
-	factory := sandbox.NewFactory(config.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), egressProxy, sandbox.NoopNetworkAssignHook{}, sandboxes)
+	// A chosen size may need a limit, so it gets a real cgroup; the snapshot's own size needs none.
+	cgroupManager := cgroup.NewNoopManager()
+	if runOpts.vcpu > 0 || runOpts.maxVcpus > 0 {
+		cgroupManager, err = cgroup.NewManager()
+		if err != nil {
+			return fmt.Errorf("cgroup manager for -vcpu/-max-vcpus: %w", err)
+		}
+		if err := cgroupManager.Initialize(ctx); err != nil {
+			return fmt.Errorf("initialize cgroup root for -vcpu/-max-vcpus: %w", err)
+		}
+	}
+	factory := sandbox.NewFactory(ctx, config.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroupManager, egressProxy, sandbox.NoopNetworkAssignHook{}, sandboxes)
 
 	fmt.Printf("📦 Loading %s...\n", buildID)
-	tmpl, err := cache.GetTemplate(ctx, buildID, false, false)
+	tmpl, releaseTmpl, err := cache.GetTemplatePinned(ctx, buildID, false, false)
+	pin := &templatePin{release: releaseTmpl}
+	defer pin.Release()
 	if err != nil {
 		return err
 	}
@@ -1318,13 +1469,41 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 		fcVersion = runOpts.firecrackerVersion
 	}
 
+	fmt.Printf("   envd: %s\n", runOpts.envdVersion.describe())
+
+	// -vcpu 0 is the snapshot's recorded size, or 1 for an unrecorded cold boot.
+	if runOpts.vcpu == 0 {
+		runOpts.vcpu, err = defaultRunVcpu(meta.VcpuCount, reboot || forceReboot)
+		if err != nil {
+			return err
+		}
+		if runOpts.maxVcpus != 0 && runOpts.maxVcpus < runOpts.vcpu {
+			return fmt.Errorf("-max-vcpus %d is below the snapshot's %d vcpus", runOpts.maxVcpus, runOpts.vcpu)
+		}
+	}
+	vmVcpus := meta.VcpuCount
+	vmSizeSource := "recorded in the snapshot"
+	switch {
+	case reboot || forceReboot:
+		vmVcpus = max(runOpts.vcpu, runOpts.maxVcpus)
+		if runOpts.maxVcpus == 0 {
+			vmVcpus = max(vmVcpus, meta.VcpuCount)
+		}
+		vmSizeSource = "cold-boot VM"
+	case vmVcpus == 0:
+		vmVcpus = max(runOpts.vcpu, runOpts.maxVcpus)
+		vmSizeSource = "inferred from flags; snapshot size unrecorded"
+	}
+	fmt.Printf("   vCPUs: %d of %d (%s)\n", runOpts.vcpu, vmVcpus, vmSizeSource)
+
 	token := "local"
 	sbxCfg := sandbox.NewConfig(sandbox.Config{
 		BaseTemplateID:    buildID,
-		Vcpu:              1,
+		Vcpu:              runOpts.vcpu,
+		ConfiguredVmVcpus: runOpts.maxVcpus,
 		RamMB:             512,
 		FreePageReporting: fphBenchOpts.enabled,
-		Envd:              sandbox.EnvdMetadata{Vars: map[string]string{}, AccessToken: &token, Version: "1.0.0"},
+		Envd:              sandbox.EnvdMetadata{Vars: map[string]string{}, AccessToken: &token, Version: runOpts.envdVersion.String()},
 		FirecrackerConfig: fc.Config{
 			KernelVersion:      meta.Template.KernelVersion,
 			FirecrackerVersion: fcVersion,
@@ -1334,6 +1513,7 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	r := &runner{
 		factory:     factory,
 		tmpl:        tmpl,
+		tmplPin:     pin,
 		buildID:     buildID,
 		cache:       cache,
 		coldStart:   coldStart,
@@ -1377,6 +1557,17 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	}
 
 	return r.interactive(ctx)
+}
+
+func defaultRunVcpu(recorded int64, coldBoot bool) (int64, error) {
+	if recorded > 0 {
+		return recorded, nil
+	}
+	if coldBoot {
+		return 1, nil
+	}
+
+	return 0, errors.New("snapshot size unrecorded; pass -vcpu for a memory resume")
 }
 
 func printTemplateInfo(ctx context.Context, tmpl template.Template, meta metadata.Template) {

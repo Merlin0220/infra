@@ -22,6 +22,8 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	templatecache "github.com/e2b-dev/infra/packages/api/internal/cache/templates"
+	"github.com/e2b-dev/infra/packages/api/internal/fcgate"
+	"github.com/e2b-dev/infra/packages/api/internal/middleware/idempotency"
 	apiorch "github.com/e2b-dev/infra/packages/api/internal/orchestrator"
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth"
@@ -30,6 +32,7 @@ import (
 	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/clusters"
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/ginutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
@@ -51,7 +54,7 @@ const (
 	// Network validation error messages
 	ErrMsgDomainsRequireBlockAll = "When specifying allowed domains in allow out, you must include 'ALL_TRAFFIC' in deny out to block all other traffic."
 
-	maxNetworkRuleDomains             = 10
+	maxHTTPSPorts                     = 128
 	maxNetworkRuleTransformsPerDomain = 1
 	maxNetworkRuleDomainLen           = 128
 	maxNetworkRuleHeaderNameLen       = 64
@@ -61,7 +64,63 @@ const (
 	maxIamTokens = 5
 )
 
+// PostSandboxes creates a sandbox with secured envd access; the body's secure field is ignored.
 func (a *APIStore) PostSandboxes(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	body, err := ginutils.ParseBody[api.PostSandboxesJSONRequestBody](ctx, c)
+	if err != nil {
+		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Error when parsing request: %s", err))
+
+		telemetry.ReportCriticalError(ctx, "error when parsing request", err)
+
+		return
+	}
+
+	body.Secure = new(true)
+	a.createSandbox(c, body, sandbox.SandboxTimeoutDefault)
+}
+
+// PostV2Sandboxes creates a sandbox with secured envd access; the request has no secure field to opt out.
+func (a *APIStore) PostV2Sandboxes(c *gin.Context, _ api.PostV2SandboxesParams) {
+	ctx := c.Request.Context()
+
+	body, err := ginutils.ParseBody[api.PostV2SandboxesJSONRequestBody](ctx, c)
+	if err != nil {
+		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Error when parsing request: %s", err))
+
+		telemetry.ReportCriticalError(ctx, "error when parsing request", err)
+
+		return
+	}
+
+	idempotency.Execute(c, body, func() {
+		a.createSandbox(c, newSandboxFromV2(body), sandbox.SandboxTimeoutDefaultV2)
+	})
+}
+
+func newSandboxFromV2(body api.NewSandboxV2) api.NewSandbox {
+	secure := true
+
+	return api.NewSandbox{
+		TemplateID:          body.TemplateID,
+		Timeout:             body.Timeout,
+		AutoPause:           body.AutoPause,
+		AutoPauseMemory:     body.AutoPauseMemory,
+		AutoResume:          body.AutoResume,
+		Secure:              &secure,
+		AllowInternetAccess: body.AllowInternetAccess,
+		Network:             body.Network,
+		Metadata:            body.Metadata,
+		EnvVars:             body.EnvVars,
+		Mcp:                 body.Mcp,
+		Iam:                 body.Iam,
+		VolumeMounts:        body.VolumeMounts,
+	}
+}
+
+// createSandbox runs the shared create flow; defaultTimeout applies when the body omits timeout.
+func (a *APIStore) createSandbox(c *gin.Context, body api.NewSandbox, defaultTimeout time.Duration) {
 	ctx := c.Request.Context()
 
 	// Get team from context, use TeamContextKey
@@ -72,15 +131,6 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 	span := trace.SpanFromContext(ctx)
 	traceID := span.SpanContext().TraceID().String()
 	c.Set("traceID", traceID)
-
-	body, err := ginutils.ParseBody[api.PostSandboxesJSONRequestBody](ctx, c)
-	if err != nil {
-		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Error when parsing request: %s", err))
-
-		telemetry.ReportCriticalError(ctx, "error when parsing request", err)
-
-		return
-	}
 
 	telemetry.ReportEvent(ctx, "Parsed body")
 
@@ -155,7 +205,7 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 	metadata := sharedUtils.DerefOrDefault(body.Metadata, nil)
 	apiVolumeMounts := sharedUtils.DerefOrDefault(body.VolumeMounts, nil)
 
-	timeout, apiErr := validateAndParseTimeout(body.Timeout, teamInfo.Limits.MaxLengthHours)
+	timeout, apiErr := validateAndParseTimeoutWithDefault(body.Timeout, teamInfo.Limits.MaxLengthHours, defaultTimeout)
 	if apiErr != nil {
 		a.sendAPIStoreError(c, apiErr.Code, apiErr.ClientMsg)
 
@@ -181,6 +231,19 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 	// auto-resume (it must be resumed explicitly), so the two are incompatible.
 	if autoPauseFilesystemOnly && autoResume != nil && autoResume.Policy == types.SandboxAutoResumeAny {
 		a.sendAPIStoreError(c, http.StatusBadRequest, "autoPauseMemory=false (filesystem-only auto-pause) cannot be combined with autoResume: a filesystem-only snapshot cannot be auto-resumed by traffic and must be resumed explicitly.")
+
+		return
+	}
+
+	// A filesystem-only auto-pause also needs the sandbox's Firecracker
+	// release to carry the feature. No record exists yet, so fcgate checks
+	// the declared build version and falls back to the same flag resolution
+	// the orchestrator will apply at start — refusing up front instead of
+	// storing a policy the timeout eviction would have to degrade later.
+	// (The evictor still degrades gracefully if resolution shifts between
+	// create and timeout.)
+	if autoPauseFilesystemOnly && !fcgate.SupportsFilesystemSnapshotsDeclared(ctx, a.featureFlags, build.FirecrackerVersion) {
+		a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("autoPauseMemory=false requires a Firecracker release with filesystem-only snapshot support; this template's version is %q. Rebuild the template on a current release or omit autoPauseMemory.", build.FirecrackerVersion))
 
 		return
 	}
@@ -216,7 +279,8 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 
 	var network *types.SandboxNetworkConfig
 	if n := body.Network; n != nil {
-		if err := validateNetworkConfig(ctx, a.featureFlags, teamInfo.Team.ID, sharedUtils.DerefOrDefault(build.EnvdVersion, ""), n); err != nil {
+		maxDomains := a.featureFlags.IntFlag(ctx, featureflags.MaxNetworkRuleDomains, featureflags.TeamContext(teamInfo.Team.ID.String()))
+		if err := validateNetworkConfig(ctx, a.featureFlags, teamInfo.Team.ID, sharedUtils.DerefOrDefault(build.EnvdVersion, ""), maxDomains, n); err != nil {
 			telemetry.ReportError(ctx, "invalid network config", err.Err, telemetry.WithSandboxID(sandboxID))
 			a.sendAPIStoreError(c, err.Code, err.ClientMsg)
 
@@ -227,6 +291,7 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 			Ingress: &types.SandboxNetworkIngressConfig{
 				AllowPublicAccess: n.AllowPublicTraffic,
 				MaskRequestHost:   n.MaskRequestHost,
+				HTTPSPorts:        sharedUtils.DerefOrDefault(n.HttpsPorts, nil),
 			},
 			Egress: &types.SandboxNetworkEgressConfig{
 				AllowedAddresses: sharedUtils.DerefOrDefault(n.AllowOut, nil),
@@ -244,11 +309,7 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 				return
 			}
 
-			canonical, err := sandbox_network.ValidateEgressProxy(ctx, &sandbox_network.EgressProxyConfig{
-				Address:  ep.Address,
-				Username: sharedUtils.DerefOrDefault(ep.Username, ""),
-				Password: sharedUtils.DerefOrDefault(ep.Password, ""),
-			}, nil)
+			canonical, err := sandbox_network.ValidateEgressProxy(ctx, apiEgressProxyToConfig(ep), nil)
 			if err != nil {
 				telemetry.ReportError(ctx, "invalid egress proxy config", err, telemetry.WithSandboxID(sandboxID))
 				a.sendAPIStoreError(c, http.StatusBadRequest, fmt.Sprintf("Invalid egress proxy config: %s", err))
@@ -256,17 +317,7 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 				return
 			}
 
-			network.Egress.EgressProxyAddress = canonical.Address
-			network.Egress.EgressProxyUsername = canonical.Username
-			network.Egress.EgressProxyPassword = canonical.Password
-		}
-
-		// Make sure envd seucre access is enforced when public access is disabled,
-		// This requirement forces users using newer features to secure sandboxes properly.
-		if !sharedUtils.DerefOrDefault(network.Ingress.AllowPublicAccess, types.AllowPublicAccessDefault) && envdAccessToken == nil {
-			a.sendAPIStoreError(c, http.StatusBadRequest, "You cannot create a sandbox without public access unless you enable secure envd access via 'secure' flag.")
-
-			return
+			apiorch.ApplyValidatedEgressProxy(network.Egress, canonical)
 		}
 	}
 
@@ -286,8 +337,7 @@ func (a *APIStore) PostSandboxes(c *gin.Context) {
 			return
 		}
 
-		var vne InvalidVolumeMountsError
-		if errors.As(err, &vne) {
+		if vne, ok := errors.AsType[InvalidVolumeMountsError](err); ok {
 			a.sendAPIStoreError(c, http.StatusBadRequest, vne.Error())
 
 			return
@@ -681,15 +731,76 @@ func apiRulesToDBRules(apiRules *map[string][]api.SandboxNetworkRule) map[string
 			dbDomainRules = append(dbDomainRules, dbRule)
 		}
 
-		dbRules[domain] = dbDomainRules
+		dbRules[strings.ToLower(domain)] = dbDomainRules
 	}
 
 	return dbRules
 }
 
-func validateNetworkConfig(ctx context.Context, featureFlags featureFlagsClient, teamID uuid.UUID, envdVersion string, network *api.SandboxNetworkConfig) *api.APIError {
+// apiEgressProxyToConfig maps the API egress proxy object onto the validation
+// input. It does no checking of its own; ValidateEgressProxy owns that.
+func apiEgressProxyToConfig(ep *api.SandboxEgressProxyConfig) *sandbox_network.EgressProxyConfig {
+	if ep == nil {
+		return nil
+	}
+
+	cfg := &sandbox_network.EgressProxyConfig{
+		Address:  ep.Address,
+		Username: sharedUtils.DerefOrDefault(ep.Username, ""),
+		Password: sharedUtils.DerefOrDefault(ep.Password, ""),
+	}
+
+	if t := ep.Tls; t != nil {
+		cfg.TLS = &sandbox_network.EgressProxyTLSConfig{
+			Enabled:    t.Enabled,
+			ServerName: sharedUtils.DerefOrDefault(t.ServerName, ""),
+			CACert:     sharedUtils.DerefOrDefault(t.CaCert, ""),
+		}
+	}
+
+	return cfg
+}
+
+func validateNetworkConfig(ctx context.Context, featureFlags featureFlagsClient, teamID uuid.UUID, envdVersion string, maxDomains int, network *api.SandboxNetworkConfig) *api.APIError {
 	if network == nil {
 		return nil
+	}
+
+	if httpsPorts := network.HttpsPorts; httpsPorts != nil {
+		if len(*httpsPorts) > maxHTTPSPorts {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       fmt.Errorf("too many HTTPS ports: %d (max %d)", len(*httpsPorts), maxHTTPSPorts),
+				ClientMsg: fmt.Sprintf("HTTPS ports can have at most %d entries.", maxHTTPSPorts),
+			}
+		}
+
+		seen := make(map[uint32]struct{}, len(*httpsPorts))
+		for _, port := range *httpsPorts {
+			if port == 0 || port > 65535 {
+				return &api.APIError{
+					Code:      http.StatusBadRequest,
+					Err:       fmt.Errorf("invalid HTTPS port %d", port),
+					ClientMsg: fmt.Sprintf("HTTPS port must be between 1 and 65535: %d", port),
+				}
+			}
+			if port == uint32(consts.DefaultEnvdServerPort) {
+				return &api.APIError{
+					Code:      http.StatusBadRequest,
+					Err:       errors.New("envd port cannot use HTTPS backend routing"),
+					ClientMsg: fmt.Sprintf("HTTPS backend routing is not supported for reserved port %d", port),
+				}
+			}
+			if _, ok := seen[port]; ok {
+				return &api.APIError{
+					Code:      http.StatusBadRequest,
+					Err:       fmt.Errorf("duplicate HTTPS port %d", port),
+					ClientMsg: fmt.Sprintf("HTTPS port %d is specified more than once.", port),
+				}
+			}
+
+			seen[port] = struct{}{}
+		}
 	}
 
 	if maskRequestHost := network.MaskRequestHost; maskRequestHost != nil {
@@ -727,7 +838,7 @@ func validateNetworkConfig(ctx context.Context, featureFlags featureFlagsClient,
 		return err
 	}
 
-	return validateNetworkRules(ctx, featureFlags, teamID, envdVersion, network.Rules)
+	return validateNetworkRules(ctx, featureFlags, teamID, envdVersion, maxDomains, network.Rules)
 }
 
 // validateEgressRules validates egress allow/deny rules:
@@ -771,7 +882,7 @@ func validateEgressRules(allowOut, denyOut []string) *api.APIError {
 	return nil
 }
 
-func validateNetworkRules(ctx context.Context, featureFlags featureFlagsClient, teamID uuid.UUID, envdVersion string, rules *map[string][]api.SandboxNetworkRule) *api.APIError {
+func validateNetworkRules(ctx context.Context, featureFlags featureFlagsClient, teamID uuid.UUID, envdVersion string, maxDomains int, rules *map[string][]api.SandboxNetworkRule) *api.APIError {
 	if rules == nil {
 		return nil
 	}
@@ -800,14 +911,15 @@ func validateNetworkRules(ctx context.Context, featureFlags featureFlagsClient, 
 		}
 	}
 
-	if len(*rules) > maxNetworkRuleDomains {
+	if len(*rules) > maxDomains {
 		return &api.APIError{
 			Code:      http.StatusBadRequest,
-			Err:       fmt.Errorf("too many rule domains: %d (max %d)", len(*rules), maxNetworkRuleDomains),
-			ClientMsg: fmt.Sprintf("Network rules can have at most %d domains.", maxNetworkRuleDomains),
+			Err:       fmt.Errorf("too many rule domains: %d (max %d)", len(*rules), maxDomains),
+			ClientMsg: fmt.Sprintf("Network rules can have at most %d domains.", maxDomains),
 		}
 	}
 
+	seenDomains := make(map[string]struct{}, len(*rules))
 	for domain, domainRules := range *rules {
 		if len(domain) == 0 {
 			return &api.APIError{
@@ -825,13 +937,28 @@ func validateNetworkRules(ctx context.Context, featureFlags featureFlagsClient, 
 			}
 		}
 
-		if !govalidator.IsDNSName(domain) {
+		validDomain := govalidator.IsDNSName(domain)
+		if strings.HasPrefix(domain, "*.") {
+			validDomain = sandbox_network.IsValidWildcardDomainPattern(domain)
+		}
+
+		if !validDomain {
 			return &api.APIError{
 				Code:      http.StatusBadRequest,
 				Err:       fmt.Errorf("rule domain %q is not a valid domain", domain),
 				ClientMsg: fmt.Sprintf("Rule domain %q is not a valid domain name.", domain),
 			}
 		}
+
+		normalizedDomain := strings.ToLower(domain)
+		if _, ok := seenDomains[normalizedDomain]; ok {
+			return &api.APIError{
+				Code:      http.StatusBadRequest,
+				Err:       errors.New("network rule domain keys must be unique ignoring case"),
+				ClientMsg: "Network rule domain keys must be unique ignoring case.",
+			}
+		}
+		seenDomains[normalizedDomain] = struct{}{}
 
 		if len(domainRules) > maxNetworkRuleTransformsPerDomain {
 			return &api.APIError{

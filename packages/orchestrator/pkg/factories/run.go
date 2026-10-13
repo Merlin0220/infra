@@ -36,6 +36,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/chrooted"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/events"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/gcpercent"
 	e2bhealthcheck "github.com/e2b-dev/infra/packages/orchestrator/pkg/healthcheck"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/hyperloopserver"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/localupload"
@@ -44,6 +45,7 @@ import (
 	nfscfg "github.com/e2b-dev/infra/packages/orchestrator/pkg/nfsproxy/cfg"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/portmap"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/proxy"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/routing"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	blockmetrics "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/metrics"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
@@ -70,6 +72,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/limit"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
+	sandboxcatalog "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-catalog"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
@@ -278,6 +281,17 @@ func (e serviceDoneError) Error() string {
 	return fmt.Sprintf("service %s finished", e.name)
 }
 
+func newServiceErrorChannel() chan error {
+	return make(chan error, 1)
+}
+
+func reportServiceError(serviceError chan<- error, err error) {
+	select {
+	case serviceError <- err:
+	default:
+	}
+}
+
 // Run starts the orchestrator, blocking until shutdown.
 // Returns true on clean shutdown.
 func Run(opts Options) bool {
@@ -344,22 +358,37 @@ func acquireOrchestratorLock(path string) (*flock.Flock, error) {
 	}
 
 	// Record our PID so a future conflicting instance can report it. We hold the
-	// exclusive advisory lock, so no other process writes this file concurrently.
-	if err := writeLockHolderPID(path); err != nil {
-		_ = fileLock.Unlock()
-
-		return nil, fmt.Errorf("write lock holder pid: %w", err)
+	// exclusive advisory lock, but its pathname may have been replaced while
+	// TryLock was opening it. Bind the metadata writer to the held inode.
+	lockedInfo, err := fileLock.Stat()
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("stat held lock file: %w", err), fileLock.Unlock())
+	}
+	if err := writeLockHolderPID(path, lockedInfo); err != nil {
+		return nil, errors.Join(fmt.Errorf("write lock holder pid: %w", err), fileLock.Unlock())
 	}
 
 	return fileLock, nil
 }
 
-func writeLockHolderPID(path string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
+func writeLockHolderPID(path string, lockedInfo os.FileInfo) error {
+	// Do not truncate through the pathname before confirming this descriptor
+	// refers to the inode that we actually locked.
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat lock metadata file: %w", err)
+	}
+	if !os.SameFile(lockedInfo, info) {
+		return errors.New("lock file path changed during acquisition")
+	}
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("truncate lock file: %w", err)
+	}
 
 	if _, err := fmt.Fprintf(f, "%d\n", os.Getpid()); err != nil {
 		return fmt.Errorf("write pid: %w", err)
@@ -400,17 +429,8 @@ func run(config cfg.Config, opts Options) (success bool) {
 			log.Fatalf("Failed to acquire orchestrator lock %s: %v", config.OrchestratorLockPath, err)
 		}
 		defer func() {
-			fileErr := f.Close()
-			if fileErr != nil {
-				log.Printf("Failed to close lock file %s: %v", config.OrchestratorLockPath, fileErr)
-			}
-			// Remove the lock file on clean shutdown so a rollback to the older
-			// stat-based release can start: that guard exits whenever the lock
-			// file exists and cannot tell that this process is already gone.
-			// TODO: Remove this os.Remove once all hosts run a flock-based
-			// release and rollback to the stat-based guard is no longer possible.
-			if rmErr := os.Remove(config.OrchestratorLockPath); rmErr != nil && !os.IsNotExist(rmErr) {
-				log.Printf("Failed to remove lock file %s: %v", config.OrchestratorLockPath, rmErr)
+			if err := releaseOrchestratorLock(config.OrchestratorLockPath, f.Close); err != nil {
+				log.Printf("Failed to release lock file %s: %v", config.OrchestratorLockPath, err)
 			}
 		}()
 	}
@@ -435,7 +455,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 
 	serviceInfo := service.NewInfoContainer(nodeID, version, commitSHA, serviceInstanceID, machineInfo, config)
 
-	serviceError := make(chan error)
+	serviceError := newServiceErrorChannel()
 	defer close(serviceError)
 
 	var g errgroup.Group
@@ -450,14 +470,15 @@ func run(config cfg.Config, opts Options) (success bool) {
 	}(&g)
 
 	// Setup telemetry
-	tel, err := telemetry.New(
+	tel, err := telemetry.NewWithOptions(
 		ctx,
 		nodeID,
 		serviceName,
 		commitSHA,
 		version,
 		serviceInstanceID,
-		attribute.Key("host.labels").StringSlice(config.NodeLabels),
+		telemetry.WithResourceAttributes(attribute.Key("host.labels").StringSlice(config.NodeLabels)),
+		telemetry.WithDeltaTemporality(),
 	)
 	if err != nil {
 		logger.L().Fatal(ctx, "failed to init telemetry", zap.Error(err))
@@ -513,6 +534,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 		zap.String("version", version),
 		zap.String("commit", commitSHA),
 		zap.Strings("labels", config.NodeLabels),
+		zap.String("host_kernel", telemetry.HostKernelVersion()),
 		logger.WithServiceInstanceID(serviceInstanceID),
 	)
 
@@ -526,12 +548,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 				l.Error(ctx, "service returned an error", zap.Error(err))
 			}
 
-			select {
-			case serviceError <- err:
-			default:
-				// Don't block if the serviceError channel is already closed
-				// or if the error is already sent
-			}
+			reportServiceError(serviceError, err)
 
 			return serviceDoneError{name: name}
 		})
@@ -539,19 +556,43 @@ func run(config cfg.Config, opts Options) (success bool) {
 
 	var closers []closer
 
+	pprofServer := telemetry.NewPprofServer()
+	go func() {
+		logger.L().Info(ctx, "pprof server starting", zap.Int("port", telemetry.PprofPort()))
+
+		if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.L().Error(ctx, "pprof server encountered error", zap.Error(err))
+		}
+	}()
+	// Closers run in reverse order; retain diagnostics through service teardown.
+	closers = append(closers, closer{"pprof server", func(ctx context.Context) error {
+		return closePprofServer(ctx, pprofServer)
+	}})
+
 	// The sandbox map is shared between the server and the proxy
 	// to propagate information about sandbox routing.
 	sandboxes := sandbox.NewSandboxesMap()
 
 	// feature flags
-	featureFlags, err := featureflags.NewClient()
+	featureFlags, err := featureflags.NewClient(config.DeploymentEnvironment, serviceName, version)
 	if err != nil {
 		logger.L().Fatal(ctx, "failed to create feature flags client", zap.Error(err))
 	}
 	closers = append(closers, closer{"feature flags", featureFlags.Close})
 
-	featureFlags.SetDeploymentName(config.DomainName)
 	featureFlags.RegisterContextProvider(orchestratorContextProvider(nodeID, commitSHA))
+	featureFlags.RegisterContextProvider(instanceGroupContextProvider(config.InstanceGroupName))
+
+	// Not a service and no closer: pacing stays in force through the sandbox
+	// drain and ends with the process.
+	if usesSandboxRuntime {
+		gcController, err := gcpercent.New(tel.MeterProvider, featureFlags)
+		if err != nil {
+			logger.L().Error(ctx, "failed to create GC percent controller", zap.Error(err))
+		} else {
+			go gcController.Run(context.WithoutCancel(ctx))
+		}
+	}
 
 	// External sandbox logger routes through LaunchDarkly (LogsWriteConfigFlag),
 	// falling back to the fixed collector address. Created here so it can use the
@@ -670,6 +711,22 @@ func run(config cfg.Config, opts Options) (success bool) {
 		sbxEventsDeliveryTargets = append(sbxEventsDeliveryTargets, sbxEventsDeliveryRedis)
 	}
 
+	// Orchestrator-owned sandbox routing record (sandbox:routing:{id}).
+	if redisClient != nil {
+		routingPublisher, err := routing.New(
+			tel.MeterProvider,
+			sandboxcatalog.NewRedisSandboxCatalog(redisClient),
+			serviceInstanceID,
+			config.NodeIP,
+		)
+		if err != nil {
+			logger.L().Fatal(ctx, "failed to create sandbox routing publisher", zap.Error(err))
+		}
+		sandboxes.Subscribe(routingPublisher)
+	} else {
+		logger.L().Warn(ctx, "redis disabled; orchestrator sandbox routing records are not published")
+	}
+
 	// Wrapper closers run before per-driver closers (deliveries write through the drivers).
 	eventsService := events.NewEventsService(sbxEventsDeliveryTargets)
 	closers = append(closers, closer{"sandbox host stats deliveries (all)", hostStatsDelivery.Close})
@@ -748,6 +805,15 @@ func run(config cfg.Config, opts Options) (success bool) {
 			StorageConfig: config.StorageConfig,
 		})
 		reclaimClean = !summary.HasFailures()
+	}
+
+	if usesSandboxRuntime {
+		tracker, err := metrics.NewFirecrackerTracker(tel.MeterProvider, sandboxes)
+		if err != nil {
+			logger.L().Fatal(ctx, "failed to create Firecracker process tracker", zap.Error(err))
+		}
+		startService("Firecracker process tracker", func() error { return tracker.Start(ctx) })
+		closers = append(closers, closer{"Firecracker process tracker", tracker.Close})
 	}
 
 	// device pool
@@ -843,13 +909,16 @@ func run(config cfg.Config, opts Options) (success bool) {
 	if networkAssignHook == nil {
 		networkAssignHook = sandbox.NoopNetworkAssignHook{}
 	}
-	sandboxFactory := sandbox.NewFactory(config.BuilderConfig, networkPool, devicePool, featureFlags, hostStatsDelivery, cgroupManager, egressSetup.Proxy, networkAssignHook, sandboxes)
+	sandboxFactory := sandbox.NewFactory(ctx, config.BuilderConfig, networkPool, devicePool, featureFlags, hostStatsDelivery, cgroupManager, egressSetup.Proxy, networkAssignHook, sandboxes)
 
-	// isolated filesystems cache (for nfs proxy)
+	// confined volume filesystems (for the volume service and nfs proxy)
+	if err := chrooted.CheckSupport(); err != nil {
+		logger.L().Fatal(ctx, "volume confinement prerequisites not met", zap.Error(err))
+	}
 	builder := chrooted.NewBuilder(config)
 	volumeService := volumes.New(config, builder)
 
-	uploads := sandbox.NewUploads(templateCache, persistence, peerResolver, redisClient)
+	uploads := sandbox.NewUploads(templateCache, persistence, peerResolver, redisClient, featureFlags)
 	closers = append(closers, closer{"pending uploads", func(context.Context) error {
 		uploads.Stop()
 
@@ -866,6 +935,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 		Info:             serviceInfo,
 		Proxy:            sandboxProxy,
 		Persistence:      persistence,
+		TemplateStorage:  templateSpec,
 		FeatureFlags:     featureFlags,
 		SbxEventsService: eventsService,
 		PeerRegistry:     peerRegistry,
@@ -924,7 +994,10 @@ func run(config cfg.Config, opts Options) (success bool) {
 	})
 	closers = append(closers, closer{"hyperloop server", hyperloopSrv.Shutdown})
 
-	grpcServer := e2bgrpc.NewGRPCServer(tel, e2bgrpc.WithSandboxResumeMetrics())
+	// No connection age: ChunkService and VolumeService streams may outlive the
+	// shared default's age plus grace, and how their clients behave on the
+	// GOAWAY has not been measured.
+	grpcServer := e2bgrpc.NewGRPCServer(tel, e2bgrpc.WithSandboxMetricAttributes(), e2bgrpc.WithMaxConnectionAge(0, 0))
 	orchestrator.RegisterSandboxServiceServer(grpcServer, orchestratorService)
 	orchestrator.RegisterVolumeServiceServer(grpcServer, volumeService)
 	orchestrator.RegisterChunkServiceServer(grpcServer, orchestratorService)
@@ -943,6 +1016,7 @@ func run(config cfg.Config, opts Options) (success bool) {
 		tmpl, err = tmplserver.New(
 			ctx,
 			config,
+			serviceInfo,
 			featureFlags,
 			tel.MeterProvider,
 			globalLogger,
@@ -996,32 +1070,14 @@ func run(config cfg.Config, opts Options) (success bool) {
 		return nil
 	}})
 
-	pprofServer := telemetry.NewPprofServer()
-	// We handle the pprof in a separate goroutine to prevent any interaction with the main server.
-	go func() {
-		logger.L().Info(ctx, "pprof server starting", zap.Int("port", telemetry.PprofPort()))
-
-		if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.L().Error(ctx, "pprof server encountered error", zap.Error(err))
-		}
-	}()
-	closers = append(closers, closer{"pprof server", pprofServer.Shutdown})
-
 	// http server
 	healthcheck, err := e2bhealthcheck.NewHealthcheck(serviceInfo)
 	if err != nil {
 		logger.L().Fatal(ctx, "failed to create healthcheck", zap.Error(err))
 	}
 
-	httpMux := http.NewServeMux()
-	httpMux.Handle("/health", healthcheck.CreateHandler())
-
-	if localUploadHandler != nil {
-		httpMux.Handle("/upload", localUploadHandler)
-	}
-
 	httpServer := NewHTTPServer()
-	httpServer.Handler = httpMux
+	httpServer.Handler = newHTTPHandler(healthcheck.CreateHandler(), localUploadHandler)
 
 	startService("http server", func() error {
 		err := httpServer.Serve(httpListener)
@@ -1061,16 +1117,12 @@ func run(config cfg.Config, opts Options) (success bool) {
 		cancelCloseCtx()
 	}
 
-	// Mark service draining if not already.
-	// If service stats was previously changed via API, we don't want to override it.
 	logger.L().Info(ctx, "Starting drain phase", zap.Int("sandbox_count", sandboxes.Count()))
-	if status := serviceInfo.GetStatus().Status; status == orchestratorinfo.ServiceInfoStatus_Healthy || status == orchestratorinfo.ServiceInfoStatus_Standby {
-		serviceInfo.SetStatus(ctx, orchestratorinfo.ServiceInfoStatus_Draining)
+	serviceInfo.SetStatus(ctx, orchestratorinfo.ServiceInfoStatus_ShuttingDown)
 
-		// Wait for draining state to propagate to all consumers
-		if !env.IsLocal() {
-			time.Sleep(15 * time.Second)
-		}
+	// Consumers must stop assigning work before services drain.
+	if !env.IsLocal() {
+		time.Sleep(15 * time.Second)
 	}
 
 	// Wait for services to be drained before closing them
@@ -1151,6 +1203,8 @@ func startNFSProxy(
 		RecordHandleCalls: config.NFSProxyRecordHandleCalls,
 		RecordStatCalls:   config.NFSProxyRecordStatCalls,
 		NFSLogLevel:       config.NFSProxyLogLevel,
+		HandleCacheLimit:  config.NFSProxyHandleCacheLimit,
+		DirVerifierLimit:  config.NFSProxyDirVerifierLimit,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create nfs proxy: %w", err)

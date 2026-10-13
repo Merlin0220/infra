@@ -77,21 +77,50 @@ type SandboxNetworkEgressConfig struct {
 	Rules            map[string][]SandboxNetworkRule `json:"rules,omitempty"`
 
 	// SOCKS5 BYOP egress proxy configuration.
-	EgressProxyAddress  string `json:"egressProxyAddress,omitempty"`
-	EgressProxyUsername string `json:"egressProxyUsername,omitempty"`
-	EgressProxyPassword string `json:"egressProxyPassword,omitempty"`
+	EgressProxyAddress  string                       `json:"egressProxyAddress,omitempty"`
+	EgressProxyUsername string                       `json:"egressProxyUsername,omitempty"`
+	EgressProxyPassword string                       `json:"egressProxyPassword,omitempty"`
+	EgressProxyTLS      *SandboxEgressProxyTLSConfig `json:"egressProxyTls,omitempty"`
+}
+
+// SandboxEgressProxyTLSConfig configures TLS on the hop to the BYOP SOCKS5
+// proxy. CACert is a certificate, not a secret, so it is stored inline.
+type SandboxEgressProxyTLSConfig struct {
+	Enabled    bool   `json:"enabled"`
+	ServerName string `json:"serverName,omitempty"`
+	CACert     string `json:"caCert,omitempty"`
 }
 
 const AllowPublicAccessDefault = true
 
 type SandboxNetworkIngressConfig struct {
-	AllowPublicAccess *bool   `json:"allowPublicAccess,omitempty"`
-	MaskRequestHost   *string `json:"maskRequestHost,omitempty"`
+	AllowPublicAccess *bool    `json:"allowPublicAccess,omitempty"`
+	MaskRequestHost   *string  `json:"maskRequestHost,omitempty"`
+	HTTPSPorts        []uint32 `json:"httpsPorts,omitempty"`
 }
 
 type SandboxNetworkConfig struct {
 	Egress  *SandboxNetworkEgressConfig  `json:"egress,omitempty"`
 	Ingress *SandboxNetworkIngressConfig `json:"ingress,omitempty"`
+}
+
+// HasEgressProxy reports whether a customer-supplied SOCKS5 egress proxy is
+// configured. The address is the single source of truth: credentials are
+// optional and are never set without it.
+func (c *SandboxNetworkConfig) HasEgressProxy() bool {
+	return c != nil && c.Egress != nil && c.Egress.EgressProxyAddress != ""
+}
+
+// HasEgressProxyAuth reports whether the egress proxy is configured with
+// RFC 1929 credentials.
+func (c *SandboxNetworkConfig) HasEgressProxyAuth() bool {
+	return c.HasEgressProxy() && c.Egress.EgressProxyUsername != ""
+}
+
+// HasEgressProxyTLS reports whether the hop to the egress proxy is wrapped in
+// TLS.
+func (c *SandboxNetworkConfig) HasEgressProxyTLS() bool {
+	return c.HasEgressProxy() && c.Egress.EgressProxyTLS != nil && c.Egress.EgressProxyTLS.Enabled
 }
 
 type SandboxVolumeMountConfig struct {

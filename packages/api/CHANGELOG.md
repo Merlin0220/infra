@@ -1,19 +1,210 @@
 # Changelog
 
-## [0.2.0](https://github.com/e2b-dev/belt/compare/api-v0.1.0...api-v0.2.0) (2026-08-20)
+## 0.14.1 (2026-09-09)
+
+
+### Bug Fixes
+
+* **api:** rebuild template aliases on the current cluster (c74f369)
+
+## 0.14.0 (2026-09-09)
 
 
 ### Features
 
-* **api:** add sandbox list sorting and filters ([#1713](https://github.com/e2b-dev/belt/issues/1713)) ([f8a9bec](https://github.com/e2b-dev/belt/commit/f8a9bec1bae4ceac385a51de0c5dbc37c619f167))
-* **api:** expose secrets management ([#1755](https://github.com/e2b-dev/belt/issues/1755)) ([b4ce6c5](https://github.com/e2b-dev/belt/commit/b4ce6c5763995cbedff21170622fbb4dab08dc82))
-* **api:** semantic error codes and differentiated statuses for sandbox placement failures ([#1772](https://github.com/e2b-dev/belt/issues/1772)) ([0a4dfb1](https://github.com/e2b-dev/belt/commit/0a4dfb1b07e9bbb959024a95bbc7052784f9d60b))
-* **auth:** share the security-requirements error selection ([#1955](https://github.com/e2b-dev/belt/issues/1955)) ([2fe094c](https://github.com/e2b-dev/belt/commit/2fe094c69c54b4043348919867317dbac3e7bcca))
-* **checkpoint:** in-place checkpoint — snapshot a sandbox without stopping it ([#1852](https://github.com/e2b-dev/belt/issues/1852)) ([0001909](https://github.com/e2b-dev/belt/commit/0001909770c6a8f7ff25331ddbc0970e1f289967))
-* **db:** add PostgreSQL session primitives ([#1899](https://github.com/e2b-dev/belt/issues/1899)) ([22f0ccb](https://github.com/e2b-dev/belt/commit/22f0ccb618081ad4388cf510a9f3ec2f11c56a81))
-* filesystem-only resume of memory-inclusive snapshots ([#1958](https://github.com/e2b-dev/belt/issues/1958)) ([6061743](https://github.com/e2b-dev/belt/commit/60617431dda40837e8530508f2ed29ac077c2319))
-* **orchestrator-ee:** resolve customer secrets for egress headers ([#1434](https://github.com/e2b-dev/belt/issues/1434)) ([36c966f](https://github.com/e2b-dev/belt/commit/36c966f0cf32c2354267fb21fbd52fe5b8275c04))
-* **redis:** password auth and explicit TLS enablement ([#1587](https://github.com/e2b-dev/belt/issues/1587)) ([1c49ecf](https://github.com/e2b-dev/belt/commit/1c49ecfc08c1b65d280a440c42cddd45b113744d))
+* **api:** expose outstanding node work (045df33)
+
+
+### Code Refactoring
+
+* **api:** remove ignored free disk request field (53b8e04)
+
+## 0.13.0 (2026-09-09)
+
+
+### Features
+
+* **api:** add minimum free disk request name (b03cd83)
+
+## 0.12.0 (2026-09-07)
+
+
+### Features
+
+* **orchestrator:** add shutting-down status (c7bb7eb)
+* **templates:** configure free disk targets (b88aab9)
+
+
+### Bug Fixes
+
+* **deps:** update module google.golang.org/grpc to v1.83.1 [security] (27006d5)
+
+## 0.11.0 (2026-09-04)
+
+
+### Features
+
+* **api:** optional LOKI_URL and a LOGS_READ_CONFIG override for deployments without LaunchDarkly (6a6edf5)
+* **api:** restore a refused pause to running and bound auto-pause overstay (flag-gated) (cc07fd6)
+
+
+### Bug Fixes
+
+* **api:** stagger Redis lock-release retries (5f3e739)
+
+
+### Miscellaneous Chores
+
+* **api:** drop x-not-implemented from the filesystem-only resume field (103e11f)
+
+## 0.10.0 (2026-09-03)
+
+
+### Features
+
+* **api:** report egress proxy usage in product analytics (1049c80)
+
+
+### Bug Fixes
+
+* **api:** chunk Reconcile MGETs to 256 keys per command (bc61e07)
+* **api:** stop retrying pause on already-killing leftovers (df365d4)
+
+
+### Performance Improvements
+
+* **api:** bound sandbox-store MGETs to 256 keys per command (a49f2d1)
+
+## 0.9.0 (2026-09-02)
+
+
+### Features
+
+* **api:** add service JWT authentication (3374207)
+* **api:** make network rule domain limit configurable (291ae2c)
+* **orchestrator:** snapshot-admission pre-flight for pause and checkpoint (flag-gated) (b47217c)
+
+## 0.8.0 (2026-09-01)
+
+
+### Features
+
+* **api:** accept HTTPS backend ports on sandbox create (c395e9b)
+* **api:** filter sandbox placement by orchestrator release (7e433ac)
+
+## 0.7.0 (2026-08-28)
+
+
+### Features
+
+* **servicediscovery:** union orchestrator discovery across both schedulers (df09b1d)
+
+## 0.6.2 (2026-08-27)
+
+
+### Bug Fixes
+
+* **api:** drop the evictor's fs-only version degrade (d765459)
+
+
+### Miscellaneous Chores
+
+* **api:** fix comment & linter (d0903da)
+
+## 0.6.1 (2026-08-27)
+
+
+### Bug Fixes
+
+* **api:** don't check for fs-only pause support (15f5a24)
+
+## 0.6.0 (2026-08-27)
+
+
+### Features
+
+* **network:** accept wildcard transform domains (838ed57)
+
+
+### Bug Fixes
+
+* **api:** include template and build IDs in create errors (929b6b7)
+
+## 0.5.1 (2026-08-27)
+
+
+### Code Refactoring
+
+* **api:** retire the api's second discovery mechanism (1360629)
+* name node identity for what it identifies (62af6f7)
+* **servicediscovery:** one package per backend (ae36dd9)
+
+## 0.5.0 (2026-08-26)
+
+
+### Features
+
+* **api:** admin rig passthrough for remote clusters (6586f22)
+* **snapshots:** gate in-place checkpoint and fs-only snapshots on FC release &gt;= 0.2.0 (c7b5dff)
+
+
+### Bug Fixes
+
+* **api:** deregister node when its grpc connection is shut down (44d9dad)
+* **api:** fail the snapshot build when a pause is rejected (036a174)
+* **api:** finish snapshot builds on client disconnect (bd31fc4)
+
+
+### Code Refactoring
+
+* **api:** reuse the filesystem-only snapshot predicate (7829b43)
+* rename the discovery package for what it discovers (2c8ad0d)
+
+## 0.4.0 (2026-08-25)
+
+
+### Features
+
+* **api:** confine filesystem-only resume to one CPU model (e6a0985)
+
+
+### Bug Fixes
+
+* **api:** record terminal template build status on a live context (fe829d4)
+
+
+### Dependencies
+
+* bump go-redis to v9.21.0 across the OSS modules (1aa38f8)
+
+
+### Code Refactoring
+
+* **api:** extract service-discovery construction from the store (2924266)
+* **shared:** unify service discovery into one nodediscovery package (f214e11)
+
+## 0.3.0 (2026-08-24)
+
+
+### Features
+
+* **api:** remove deprecated E2B access token auth (a301352)
+* **shared:** use TypeID encoding for object IDs (4a5075b)
+
+## 0.2.0 (2026-08-20)
+
+
+### Features
+
+* **api:** add sandbox list sorting and filters (f8a9bec)
+* **api:** expose secrets management (b4ce6c5)
+* **api:** semantic error codes and differentiated statuses for sandbox placement failures (0a4dfb1)
+* **auth:** share the security-requirements error selection (2fe094c)
+* **checkpoint:** in-place checkpoint — snapshot a sandbox without stopping it (0001909)
+* **db:** add PostgreSQL session primitives (22f0ccb)
+* filesystem-only resume of memory-inclusive snapshots (6061743)
+* **orchestrator-ee:** resolve customer secrets for egress headers (36c966f)
+* **redis:** password auth and explicit TLS enablement (1c49ecf)
 
 ## [0.1.0](https://github.com/e2b-dev/infra/compare/api-v0.0.1...api-v0.1.0) (2026-08-17)
 

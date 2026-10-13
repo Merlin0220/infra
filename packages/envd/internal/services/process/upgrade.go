@@ -11,6 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/e2b-dev/infra/packages/envd/internal/execcontext"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/cgroups"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/process/handler"
 	rpc "github.com/e2b-dev/infra/packages/envd/internal/services/spec/process"
@@ -26,12 +27,71 @@ import (
 // tests can point it at a temp file.
 var HandoverPath = "/run/e2b/envd-handover.pb"
 
-// handoverSchema is the version of the HandoverState layout this envd writes and
-// the maximum it will read. A reader refuses a blob whose schema exceeds this
-// (design §6.4: decode every schema <= N, abort on schema > N) rather than
-// mis-read a newer-than-known layout — the outgoing envd then keeps running the
-// old binary and the resume proceeds unupgraded.
-const handoverSchema = 1
+// handoverSchema is the maximum HandoverState schema this envd will read: a reader refuses a
+// blob whose schema exceeds it (design §6.4 — decode every schema <= N, abort on schema > N)
+// rather than mis-read a newer-than-known layout.
+//
+// Refusing is a hard failure, not a graceful decline. The read happens after the execve, in the
+// new image, so there is no old binary left to fall back to: the handover is abandoned, the
+// workload is not re-adopted, and SetHandoverResult(failed) tells the orchestrator to tear the
+// sandbox down. That cost is why the version a writer STAMPS is chosen per blob
+// (schemaFor) rather than pinned to this maximum.
+//
+// It also constrains how a change to this file is rolled back. Version resolution is
+// monotonic — the upgrade target must be strictly newer than the running envd — so a reader
+// can never be an older VERSION than the writer, but it can know less: a binary whose version
+// sorts above the fleet's while its source predates a field refuses every blob that carries
+// that field, and each refusal fails a live resume. Reverting a field here is therefore not a
+// rollback while the live-upgrade flag names a target; turning that flag off is, and it takes
+// effect immediately, because this blob is tmpfs and is written and read seconds apart inside
+// one upgrade. Same trap for an experiment pointed at a branch build: do not aim one that
+// lacks a field at a fleet whose envd has it.
+const handoverSchema = handoverSchemaDefaults
+
+// The schema versions themselves. A writer stamps the LOWEST version that can express the blob
+// it actually produced, so a field's mere existence in the layout costs nothing at runtime.
+const (
+	// handoverSchemaBase is every field through forwarded ports.
+	handoverSchemaBase = 1
+	// handoverSchemaGuestFrozen adds guest_frozen_cgroups.
+	handoverSchemaGuestFrozen = 2
+	// handoverSchemaDefaults adds defaults (the exec context's user/workdir).
+	handoverSchemaDefaults = 3
+)
+
+// schemaFor is the lowest schema that can carry st without loss.
+//
+// guest_frozen_cgroups is absent-safe on the wire, but a reader that predates it would drop the
+// record and then thaw cgroups the guest froze itself -- so a blob that carries the list must be
+// refused by such a reader, and stamping 2 is what refuses it. A blob with an EMPTY list is a
+// different case: there is nothing for an older reader to lose, and stamping 2 anyway would fail
+// the upgrade for a peer that could have handled the blob perfectly. Empty is the common case,
+// since most guests freeze nothing of their own, so pinning the stamp at the maximum would trade
+// away nearly every downgrade for a guarantee only the non-empty blob needs.
+func schemaFor(st *upgrade.HandoverState) uint32 {
+	// A carried default that differs from the compiled-in fallback is behaviour an
+	// older reader would drop, and dropping it means the new image serves requests as
+	// somebody else. Stamp so such a reader refuses instead. When the default already
+	// IS the fallback there is nothing to lose, so do not spend a refusal on it --
+	// same reasoning as guest_frozen_cgroups below.
+	//
+	// Unlike the empty-cgroup list, though, the cheap case is NOT the common one here:
+	// most templates record a default user, so most blobs really do stamp 3. What that
+	// costs is not downgrades but ROLLBACK -- while the live-upgrade flag names a
+	// target, reverting this field does not roll the change back, because a reader that
+	// knows less refuses every blob carrying it and each refusal fails a live resume.
+	// Turning the flag off is the rollback. See handoverSchema above for the full
+	// argument.
+	if d := st.GetDefaults(); d != nil &&
+		((d.GetUser() != "" && d.GetUser() != execcontext.BuiltinDefaultUser) || d.GetHasWorkdir()) {
+		return handoverSchemaDefaults
+	}
+	if len(st.GetGuestFrozenCgroups()) > 0 {
+		return handoverSchemaGuestFrozen
+	}
+
+	return handoverSchemaBase
+}
 
 // fdBase is where carried fds are dup3'd to; high enough that the fresh runtime
 // in the new image won't have grabbed these numbers during early startup.
@@ -69,7 +129,7 @@ func dupKeep(oldfd, target int) (int, error) {
 // responsibility — see main's /upgrade handler). It serializes the process
 // table, carries the I/O fds across execve, and re-execs newBin with the same
 // PID. It does not return on success.
-func (s *Service) Upgrade(newBin, fromVer string, watchers []*upgrade.HandoverWatcher, mounts []*upgrade.MountEntry, forwards []*upgrade.ForwardedPort) error {
+func (s *Service) Upgrade(newBin, fromVer string, watchers []*upgrade.HandoverWatcher, mounts []*upgrade.MountEntry, forwards []*upgrade.ForwardedPort, helpers []int32) error {
 	// Only re-exec self (empty) or the fixed delivered-binary path — never an
 	// arbitrary caller-supplied path. Checked first, before any side effects.
 	if newBin != "" && newBin != DefaultUpgradeBinPath {
@@ -77,12 +137,21 @@ func (s *Service) Upgrade(newBin, fromVer string, watchers []*upgrade.HandoverWa
 	}
 
 	st := &upgrade.HandoverState{
-		Schema:   handoverSchema,
-		FromVer:  fromVer,
-		Watchers: watchers,
-		Mounts:   mounts,
-		Forwards: forwards,
+		FromVer:    fromVer,
+		Watchers:   watchers,
+		Mounts:     mounts,
+		Forwards:   forwards,
+		HelperPids: helpers,
+		// Which cgroups the GUEST had frozen before the pre-pause sweep. Read from the
+		// freezer here rather than plumbed in by the caller: it is the freezer's own
+		// state, and the new image needs it before its /init thaws anything.
+		GuestFrozenCgroups: s.workloadFreezer.GuestFrozenPaths(),
+		// The exec context this envd was serving with. The new image rebuilds its
+		// defaults from scratch after the execve, so without this it depends entirely on
+		// the orchestrator's post-upgrade /init to re-send them.
+		Defaults: handoverDefaults(s.defaults),
 	}
+	st.Schema = schemaFor(st)
 
 	// Serialize the process table and relocate each carried fd to its fixed
 	// target, holding syscall.ForkLock so no concurrent Go fd allocation can
@@ -250,13 +319,14 @@ type HandoverResult struct {
 	// returned rather than applied via a callback.
 	Mounts   []*upgrade.MountEntry
 	Forwards []*upgrade.ForwardedPort
+	Helpers  []int32
 }
 
 func (s *Service) ResumeFromHandover(reArmWatchers func([]*upgrade.HandoverWatcher) (rearmed, failed int)) (HandoverResult, error) {
 	// Thaw the workload on every FAILURE path — a bad blob, partial re-adopt, or
 	// panic must never leave the sandbox frozen (a degraded-but-running workload
 	// beats a hung one). On SUCCESS the workload is deliberately left frozen: the
-	// orchestrator's post-upgrade /init thaws it (deferred unfreeze in PostInit)
+	// orchestrator's post-upgrade /init thaws it (the thaw in PostInit)
 	// only after it has re-established the access token. This closes the window
 	// in which a re-adopted — and possibly hostile — guest process could run
 	// before /init restores auth and reach the unauthenticated /upgrade endpoint
@@ -281,13 +351,26 @@ func (s *Service) ResumeFromHandover(reArmWatchers func([]*upgrade.HandoverWatch
 		return HandoverResult{}, fmt.Errorf("unmarshal handover: %w", err)
 	}
 
-	// Schema gate (design §6.4): refuse a blob written by a newer envd whose
-	// layout this binary does not understand, rather than mis-read it. The
-	// outgoing envd is already gone (this runs post-execve), so we can't fall
-	// back to it — but the orchestrator's post-upgrade /init readiness wait will
-	// fail and the resume is reported unupgraded rather than corrupt.
+	// Schema gate (design §6.4): refuse a blob written by a newer envd whose layout this binary
+	// does not understand, rather than mis-read it. This runs post-execve, so the outgoing envd
+	// is gone and there is nothing to fall back to -- the caller reports the handover failed and
+	// the orchestrator tears the sandbox down, which is the intended outcome. A refusal is worse
+	// than a successful handover and better than a silently mis-decoded one.
 	if st.GetSchema() > handoverSchema {
 		return HandoverResult{}, fmt.Errorf("handover schema %d exceeds max supported %d", st.GetSchema(), handoverSchema)
+	}
+
+	// Restore the exec context BEFORE any re-adopted process can be interacted with,
+	// so a request that arrives between here and the post-upgrade /init resolves
+	// against the identity the outgoing envd was serving with rather than the
+	// compiled-in fallback. Absent from a blob written by an envd predating the field,
+	// in which case the fallback stands and /init remains the only source.
+	if userRestored, workdirRestored := ApplyHandoverDefaults(st, s.defaults); userRestored || workdirRestored {
+		// Name the fields actually applied. The blob carries them independently, so a
+		// message that always says "default user" would report the compiled-in fallback
+		// as a restored identity on a workdir-only blob.
+		fmt.Fprintf(os.Stderr, "envd: restored exec context from the handover blob (user=%t workdir=%t)\n",
+			userRestored, workdirRestored)
 	}
 
 	// journald-visible proof of the running image after the swap (from_ver is
@@ -412,6 +495,28 @@ func (s *Service) ResumeFromHandover(reArmWatchers func([]*upgrade.HandoverWatch
 
 	// Handover succeeded: keep the workload frozen (see the deferred thaw above);
 	// the orchestrator's post-upgrade /init thaws it once auth is restored.
+	// Restore before returning: the incoming envd's /init thaws the workload, and
+	// without this the thaw would clear cgroups the guest itself had frozen. An absent
+	// or empty list leaves the record empty, which thaws everything -- the safe
+	// direction, and what an older outgoing envd produces.
+	s.workloadFreezer.SetGuestFrozenPaths(st.GetGuestFrozenCgroups())
+
+	// The workload stays frozen past this point, so tell the freezer it owns a live freeze
+	// again: neither the freeze-active state, nor the watchdog timer, nor the spawn barrier
+	// crossed the execve, and without them a freeze before the post-upgrade /init would adopt
+	// our own frozen cgroups as the guest's, an /init that never arrives would leave the guest
+	// frozen with no backstop, and a process start would be refused only by the pre-spawn
+	// probe, which a failed read or a race with the clone can get past.
+	//
+	// Logged rather than returned: only the barrier can fail here, after the watchdog is
+	// armed, and only by failing to drain spawns that a just-execve'd image cannot have.
+	// Failing the handover over it would trip the deferred thaw and release a re-adopted
+	// workload before /init restores auth, which is a worse outcome than a window guarded
+	// only by the probe before a thaw that is already due.
+	if err := s.workloadFreezer.ResumeFrozen(context.Background()); err != nil {
+		s.logger.Error().Err(err).Msg("inherited a frozen workload without the spawn barrier: only the pre-spawn probe guards process starts until /init")
+	}
+
 	keepFrozen = true
 
 	return HandoverResult{
@@ -425,6 +530,7 @@ func (s *Service) ResumeFromHandover(reArmWatchers func([]*upgrade.HandoverWatch
 		// are constructed after this returns.
 		Mounts:   st.GetMounts(),
 		Forwards: st.GetForwards(),
+		Helpers:  st.GetHelperPids(),
 	}, nil
 }
 
@@ -477,7 +583,7 @@ var ErrWorkloadNotFrozen = errors.New("workload was not frozen before the handov
 // the freeze exists to prevent, and unlike a pause the handover has a safe
 // alternative -- abort and thaw, leaving a working envd in place.
 func (s *Service) FreezeWorkloadHold() (release func(), err error) {
-	release, res, err := s.workloadFreezer.FreezeHold(context.Background(), s.handoverMaxWait)
+	release, res, err := s.workloadFreezer.FreezeHold(context.Background(), cgroups.FreezeOptions{MaxWait: s.handoverMaxWait})
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("handover: freeze failed")
 
@@ -504,4 +610,63 @@ func (s *Service) UnfreezeWorkload() {
 	if err := s.workloadFreezer.Unfreeze(context.Background()); err != nil {
 		s.logger.Warn().Err(err).Msg("handover: unfreeze failed")
 	}
+}
+
+// handoverDefaults converts the live exec context into its wire form. Env vars are
+// deliberately omitted: /init replaces them wholesale, so carrying them would add a
+// second source of truth for state that is already restored reliably.
+func handoverDefaults(d *execcontext.Defaults) *upgrade.HandoverDefaults {
+	if d == nil {
+		return nil
+	}
+	hd := &upgrade.HandoverDefaults{}
+	// Only a DELIVERED user is worth carrying. Carrying the compiled-in fallback would
+	// make the incoming image report that it was told, when it was not — and the incoming
+	// binary has that same fallback already.
+	if d.UserDelivered {
+		hd.User = d.User
+	}
+	// Per field, not per blob. An /init can carry a workdir with an empty user — a USER step
+	// whose argument expands to nothing is stored unvalidated — and the two are delivered
+	// independently, so dropping the workdir along with the user would lose it permanently:
+	// no later memory resume re-sends a workdir, and the next blob would faithfully carry
+	// the absence forward. has_workdir and SetData already treat them separately.
+	if d.Workdir != nil {
+		hd.Workdir = *d.Workdir
+		hd.HasWorkdir = true
+	}
+	if hd.GetUser() == "" && !hd.GetHasWorkdir() {
+		return nil
+	}
+
+	return hd
+}
+
+// ApplyHandoverDefaults restores the carried exec context onto the incoming envd's
+// defaults, and reports which fields it applied.
+//
+// Only ever widens: a blob with no record (an outgoing envd predating the field)
+// leaves the compiled-in fallback in place, which is the behaviour that existed
+// before this field. A later /init carrying a non-empty user still overrides it --
+// the host owns this state and the blob is a backstop, not an authority.
+//
+// Per field, matching the writer: a blob can carry a workdir and no user, and applying
+// neither because one is absent is how a delivered workdir gets lost for good.
+func ApplyHandoverDefaults(st *upgrade.HandoverState, d *execcontext.Defaults) (user, workdir bool) {
+	hd := st.GetDefaults()
+	if hd == nil || d == nil {
+		return false, false
+	}
+	if u := hd.GetUser(); u != "" {
+		d.User = u
+		d.UserDelivered = true
+		user = true
+	}
+	if hd.GetHasWorkdir() {
+		w := hd.GetWorkdir()
+		d.Workdir = &w
+		workdir = true
+	}
+
+	return user, workdir
 }

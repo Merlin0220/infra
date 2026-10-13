@@ -29,6 +29,60 @@ func (e EntryInfoType) Valid() bool {
 	}
 }
 
+// Defines values for FreezeResultMode.
+const (
+	FreezeResultModeHierarchy FreezeResultMode = "hierarchy"
+	FreezeResultModeLegacy    FreezeResultMode = "legacy"
+)
+
+// Valid indicates whether the value is a known member of the FreezeResultMode enum.
+func (e FreezeResultMode) Valid() bool {
+	switch e {
+	case FreezeResultModeHierarchy:
+		return true
+	case FreezeResultModeLegacy:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for PostFreezeParamsMode.
+const (
+	PostFreezeParamsModeHierarchy PostFreezeParamsMode = "hierarchy"
+	PostFreezeParamsModeLegacy    PostFreezeParamsMode = "legacy"
+)
+
+// Valid indicates whether the value is a known member of the PostFreezeParamsMode enum.
+func (e PostFreezeParamsMode) Valid() bool {
+	switch e {
+	case PostFreezeParamsModeHierarchy:
+		return true
+	case PostFreezeParamsModeLegacy:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for PostInitJSONBodyThaw.
+const (
+	Inline PostInitJSONBodyThaw = "inline"
+	Skip   PostInitJSONBodyThaw = "skip"
+)
+
+// Valid indicates whether the value is a known member of the PostInitJSONBodyThaw enum.
+func (e PostInitJSONBodyThaw) Valid() bool {
+	switch e {
+	case Inline:
+		return true
+	case Skip:
+		return true
+	default:
+		return false
+	}
+}
+
 // CollapseResult Per-call statistics from a heap collapse
 type CollapseResult struct {
 	// AlreadyHuge Chunks MADV_COLLAPSE accepted but were already hugepages (no work)
@@ -94,14 +148,23 @@ type Error struct {
 
 // FreezeResult Per-call statistics from a pre-pause workload freeze
 type FreezeResult struct {
-	// Failed Cgroups whose freeze write or state read errored (expected for a threaded cgroup, and for one removed mid-sweep)
+	// Allowlisted Cgroups skipped because the resume path depends on them (systemd, journald, envd's port forwarding). Reported because the allowlist is expected to grow, and a distro that routes journald differently changes this count
+	Allowlisted *int `json:"allowlisted,omitempty"`
+
+	// Failed Cgroups that errored for a reason that is not simply being gone - the write was refused, or the state could not be read. A cgroup the hierarchy walk discovered that merely went away is counted vanished instead; one of envd's own static cgroups that goes away is counted here, by design
 	Failed *int `json:"failed,omitempty"`
 
 	// Frozen Cgroups that read back "frozen 1" from cgroup.events within the budget; their tasks have stopped
 	Frozen *int `json:"frozen,omitempty"`
 
+	// Mode Which sweep actually ran. Echoed back rather than inferred from the flag, so a caller can tell that envd honoured what it asked for
+	Mode *FreezeResultMode `json:"mode,omitempty"`
+
 	// NotFrozen Cgroups still reading "frozen 0" when the budget expired; their tasks may still be running, so a snapshot taken now can capture a live workload
 	NotFrozen *int `json:"notFrozen,omitempty"`
+
+	// PreFrozen Cgroups the guest itself had already frozen before the sweep ran (docker pause writes cgroup.freeze). Not written to and deliberately left frozen by the resume thaw, so the guest's own suspension survives the snapshot
+	PreFrozen *int `json:"preFrozen,omitempty"`
 
 	// Requested Cgroups this call wrote cgroup.freeze to
 	Requested *int `json:"requested,omitempty"`
@@ -109,20 +172,44 @@ type FreezeResult struct {
 	// SweepMs Time spent issuing the freeze writes, in milliseconds (scales with cgroup count)
 	SweepMs *int64 `json:"sweepMs,omitempty"`
 
+	// Truncated True when the walk stopped because it hit the bound rather than because it ran out of tree, so coverage is incomplete
+	Truncated *bool `json:"truncated,omitempty"`
+
 	// Unobservable Cgroups whose freeze state cannot be read because this guest has no cgroup manager; the write was accepted but nothing can be read back, so these are neither frozen nor notFrozen
 	Unobservable *int `json:"unobservable,omitempty"`
+
+	// Vanished Cgroups the hierarchy walk enumerated that the guest then removed before the sweep finished with them - envd's own static cgroups are excluded and report failed instead. A race rather than a failure, and a claim about the cgroup only - tasks migrated out of it before its removal can still be running. Like failed it spans both phases, so it does not reconcile against requested on its own - one removed during the settle poll was counted in requested, one removed before its write never was
+	Vanished *int `json:"vanished,omitempty"`
+
+	// Visited Cgroups the walk examined, whether or not it froze them. The input for sizing the bound; meaningless in legacy mode
+	Visited *int `json:"visited,omitempty"`
 
 	// WaitMs Time spent polling cgroup.events, in milliseconds (scales with how deep in I/O the guest tasks were). Outcome neutral - the wait ends either because everything stopped or because the budget ran out
 	WaitMs *int64 `json:"waitMs,omitempty"`
 }
 
+// FreezeResultMode Which sweep actually ran. Echoed back rather than inferred from the flag, so a caller can tell that envd honoured what it asked for
+type FreezeResultMode string
+
 // Metrics Resource usage metrics
 type Metrics struct {
-	// CpuCount Number of CPU cores
+	// CpuCount Number of CPU cores online
 	CpuCount *int `json:"cpu_count,omitempty"`
+
+	// CpuPossible Number of CPUs the guest can bring online
+	CpuPossible *int `json:"cpu_possible,omitempty"`
+
+	// CpuTarget Online count last requested, 0 when none was
+	CpuTarget *int `json:"cpu_target,omitempty"`
+
+	// CpuTargetAttempts Attempts at reaching cpu_target since it was set
+	CpuTargetAttempts *int `json:"cpu_target_attempts,omitempty"`
 
 	// CpuUsedPct CPU usage percentage
 	CpuUsedPct *float32 `json:"cpu_used_pct,omitempty"`
+
+	// CpuWritePendingMs How long a CPU online or offline write has been running in the guest kernel, 0 when none is. A value that keeps growing means CPU hotplug is stuck.
+	CpuWritePendingMs *int64 `json:"cpu_write_pending_ms,omitempty"`
 
 	// DiskTotal Total disk space in bytes
 	DiskTotal *int `json:"disk_total,omitempty"`
@@ -136,17 +223,23 @@ type Metrics struct {
 	// MemTotal Total virtual memory in bytes
 	MemTotal *int `json:"mem_total,omitempty"`
 
-	// MemTotalMib Total virtual memory in MiB
-	MemTotalMib *int `json:"mem_total_mib,omitempty"`
-
 	// MemUsed Used virtual memory in bytes
 	MemUsed *int `json:"mem_used,omitempty"`
 
-	// MemUsedMib Used virtual memory in MiB
-	MemUsedMib *int `json:"mem_used_mib,omitempty"`
+	// OomKills The latest 32 out-of-memory kills since the guest booted, oldest first. Reading does not consume them. Empty when there are none. Omitted when not known (while envd is still reading the kernel log, when it can't be read or envd stopped reading it, and outside Firecracker).
+	OomKills *[]OOMKill `json:"oom_kills,omitempty"`
 
 	// Ts Unix timestamp in UTC for current sandbox time
 	Ts *int64 `json:"ts,omitempty"`
+}
+
+// OOMKill A process the guest kernel killed for running out of memory
+type OOMKill struct {
+	// Process Name of the killed process, or Unknown if the record doesn't show it
+	Process string `json:"process"`
+
+	// Seq Kernel log sequence number of the kill record. It only grows, across pauses and envd restarts.
+	Seq int64 `json:"seq"`
 }
 
 // VolumeMount Volume mount configuration
@@ -228,6 +321,25 @@ type PostFilesParams struct {
 
 // PostFreezeParams defines parameters for PostFreeze.
 type PostFreezeParams struct {
+	// Mode Which cgroups to freeze. "hierarchy" freezes the complement of envd's own
+	// ancestor chain, so cgroups the customer created anywhere in the tree are
+	// covered; "legacy" freezes only the user and pty cgroups envd itself creates.
+	// Omitted means legacy, which is what an orchestrator predating this parameter
+	// gets.
+	//
+	// The mode is chosen by the caller because the feature flag that selects it is
+	// evaluated there — envd has no access to it. FreezeResult echoes the mode back
+	// so the caller can confirm envd honoured the request rather than inferring it
+	// from the flag's value: an envd too old to know about modes reports legacy
+	// while the flag reads on.
+	Mode *PostFreezeParamsMode `form:"mode,omitempty" json:"mode,omitempty"`
+
+	// MaxCgroups Bounds how many cgroups a hierarchy sweep may visit. A safety guard against a
+	// pathological or hostile hierarchy rather than a performance knob — the guest is
+	// the threat model. Omitted or non-positive means envd's own default. Ignored in
+	// legacy mode.
+	MaxCgroups *int `form:"maxCgroups,omitempty" json:"maxCgroups,omitempty"`
+
 	// MaxWaitMs How long to wait for the cgroups to read back frozen, in milliseconds. The
 	// caller owns this budget because it also owns the request timeout, and a wait
 	// longer than that timeout cannot be observed.
@@ -238,6 +350,9 @@ type PostFreezeParams struct {
 	MaxWaitMs *int64 `form:"maxWaitMs,omitempty" json:"maxWaitMs,omitempty"`
 }
 
+// PostFreezeParamsMode defines parameters for PostFreeze.
+type PostFreezeParamsMode string
+
 // PostInitJSONBody defines parameters for PostInit.
 type PostInitJSONBody struct {
 	// AccessToken Access token for secure access to envd service
@@ -245,6 +360,9 @@ type PostInitJSONBody struct {
 
 	// CaBundle PEM-encoded CA certificates to install into the system trust store (may contain multiple concatenated PEM blocks)
 	CaBundle *string `json:"caBundle,omitempty"`
+
+	// CpuCount Number of guest CPUs that should be online. envd attempts to bring the set of requested CPUs online asynchronously; the outcome is reported on the X-Envd-Cpus header and on /metrics.
+	CpuCount *int `json:"cpuCount,omitempty"`
 
 	// DefaultUser The default user to use for operations
 	DefaultUser *string `json:"defaultUser,omitempty"`
@@ -261,10 +379,16 @@ type PostInitJSONBody struct {
 	// LifecycleID Lifecycle ID of the sandbox
 	LifecycleID *string `json:"lifecycleID,omitempty"`
 
-	// Timestamp The current timestamp in RFC3339 format
+	// Thaw Whether this call thaws the workload cgroups a pre-pause freeze left frozen. Absent or "inline": it thaws them before it answers, as every envd before this field did, unless a freeze came after the call entered, which the call then leaves in place. "skip": it thaws nothing and answers X-Envd-Thaw: skip, leaving the workload frozen; only for a resume whose VM is discarded after the call, such as one that records which pages the resume touches. A value this envd does not know reads as inline, the side on which a guest is never left frozen.
+	Thaw *PostInitJSONBodyThaw `json:"thaw,omitempty"`
+
+	// Timestamp The current timestamp in RFC3339 format. envd adds its own time from reading the request body to its clock gates, reported on X-Envd-Init-Clock-Correction, and applies its clock rules to the result.
 	Timestamp    *time.Time     `json:"timestamp,omitempty"`
 	VolumeMounts *[]VolumeMount `json:"volumeMounts,omitempty"`
 }
+
+// PostInitJSONBodyThaw defines parameters for PostInit.
+type PostInitJSONBodyThaw string
 
 // PostFilesMultipartRequestBody defines body for PostFiles for multipart/form-data ContentType.
 type PostFilesMultipartRequestBody PostFilesMultipartBody
@@ -310,7 +434,7 @@ type ServerInterface interface {
 	// GetMetrics Service stats
 	// (GET /metrics)
 	GetMetrics(w http.ResponseWriter, r *http.Request)
-	// PostUnfreeze Unfreeze user/pty cgroups. Intended ONLY for the orchestrator's pause-failure rollback path; the normal resume thaw happens via /init's deferred unfreeze, not here.
+	// PostUnfreeze Unfreeze user/pty cgroups. Intended for the orchestrator's pause-failure rollback path and the thaw after an in-place checkpoint; the normal resume thaw happens inside /init, not here.
 	// (POST /unfreeze)
 	PostUnfreeze(w http.ResponseWriter, r *http.Request)
 }
@@ -385,7 +509,7 @@ func (_ Unimplemented) GetMetrics(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
-// PostUnfreeze Unfreeze user/pty cgroups. Intended ONLY for the orchestrator's pause-failure rollback path; the normal resume thaw happens via /init's deferred unfreeze, not here.
+// PostUnfreeze Unfreeze user/pty cgroups. Intended for the orchestrator's pause-failure rollback path and the thaw after an in-place checkpoint; the normal resume thaw happens inside /init, not here.
 // (POST /unfreeze)
 func (_ Unimplemented) PostUnfreeze(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
@@ -594,6 +718,32 @@ func (siw *ServerInterfaceWrapper) PostFreeze(w http.ResponseWriter, r *http.Req
 
 	// Parameter object where we will unmarshal all parameters from the context
 	var params PostFreezeParams
+
+	// ------------- Optional query parameter "mode" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "mode", r.URL.Query(), &params.Mode, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "mode"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "mode", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "maxCgroups" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "maxCgroups", r.URL.Query(), &params.MaxCgroups, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "maxCgroups"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "maxCgroups", Err: err})
+		}
+		return
+	}
 
 	// ------------- Optional query parameter "maxWaitMs" -------------
 

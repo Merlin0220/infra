@@ -34,6 +34,27 @@ func (e AWSRegistryType) Valid() bool {
 	}
 }
 
+// Defines values for AdminSandboxState.
+const (
+	AdminSandboxStateKilled  AdminSandboxState = "killed"
+	AdminSandboxStatePaused  AdminSandboxState = "paused"
+	AdminSandboxStateRunning AdminSandboxState = "running"
+)
+
+// Valid indicates whether the value is a known member of the AdminSandboxState enum.
+func (e AdminSandboxState) Valid() bool {
+	switch e {
+	case AdminSandboxStateKilled:
+		return true
+	case AdminSandboxStatePaused:
+		return true
+	case AdminSandboxStateRunning:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for GCPRegistryType.
 const (
 	Gcp GCPRegistryType = "gcp"
@@ -126,11 +147,12 @@ func (e LogsSource) Valid() bool {
 
 // Defines values for NodeStatus.
 const (
-	NodeStatusConnecting NodeStatus = "connecting"
-	NodeStatusDraining   NodeStatus = "draining"
-	NodeStatusReady      NodeStatus = "ready"
-	NodeStatusStandby    NodeStatus = "standby"
-	NodeStatusUnhealthy  NodeStatus = "unhealthy"
+	NodeStatusConnecting   NodeStatus = "connecting"
+	NodeStatusDraining     NodeStatus = "draining"
+	NodeStatusReady        NodeStatus = "ready"
+	NodeStatusShuttingDown NodeStatus = "shutting_down"
+	NodeStatusStandby      NodeStatus = "standby"
+	NodeStatusUnhealthy    NodeStatus = "unhealthy"
 )
 
 // Valid indicates whether the value is a known member of the NodeStatus enum.
@@ -141,6 +163,8 @@ func (e NodeStatus) Valid() bool {
 	case NodeStatusDraining:
 		return true
 	case NodeStatusReady:
+		return true
+	case NodeStatusShuttingDown:
 		return true
 	case NodeStatusStandby:
 		return true
@@ -229,6 +253,75 @@ func (e TemplateBuildStatus) Valid() bool {
 	}
 }
 
+// Defines values for WebhookDeliveryErrorClass.
+const (
+	Canceled       WebhookDeliveryErrorClass = "canceled"
+	DnsError       WebhookDeliveryErrorClass = "dns_error"
+	HttpError      WebhookDeliveryErrorClass = "http_error"
+	RequestError   WebhookDeliveryErrorClass = "request_error"
+	SignatureError WebhookDeliveryErrorClass = "signature_error"
+	Timeout        WebhookDeliveryErrorClass = "timeout"
+	TransportError WebhookDeliveryErrorClass = "transport_error"
+)
+
+// Valid indicates whether the value is a known member of the WebhookDeliveryErrorClass enum.
+func (e WebhookDeliveryErrorClass) Valid() bool {
+	switch e {
+	case Canceled:
+		return true
+	case DnsError:
+		return true
+	case HttpError:
+		return true
+	case RequestError:
+		return true
+	case SignatureError:
+		return true
+	case Timeout:
+		return true
+	case TransportError:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WebhookDeliveryStatus.
+const (
+	WebhookDeliveryStatusFailed  WebhookDeliveryStatus = "failed"
+	WebhookDeliveryStatusSuccess WebhookDeliveryStatus = "success"
+)
+
+// Valid indicates whether the value is a known member of the WebhookDeliveryStatus enum.
+func (e WebhookDeliveryStatus) Valid() bool {
+	switch e {
+	case WebhookDeliveryStatusFailed:
+		return true
+	case WebhookDeliveryStatusSuccess:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatus.
+const (
+	GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatusFailed  GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatus = "failed"
+	GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatusSuccess GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatus = "success"
+)
+
+// Valid indicates whether the value is a known member of the GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatus enum.
+func (e GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatus) Valid() bool {
+	switch e {
+	case GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatusFailed:
+		return true
+	case GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatusSuccess:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for GetTeamsTeamIDMetricsMaxParamsMetric.
 const (
 	ConcurrentSandboxes GetTeamsTeamIDMetricsMaxParamsMetric = "concurrent_sandboxes"
@@ -274,6 +367,18 @@ type AdminBuildCancelResult struct {
 	FailedCount int `json:"failedCount"`
 }
 
+// AdminSandbox defines model for AdminSandbox.
+type AdminSandbox struct {
+	// SandboxID Identifier of the sandbox
+	SandboxID string `json:"sandboxID"`
+
+	// State State after the sandbox's latest create, resume, pause or kill event
+	State AdminSandboxState `json:"state"`
+
+	// TeamID Identifier of the team that owns the sandbox
+	TeamID openapi_types.UUID `json:"teamID"`
+}
+
 // AdminSandboxKillResult defines model for AdminSandboxKillResult.
 type AdminSandboxKillResult struct {
 	// FailedCount Number of sandboxes that failed to kill
@@ -282,6 +387,9 @@ type AdminSandboxKillResult struct {
 	// KilledCount Number of sandboxes successfully killed
 	KilledCount int `json:"killedCount"`
 }
+
+// AdminSandboxState State after the sandbox's latest create, resume, pause or kill event
+type AdminSandboxState string
 
 // AdminTeamRunningSandboxCounts Cached live sandbox index count keyed by team ID. Counts may briefly
 // include sandboxes transitioning out of running; teams without indexed
@@ -345,20 +453,13 @@ type ConnectSandbox struct {
 	Timeout int32 `json:"timeout"`
 }
 
-// CreatedAccessToken defines model for CreatedAccessToken.
-type CreatedAccessToken struct {
-	// CreatedAt Timestamp of access token creation
-	CreatedAt time.Time `json:"createdAt"`
+// ConnectSandboxV2 defines model for ConnectSandboxV2.
+type ConnectSandboxV2 struct {
+	// Memory Defaults to true. When false and the sandbox is paused, resume from disk state only: the sandbox cold-boots fresh and any memory in the snapshot is ignored, never modified or deleted. Disk state has crash-recovery semantics — writes not flushed before the pause may be lost. A no-op for snapshots that contain no memory. Rejected with an error in environments where this capability is not enabled, never silently downgraded to a memory restore.
+	Memory *bool `json:"memory,omitempty"`
 
-	// Id Identifier of the access token
-	Id   openapi_types.UUID       `json:"id"`
-	Mask IdentifierMaskingDetails `json:"mask"`
-
-	// Name Name of the access token
-	Name string `json:"name"`
-
-	// Token The fully created access token
-	Token string `json:"token"`
+	// Timeout Timeout in seconds from the current time after which the sandbox should expire
+	Timeout *int32 `json:"timeout,omitempty"`
 }
 
 // CreatedTeamAPIKey defines model for CreatedTeamAPIKey.
@@ -422,7 +523,7 @@ type Error struct {
 	// Code Error code
 	Code int32 `json:"code"`
 
-	// ErrorCode Machine-readable semantic error code. Not a closed set; initial values: sandbox_capacity_unavailable, sandbox_placement_timeout, sandbox_no_compatible_node, sandbox_create_failed, internal_server_error.
+	// ErrorCode Machine-readable semantic error code. Not a closed set; initial values: sandbox_capacity_unavailable, sandbox_placement_timeout, sandbox_no_compatible_node, sandbox_create_failed, internal_server_error, secret_limit_reached, idempotency_request_mismatch, idempotency_in_progress, idempotency_outcome_unknown.
 	ErrorCode *string `json:"error_code,omitempty"`
 
 	// Message Error
@@ -558,11 +659,8 @@ type Mcp map[string]interface{}
 // MemoryMB Memory for the sandbox in MiB
 type MemoryMB = int32
 
-// NewAccessToken defines model for NewAccessToken.
-type NewAccessToken struct {
-	// Name Name of the access token
-	Name string `json:"name"`
-}
+// MinFreeDiskMb Requested minimum free space after the template's build steps, in MiB. Omit to use the team's default. Set to 0 to request no minimum free-disk growth. The filesystem is never shrunk, including inherited or already-larger filesystems. Growth is best effort, so filesystem metadata can leave the available space slightly below the requested minimum.
+type MinFreeDiskMb = int32
 
 // NewSandbox defines model for NewSandbox.
 type NewSandbox struct {
@@ -587,8 +685,40 @@ type NewSandbox struct {
 	Metadata *SandboxMetadata      `json:"metadata,omitempty"`
 	Network  *SandboxNetworkConfig `json:"network,omitempty"`
 
-	// Secure Secure all system communication with sandbox
+	// Secure Ignored. All system communication with the sandbox is always secured; the template's envd version must support secured access.
+	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	Secure *bool `json:"secure,omitempty"`
+
+	// TemplateID Identifier of the required template
+	TemplateID string `json:"templateID"`
+
+	// Timeout Time to live for the sandbox in seconds.
+	Timeout      *int32                `json:"timeout,omitempty"`
+	VolumeMounts *[]SandboxVolumeMount `json:"volumeMounts,omitempty"`
+}
+
+// NewSandboxV2 Sandbox creation request. All system communication with the sandbox is always secured; the template's envd version must support secured access.
+type NewSandboxV2 struct {
+	// AllowInternetAccess Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut to 0.0.0.0/0 in the network config.
+	AllowInternetAccess *bool `json:"allow_internet_access,omitempty"`
+
+	// AutoPause Automatically pauses the sandbox after the timeout
+	AutoPause *bool `json:"autoPause,omitempty"`
+
+	// AutoPauseMemory Controls the snapshot kind taken when the sandbox auto-pauses on timeout (only relevant when autoPause is true). When false, the auto-pause drops the in-memory state and persists only the filesystem (a filesystem-only snapshot); resuming it cold-boots (reboots) the sandbox from disk. Such a snapshot cannot be auto-resumed by traffic and must be resumed explicitly, so it cannot be combined with autoResume. Defaults to true (full memory snapshot).
+	AutoPauseMemory *bool `json:"autoPauseMemory,omitempty"`
+
+	// AutoResume Auto-resume configuration for paused sandboxes.
+	AutoResume *SandboxAutoResumeConfig `json:"autoResume,omitempty"`
+	EnvVars    *EnvVars                 `json:"envVars,omitempty"`
+
+	// Iam Sandbox workload identity configuration. A non-empty, valid tokens map enables workload identity for the sandbox.
+	Iam *SandboxIam `json:"iam,omitempty"`
+
+	// Mcp MCP configuration for the sandbox
+	Mcp      *Mcp                  `json:"mcp,omitempty"`
+	Metadata *SandboxMetadata      `json:"metadata,omitempty"`
+	Network  *SandboxNetworkConfig `json:"network,omitempty"`
 
 	// TemplateID Identifier of the required template
 	TemplateID string `json:"templateID"`
@@ -640,8 +770,14 @@ type Node struct {
 	Id          string      `json:"id"`
 	MachineInfo MachineInfo `json:"machineInfo"`
 
+	// MaxSandboxes Cached node-scoped sandbox admission limit. Nonpositive values reject creation.
+	MaxSandboxes int64 `json:"maxSandboxes"`
+
 	// Metrics Node metrics
 	Metrics NodeMetrics `json:"metrics"`
+
+	// OutstandingWork Cached count of work holds on the node. Zero means idle or not yet reported; it does not by itself authorize deletion.
+	OutstandingWork uint64 `json:"outstandingWork"`
 
 	// SandboxCount Number of sandboxes running on the node
 	SandboxCount uint32 `json:"sandboxCount"`
@@ -653,7 +789,6 @@ type Node struct {
 	ServiceInstanceID string `json:"serviceInstanceID"`
 
 	// Status Status of the node.
-	// - draining: the node is bound to be shut down. It will not accept new sandboxes and will stop once all existing sandboxes are done.
 	// - standby: the node is not actively used, but it can return to ready and continue serving traffic.
 	Status NodeStatus `json:"status"`
 
@@ -682,8 +817,14 @@ type NodeDetail struct {
 	Id          string      `json:"id"`
 	MachineInfo MachineInfo `json:"machineInfo"`
 
+	// MaxSandboxes Cached node-scoped sandbox admission limit. Nonpositive values reject creation.
+	MaxSandboxes int64 `json:"maxSandboxes"`
+
 	// Metrics Node metrics
 	Metrics NodeMetrics `json:"metrics"`
+
+	// OutstandingWork Cached count of work holds on the node. Zero means idle or not yet reported; it does not by itself authorize deletion.
+	OutstandingWork uint64 `json:"outstandingWork"`
 
 	// SandboxCount Number of sandboxes running on the node
 	SandboxCount uint32 `json:"sandboxCount"`
@@ -692,7 +833,6 @@ type NodeDetail struct {
 	ServiceInstanceID string `json:"serviceInstanceID"`
 
 	// Status Status of the node.
-	// - draining: the node is bound to be shut down. It will not accept new sandboxes and will stop once all existing sandboxes are done.
 	// - standby: the node is not actively used, but it can return to ready and continue serving traffic.
 	Status NodeStatus `json:"status"`
 
@@ -740,7 +880,6 @@ type NodeMetrics struct {
 }
 
 // NodeStatus Status of the node.
-// - draining: the node is bound to be shut down. It will not accept new sandboxes and will stop once all existing sandboxes are done.
 // - standby: the node is not actively used, but it can return to ready and continue serving traffic.
 type NodeStatus string
 
@@ -750,7 +889,6 @@ type NodeStatusChange struct {
 	ClusterID *openapi_types.UUID `json:"clusterID,omitempty"`
 
 	// Status Status of the node.
-	// - draining: the node is bound to be shut down. It will not accept new sandboxes and will stop once all existing sandboxes are done.
 	// - standby: the node is not actively used, but it can return to ready and continue serving traffic.
 	Status NodeStatus `json:"status"`
 }
@@ -769,6 +907,69 @@ type ResumedSandbox struct {
 
 	// Timeout Time to live for the sandbox in seconds.
 	Timeout *int32 `json:"timeout,omitempty"`
+}
+
+// Rig An orchestrator node pool backed by one cloud scaling group
+type Rig struct {
+	// CapacityCurrent Number of instances currently attached to the rig
+	CapacityCurrent int32 `json:"capacityCurrent"`
+
+	// CapacityDesired Desired number of instances in the rig
+	CapacityDesired int32 `json:"capacityDesired"`
+
+	// CapacityMax Maximum capacity enforced on the rig's scaling group. Omitted when nothing enforces bounds (GCP MIG without an active autoscaler).
+	CapacityMax *int32 `json:"capacityMax,omitempty"`
+
+	// CapacityMin Minimum capacity enforced on the rig's scaling group. Omitted when nothing enforces bounds (GCP MIG without an active autoscaler).
+	CapacityMin *int32 `json:"capacityMin,omitempty"`
+
+	// Id Rig identifier (e.g. "default")
+	Id string `json:"id"`
+
+	// Provider Cloud provider backing the rig ("aws" or "gcp")
+	Provider string `json:"provider"`
+
+	// ResourceID Canonical cloud resource ID of the scaling group backing the rig (ARN on AWS, self-link on GCP)
+	ResourceID string `json:"resourceID"`
+}
+
+// RigCapacityChange Desired capacity to set on the rig's scaling group
+type RigCapacityChange struct {
+	// Desired Absolute desired number of instances in the rig
+	Desired int32 `json:"desired"`
+}
+
+// RigError Scaling error on the rig's scaling group, e.g. a failed instance creation due to resource exhaustion
+type RigError struct {
+	// Action Action being performed when the error occurred (e.g. CREATING)
+	Action *string `json:"action,omitempty"`
+
+	// Code Provider-specific error code (e.g. ZONE_RESOURCE_POOL_EXHAUSTED, Failed)
+	Code string `json:"code"`
+
+	// Instance Instance the error relates to, if any
+	Instance *string `json:"instance,omitempty"`
+
+	// Message Human-readable error message
+	Message string `json:"message"`
+
+	// Timestamp When the error occurred
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// RigInstance An instance attached to a rig's scaling group
+type RigInstance struct {
+	// CreatedAt When the provider created the instance. Omitted while the instance is transitioning.
+	CreatedAt *time.Time `json:"createdAt,omitempty"`
+
+	// Id Provider instance ID (EC2 instance ID on AWS, instance name on GCP), also the node ID the orchestrator reports
+	Id string `json:"id"`
+
+	// Terminating The instance is on its way out of the group and can never become healthy again
+	Terminating bool `json:"terminating"`
+
+	// Transitioning The provider is creating, deleting, recreating or otherwise mutating the instance
+	Transitioning bool `json:"transitioning"`
 }
 
 // Sandbox defines model for Sandbox.
@@ -868,8 +1069,64 @@ type SandboxEgressProxyConfig struct {
 	// Password Optional SOCKS5 password (RFC 1929), max 255 bytes.
 	Password *string `json:"password,omitempty"`
 
+	// Tls TLS for the connection to the SOCKS5 proxy. The SOCKS5 negotiation and the tunneled traffic both run inside the TLS session, so the proxy credentials are not sent in the clear. This secures only the hop to the proxy; what the proxy does onward is its own concern. A half-close from the sandbox reaches the proxy as a TLS close_notify, not a TCP FIN, and a proxy that treats close_notify as a full close cuts the reply short.
+	Tls *SandboxEgressProxyTLSConfig `json:"tls,omitempty"`
+
 	// Username Optional SOCKS5 username (RFC 1929), max 255 bytes.
 	Username *string `json:"username,omitempty"`
+}
+
+// SandboxEgressProxyTLSConfig TLS for the connection to the SOCKS5 proxy. The SOCKS5 negotiation and the tunneled traffic both run inside the TLS session, so the proxy credentials are not sent in the clear. This secures only the hop to the proxy; what the proxy does onward is its own concern. A half-close from the sandbox reaches the proxy as a TLS close_notify, not a TCP FIN, and a proxy that treats close_notify as a full close cuts the reply short.
+type SandboxEgressProxyTLSConfig struct {
+	// CaCert One or more PEM-encoded certificates to verify the proxy against, for a proxy fronted by a private CA. These replace the system trust store, which is what is used when this is omitted. The system trust store depends on the host the orchestrator runs on, so set this to get the same verification everywhere.
+	CaCert *string `json:"caCert,omitempty"`
+
+	// Enabled Connect to the proxy over TLS. When false, no other field in this object may be set.
+	Enabled bool `json:"enabled"`
+
+	// ServerName Name to verify the proxy certificate against, and to send as SNI. Defaults to the host part of address. Set this only when the certificate does not match the address the proxy is reached at.
+	ServerName *string `json:"serverName,omitempty"`
+}
+
+// SandboxEvent Sandbox event
+type SandboxEvent struct {
+	// EventCategory Category of the event (e.g., 'lifecycle', 'process', etc.)
+	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
+	EventCategory *string `json:"eventCategory,omitempty"`
+
+	// EventData Optional JSON data associated with the event
+	EventData *map[string]interface{} `json:"eventData,omitempty"`
+
+	// EventLabel Label for the specific event type (e.g., 'sandbox_started', 'process_oom', etc.)
+	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
+	EventLabel *string `json:"eventLabel,omitempty"`
+
+	// Id Event unique identifier
+	Id openapi_types.UUID `json:"id"`
+
+	// SandboxBuildId Unique identifier for the sandbox build
+	SandboxBuildId string `json:"sandboxBuildId"`
+
+	// SandboxExecutionId Unique identifier for the sandbox execution
+	SandboxExecutionId string `json:"sandboxExecutionId"`
+
+	// SandboxId Unique identifier for the sandbox
+	SandboxId string `json:"sandboxId"`
+
+	// SandboxTeamId Team identifier associated with the sandbox
+	SandboxTeamId openapi_types.UUID `json:"sandboxTeamId"`
+
+	// SandboxTemplateId Unique identifier for the sandbox template
+	SandboxTemplateId string `json:"sandboxTemplateId"`
+
+	// Timestamp Timestamp of the event
+	Timestamp time.Time `json:"timestamp"`
+
+	// Type Event name
+	Type string `json:"type"`
+
+	// Version Event structure version
+	Version string `json:"version"`
 }
 
 // SandboxForkRequest defines model for SandboxForkRequest.
@@ -1000,10 +1257,13 @@ type SandboxNetworkConfig struct {
 	// EgressProxy SOCKS5 proxy for sandbox egress. Outbound TCP is tunneled through the proxy after allow/deny filtering; the sandbox is unaware. Domain-matched flows use remote DNS (ATYP=domain).
 	EgressProxy *SandboxEgressProxyConfig `json:"egressProxy,omitempty"`
 
+	// HttpsPorts Sandbox ports that serve HTTPS rather than plaintext HTTP. Affects how the proxy reaches the service inside the sandbox; the public URL is HTTPS either way. Certificates are not verified, so self-signed ones work. The envd port (49983) cannot be listed.
+	HttpsPorts *[]uint32 `json:"httpsPorts,omitempty"`
+
 	// MaskRequestHost Specify host mask which will be used for all sandbox requests
 	MaskRequestHost *string `json:"maskRequestHost,omitempty"`
 
-	// Rules Per-domain transform rules applied to matching egress HTTP/HTTPS requests. Keys are domains (e.g. "api.example.com", "example.com"). A domain listed here is not automatically allowed - use allowOut to permit the traffic.
+	// Rules Per-domain transform rules applied to matching outbound HTTPS requests. Keys may be exact DNS names (for example, "api.example.com") or a leading wildcard (for example, "*.example.com"), and are normalized to lowercase on write. Wildcards match subdomains at any depth but not the apex domain; a bare "*" is invalid. Exact rules take precedence, followed by the longest matching wildcard suffix, and matching rule sets are not merged. Broad wildcards such as "*.com" are allowed and may expose transformed credentials to every matching destination the sandbox contacts. Rules do not grant network access; configure allowOut separately to permit the destination.
 	Rules *map[string][]SandboxNetworkRule `json:"rules,omitempty"`
 }
 
@@ -1033,7 +1293,7 @@ type SandboxNetworkUpdateConfig struct {
 	// EgressProxy SOCKS5 proxy for sandbox egress. Outbound TCP is tunneled through the proxy after allow/deny filtering; the sandbox is unaware. Domain-matched flows use remote DNS (ATYP=domain).
 	EgressProxy *SandboxEgressProxyConfig `json:"egressProxy,omitempty"`
 
-	// Rules Per-domain transform rules. Replaces all existing rules when provided.
+	// Rules Per-domain transform rules applied to matching outbound HTTPS requests. Replaces all existing rules when provided. Keys may be exact DNS names or a single leading wildcard (for example, "*.example.com"), and are normalized to lowercase on write. Wildcards match subdomains at any depth but not the apex domain; a bare "*" is invalid. Exact rules take precedence, followed by the longest matching wildcard suffix, and matching rule sets are not merged. Broad wildcards such as "*.com" are allowed and may expose transformed credentials to every matching destination the sandbox contacts. Rules do not grant network access; configure allowOut separately to permit the destination.
 	Rules *map[string][]SandboxNetworkRule `json:"rules,omitempty"`
 }
 
@@ -1054,6 +1314,9 @@ type SandboxRefreshRequest struct {
 
 // SandboxSnapshotRequest defines model for SandboxSnapshotRequest.
 type SandboxSnapshotRequest struct {
+	// Memory Whether to capture a full memory snapshot. When false, only the filesystem is persisted: the snapshot is smaller and faster to take, and sandboxes created from it cold-boot (start fresh from disk) instead of restoring memory, so they begin without the source sandbox's running processes, in-memory state, and open connections. The source sandbox keeps running in both cases. Defaults to true.
+	Memory *bool `json:"memory,omitempty"`
+
 	// Name Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
 	Name *string `json:"name,omitempty"`
 }
@@ -1272,6 +1535,9 @@ type TemplateBuild struct {
 
 // TemplateBuildFileUpload defines model for TemplateBuildFileUpload.
 type TemplateBuildFileUpload struct {
+	// Headers Request headers that must be sent with the upload request
+	Headers *map[string]string `json:"headers,omitempty"`
+
 	// Present Whether the file is already present in the cache
 	Present bool `json:"present"`
 
@@ -1287,7 +1553,8 @@ type TemplateBuildInfo struct {
 	// LogEntries Build logs structured
 	LogEntries []BuildLogEntry `json:"logEntries"`
 
-	// Logs Build logs
+	// Logs Build logs (always empty since the V1 build path was removed, use logEntries)
+	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	Logs   []string           `json:"logs"`
 	Reason *BuildStatusReason `json:"reason,omitempty"`
 
@@ -1304,46 +1571,6 @@ type TemplateBuildLogsResponse struct {
 	Logs []BuildLogEntry `json:"logs"`
 }
 
-// TemplateBuildRequest defines model for TemplateBuildRequest.
-type TemplateBuildRequest struct {
-	// Alias Alias of the template
-	Alias *string `json:"alias,omitempty"`
-
-	// CpuCount CPU cores for the sandbox
-	CpuCount *CPUCount `json:"cpuCount,omitempty"`
-
-	// Dockerfile Dockerfile for the template
-	Dockerfile string `json:"dockerfile"`
-
-	// MemoryMB Memory for the sandbox in MiB
-	MemoryMB *MemoryMB `json:"memoryMB,omitempty"`
-
-	// ReadyCmd Ready check command to execute in the template after the build
-	ReadyCmd *string `json:"readyCmd,omitempty"`
-
-	// StartCmd Start command to execute in the template after the build
-	StartCmd *string `json:"startCmd,omitempty"`
-
-	// TeamID Identifier of the team
-	TeamID *string `json:"teamID,omitempty"`
-}
-
-// TemplateBuildRequestV2 defines model for TemplateBuildRequestV2.
-type TemplateBuildRequestV2 struct {
-	// Alias Alias of the template
-	Alias string `json:"alias"`
-
-	// CpuCount CPU cores for the sandbox
-	CpuCount *CPUCount `json:"cpuCount,omitempty"`
-
-	// MemoryMB Memory for the sandbox in MiB
-	MemoryMB *MemoryMB `json:"memoryMB,omitempty"`
-
-	// TeamID Identifier of the team
-	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	TeamID *string `json:"teamID,omitempty"`
-}
-
 // TemplateBuildRequestV3 defines model for TemplateBuildRequestV3.
 type TemplateBuildRequestV3 struct {
 	// Alias Alias of the template. Deprecated, use name instead.
@@ -1356,18 +1583,21 @@ type TemplateBuildRequestV3 struct {
 	// MemoryMB Memory for the sandbox in MiB
 	MemoryMB *MemoryMB `json:"memoryMB,omitempty"`
 
+	// MinFreeDiskMb Requested minimum free space after the template's build steps, in MiB. Omit to use the team's default. Set to 0 to request no minimum free-disk growth. The filesystem is never shrunk, including inherited or already-larger filesystems. Growth is best effort, so filesystem metadata can leave the available space slightly below the requested minimum.
+	MinFreeDiskMb *MinFreeDiskMb `json:"minFreeDiskMb,omitempty"`
+
 	// Name Name of the template. Can include a tag with colon separator (e.g. "my-template" or "my-template:v1"). If tag is included, it will be treated as if the tag was provided in the tags array.
 	Name *string `json:"name,omitempty"`
 
 	// Tags Tags to assign to the template build
 	Tags *[]string `json:"tags,omitempty"`
 
-	// TeamID Identifier of the team
+	// TeamID Identifier of the team, as its UUID or its public project ID (prj_)
 	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	TeamID *string `json:"teamID,omitempty"`
 }
 
-// TemplateBuildStartV2 defines model for TemplateBuildStartV2.
+// TemplateBuildStartV2 Exactly one of fromImage or fromTemplate must be given and non-empty.
 type TemplateBuildStartV2 struct {
 	// Force Whether the whole build should be forced to run regardless of the cache
 	Force *bool `json:"force,omitempty"`
@@ -1391,49 +1621,6 @@ type TemplateBuildStartV2 struct {
 
 // TemplateBuildStatus Status of the template build
 type TemplateBuildStatus string
-
-// TemplateLegacy defines model for TemplateLegacy.
-type TemplateLegacy struct {
-	// Aliases Aliases of the template
-	Aliases []string `json:"aliases"`
-
-	// BuildCount Number of times the template was built
-	BuildCount int32 `json:"buildCount"`
-
-	// BuildID Identifier of the last successful build for given template
-	BuildID string `json:"buildID"`
-
-	// CpuCount CPU cores for the sandbox
-	CpuCount CPUCount `json:"cpuCount"`
-
-	// CreatedAt Time when the template was created
-	CreatedAt time.Time `json:"createdAt"`
-	CreatedBy *TeamUser `json:"createdBy"`
-
-	// DiskSizeMB Disk size for the sandbox in MiB
-	DiskSizeMB DiskSizeMB `json:"diskSizeMB"`
-
-	// EnvdVersion Version of the envd running in the sandbox
-	EnvdVersion EnvdVersion `json:"envdVersion"`
-
-	// LastSpawnedAt Time when the template was last used
-	LastSpawnedAt *time.Time `json:"lastSpawnedAt"`
-
-	// MemoryMB Memory for the sandbox in MiB
-	MemoryMB MemoryMB `json:"memoryMB"`
-
-	// Public Whether the template is public or only accessible by the team
-	Public bool `json:"public"`
-
-	// SpawnCount Number of times the template was used
-	SpawnCount int64 `json:"spawnCount"`
-
-	// TemplateID Identifier of the template
-	TemplateID string `json:"templateID"`
-
-	// UpdatedAt Time when the template was last updated
-	UpdatedAt time.Time `json:"updatedAt"`
-}
 
 // TemplateRequestResponseV3 defines model for TemplateRequestResponseV3.
 type TemplateRequestResponseV3 struct {
@@ -1462,7 +1649,7 @@ type TemplateStep struct {
 	// Args Arguments for the step
 	Args *[]string `json:"args,omitempty"`
 
-	// FilesHash Hash of the files used in the step
+	// FilesHash Hash of the files used in the step (lowercase hex SHA-256)
 	FilesHash *string `json:"filesHash,omitempty"`
 
 	// Force Whether the step should be forced to run regardless of the cache
@@ -1560,14 +1747,176 @@ type VolumeAndToken struct {
 	VolumeID string `json:"volumeID"`
 }
 
-// AccessTokenID defines model for accessTokenID.
-type AccessTokenID = string
+// WebhookConfiguration Configuration for updating existing webhooks
+type WebhookConfiguration struct {
+	Enabled *bool     `json:"enabled,omitempty"`
+	Events  *[]string `json:"events,omitempty"`
+
+	// Name Webhook user friendly name
+	Name *string `json:"name,omitempty"`
+
+	// SignatureSecret Secret used to sign the webhook payloads
+	SignatureSecret *string `json:"signatureSecret,omitempty"`
+	Url             *string `json:"url,omitempty"`
+}
+
+// WebhookCreate Configuration for registering new webhooks
+type WebhookCreate struct {
+	Enabled *bool    `json:"enabled,omitempty"`
+	Events  []string `json:"events"`
+	Name    string   `json:"name"`
+
+	// SignatureSecret Secret used to sign the webhook payloads
+	SignatureSecret string `json:"signatureSecret"`
+	Url             string `json:"url"`
+}
+
+// WebhookCreation Webhook creation response
+type WebhookCreation struct {
+	// CreatedAt Time when the template was created
+	CreatedAt time.Time `json:"createdAt"`
+	Enabled   bool      `json:"enabled"`
+	Events    []string  `json:"events"`
+
+	// Id Webhook unique identifier
+	Id string `json:"id"`
+
+	// Name Webhook user friendly name
+	Name string `json:"name"`
+
+	// TeamId Unique identifier for the team
+	TeamId string `json:"teamId"`
+	Url    string `json:"url"`
+}
+
+// WebhookDeliveriesListPayload Paginated webhook delivery attempts grouped by event
+type WebhookDeliveriesListPayload struct {
+	Data []WebhookDeliveryGroup `json:"data"`
+
+	// NextCursor Cursor to pass to the next list request, or null when there is no next page.
+	NextCursor *string `json:"nextCursor"`
+}
+
+// WebhookDelivery Webhook delivery attempt
+type WebhookDelivery struct {
+	// DurationMs Delivery request duration in milliseconds
+	DurationMs int32 `json:"durationMs"`
+
+	// ErrorClass Machine-readable non-HTTP or HTTP failure class
+	ErrorClass *WebhookDeliveryErrorClass `json:"errorClass"`
+
+	// ErrorMessage Error message for failures without a useful response body
+	ErrorMessage *string `json:"errorMessage,omitempty"`
+
+	// EventId Sandbox event identifier
+	EventId openapi_types.UUID `json:"eventId"`
+
+	// EventType Sandbox event type
+	EventType string `json:"eventType"`
+
+	// Id Delivery attempt identifier
+	Id openapi_types.UUID `json:"id"`
+
+	// RequestBody Serialized webhook request body
+	RequestBody string `json:"requestBody"`
+
+	// RequestHeaders JSON-encoded request headers with sensitive values redacted
+	RequestHeaders string `json:"requestHeaders"`
+
+	// RequestUrl URL attempted for this delivery
+	RequestUrl string `json:"requestUrl"`
+
+	// ResponseBody Truncated response body, if a response was received
+	ResponseBody *string `json:"responseBody,omitempty"`
+
+	// ResponseHeaders JSON-encoded response headers, if a response was received
+	ResponseHeaders *string `json:"responseHeaders,omitempty"`
+
+	// ResponseHttpStatusCode HTTP response status code, if a response was received
+	ResponseHttpStatusCode *int32 `json:"responseHttpStatusCode,omitempty"`
+
+	// SandboxId Sandbox identifier
+	SandboxId string `json:"sandboxId"`
+
+	// Status Delivery attempt status
+	Status WebhookDeliveryStatus `json:"status"`
+
+	// TeamId Team identifier
+	TeamId openapi_types.UUID `json:"teamId"`
+
+	// Timestamp Time when the delivery attempt started
+	Timestamp time.Time `json:"timestamp"`
+
+	// WebhookId Webhook configuration identifier
+	WebhookId openapi_types.UUID `json:"webhookId"`
+}
+
+// WebhookDeliveryErrorClass Machine-readable non-HTTP or HTTP failure class
+type WebhookDeliveryErrorClass string
+
+// WebhookDeliveryStatus Delivery attempt status
+type WebhookDeliveryStatus string
+
+// WebhookDeliveryDurationStats Webhook delivery duration statistics in milliseconds
+type WebhookDeliveryDurationStats struct {
+	Average float64 `json:"average"`
+	Maximum float64 `json:"maximum"`
+	Minimum float64 `json:"minimum"`
+}
+
+// WebhookDeliveryGroup Webhook delivery attempts grouped by sandbox event
+type WebhookDeliveryGroup struct {
+	Attempts  []WebhookDelivery  `json:"attempts"`
+	EventId   openapi_types.UUID `json:"eventId"`
+	EventType string             `json:"eventType"`
+	SandboxId string             `json:"sandboxId"`
+}
+
+// WebhookDeliveryStats Webhook delivery aggregate stats
+type WebhookDeliveryStats struct {
+	Buckets []WebhookDeliveryStatsBucket `json:"buckets"`
+
+	// DurationMs Webhook delivery duration statistics in milliseconds
+	DurationMs WebhookDeliveryDurationStats `json:"durationMs"`
+	Failed     int64                        `json:"failed"`
+	Total      int64                        `json:"total"`
+}
+
+// WebhookDeliveryStatsBucket Webhook delivery stats for a time bucket
+type WebhookDeliveryStatsBucket struct {
+	// DurationMs Webhook delivery duration statistics in milliseconds
+	DurationMs WebhookDeliveryDurationStats `json:"durationMs"`
+	Failed     int64                        `json:"failed"`
+	Timestamp  time.Time                    `json:"timestamp"`
+	Total      int64                        `json:"total"`
+}
+
+// WebhookDetail Webhook detail response
+type WebhookDetail struct {
+	// CreatedAt Time when the template was created
+	CreatedAt time.Time `json:"createdAt"`
+	Enabled   bool      `json:"enabled"`
+	Events    []string  `json:"events"`
+
+	// Id Webhook unique identifier
+	Id string `json:"id"`
+
+	// Name Webhook user friendly name
+	Name string `json:"name"`
+
+	// TeamId Unique identifier for the team
+	TeamId string `json:"teamId"`
+	Url    string `json:"url"`
+}
 
 // ApiKeyID defines model for apiKeyID.
 type ApiKeyID = string
 
 // BuildID defines model for buildID.
 type BuildID = string
+
+// ClusterID defines model for clusterID.
+type ClusterID = openapi_types.UUID
 
 // NodeID defines model for nodeID.
 type NodeID = string
@@ -1577,6 +1926,9 @@ type PaginationLimit = int32
 
 // PaginationNextToken defines model for paginationNextToken.
 type PaginationNextToken = string
+
+// RigID defines model for rigID.
+type RigID = string
 
 // SandboxID defines model for sandboxID.
 type SandboxID = string
@@ -1593,6 +1945,9 @@ type TemplateID = string
 // VolumeID defines model for volumeID.
 type VolumeID = string
 
+// WebhookID defines model for webhookID.
+type WebhookID = openapi_types.UUID
+
 // N400 defines model for 400.
 type N400 = Error
 
@@ -1608,14 +1963,14 @@ type N404 = Error
 // N409 defines model for 409.
 type N409 = Error
 
-// N410 defines model for 410.
-type N410 = Error
-
 // N429 defines model for 429.
 type N429 = Error
 
 // N500 defines model for 500.
 type N500 = Error
+
+// N501 defines model for 501.
+type N501 = Error
 
 // N502 defines model for 502.
 type N502 = Error
@@ -1625,6 +1980,70 @@ type N503 = Error
 
 // N504 defines model for 504.
 type N504 = Error
+
+// DeleteClustersClusterIDRigsInstancesInstanceIDParams defines parameters for DeleteClustersClusterIDRigsInstancesInstanceID.
+type DeleteClustersClusterIDRigsInstancesInstanceIDParams struct {
+	// DecrementDesired When true, desired capacity is decremented (rig shrinks); when false, the scaling group launches a replacement instance
+	DecrementDesired bool `form:"decrementDesired" json:"decrementDesired"`
+}
+
+// GetClustersClusterIDRigsRigIDErrorsParams defines parameters for GetClustersClusterIDRigsRigIDErrors.
+type GetClustersClusterIDRigsRigIDErrorsParams struct {
+	// Limit Maximum number of errors to return
+	Limit *int32 `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// GetEventsSandboxesParams defines parameters for GetEventsSandboxes.
+type GetEventsSandboxesParams struct {
+	Offset   *int32 `form:"offset,omitempty" json:"offset,omitempty"`
+	Limit    *int32 `form:"limit,omitempty" json:"limit,omitempty"`
+	OrderAsc *bool  `form:"orderAsc,omitempty" json:"orderAsc,omitempty"`
+
+	// Types Filter events to the provided event types
+	Types *[]string `form:"types,omitempty" json:"types,omitempty"`
+}
+
+// GetEventsSandboxesSandboxIDParams defines parameters for GetEventsSandboxesSandboxID.
+type GetEventsSandboxesSandboxIDParams struct {
+	Offset   *int32 `form:"offset,omitempty" json:"offset,omitempty"`
+	Limit    *int32 `form:"limit,omitempty" json:"limit,omitempty"`
+	OrderAsc *bool  `form:"orderAsc,omitempty" json:"orderAsc,omitempty"`
+
+	// Types Filter events to the provided event types
+	Types *[]string `form:"types,omitempty" json:"types,omitempty"`
+}
+
+// GetEventsWebhooksWebhookIDDeliveriesParams defines parameters for GetEventsWebhooksWebhookIDDeliveries.
+type GetEventsWebhooksWebhookIDDeliveriesParams struct {
+	// Cursor Opaque cursor from the previous response's nextCursor field.
+	Cursor   *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+	Limit    *int32  `form:"limit,omitempty" json:"limit,omitempty"`
+	OrderAsc *bool   `form:"orderAsc,omitempty" json:"orderAsc,omitempty"`
+
+	// Start Include deliveries at or after this timestamp.
+	Start *time.Time `form:"start,omitempty" json:"start,omitempty"`
+
+	// End Include deliveries before this timestamp.
+	End *time.Time `form:"end,omitempty" json:"end,omitempty"`
+
+	// DeliveryStatus Filter deliveries by delivery status
+	DeliveryStatus *[]GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatus `form:"deliveryStatus,omitempty" json:"deliveryStatus,omitempty"`
+
+	// EventType Filter deliveries by event type
+	EventType *[]string `form:"eventType,omitempty" json:"eventType,omitempty"`
+}
+
+// GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatus defines parameters for GetEventsWebhooksWebhookIDDeliveries.
+type GetEventsWebhooksWebhookIDDeliveriesParamsDeliveryStatus string
+
+// GetEventsWebhooksWebhookIDStatsParams defines parameters for GetEventsWebhooksWebhookIDStats.
+type GetEventsWebhooksWebhookIDStatsParams struct {
+	// Start Inclusive stats range start. Defaults to 24 hours ago.
+	Start *time.Time `form:"start,omitempty" json:"start,omitempty"`
+
+	// End Exclusive stats range end. Defaults to now.
+	End *time.Time `form:"end,omitempty" json:"end,omitempty"`
+}
 
 // GetNodesParams defines parameters for GetNodes.
 type GetNodesParams struct {
@@ -1771,6 +2190,18 @@ type GetV2SandboxesParams struct {
 	Limit *PaginationLimit `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
+// PostV2SandboxesParams defines parameters for PostV2Sandboxes.
+type PostV2SandboxesParams struct {
+	// IdempotencyKey Optional team-scoped key for retrying sandbox creation. Use 1 to 255 lowercase ASCII
+	// letters or digits (a-z, 0-9). When idempotency is enabled, matching retries replay the original
+	// status and body, including errors, for the retention period.
+	// Different request parameters return 409 with error_code idempotency_request_mismatch.
+	// An in-progress request returns 409 with error_code idempotency_in_progress; an unknown
+	// outcome returns 422 with error_code idempotency_outcome_unknown. These retries do not execute the request again.
+	// Retries do not extend retention. After the key expires, it can start a new creation.
+	IdempotencyKey *string `json:"Idempotency-Key,omitempty"`
+}
+
 // GetV2SandboxesSandboxIDLogsParams defines parameters for GetV2SandboxesSandboxIDLogs.
 type GetV2SandboxesSandboxIDLogsParams struct {
 	// Cursor Starting timestamp of the logs that should be returned in milliseconds
@@ -1800,11 +2231,6 @@ type GetV2TemplatesParams struct {
 	Limit *PaginationLimit `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
-// PostAccessTokensJSONRequestBody defines body for PostAccessTokens for application/json ContentType.
-//
-// Deprecated: this type has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-type PostAccessTokensJSONRequestBody = NewAccessToken
-
 // PostAdminTeamsTeamIDApiKeysJSONRequestBody defines body for PostAdminTeamsTeamIDApiKeys for application/json ContentType.
 type PostAdminTeamsTeamIDApiKeysJSONRequestBody = NewTeamAPIKey
 
@@ -1814,13 +2240,26 @@ type PostApiKeysJSONRequestBody = NewTeamAPIKey
 // PatchApiKeysApiKeyIDJSONRequestBody defines body for PatchApiKeysApiKeyID for application/json ContentType.
 type PatchApiKeysApiKeyIDJSONRequestBody = UpdateTeamAPIKey
 
+// PutClustersClusterIDRigsRigIDCapacityJSONRequestBody defines body for PutClustersClusterIDRigsRigIDCapacity for application/json ContentType.
+type PutClustersClusterIDRigsRigIDCapacityJSONRequestBody = RigCapacityChange
+
+// PostEventsWebhooksJSONRequestBody defines body for PostEventsWebhooks for application/json ContentType.
+type PostEventsWebhooksJSONRequestBody = WebhookCreate
+
+// PatchEventsWebhooksWebhookIDJSONRequestBody defines body for PatchEventsWebhooksWebhookID for application/json ContentType.
+type PatchEventsWebhooksWebhookIDJSONRequestBody = WebhookConfiguration
+
 // PostNodesNodeIDJSONRequestBody defines body for PostNodesNodeID for application/json ContentType.
 type PostNodesNodeIDJSONRequestBody = NodeStatusChange
 
 // PostSandboxesJSONRequestBody defines body for PostSandboxes for application/json ContentType.
+//
+// Deprecated: this type has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 type PostSandboxesJSONRequestBody = NewSandbox
 
 // PostSandboxesSandboxIDConnectJSONRequestBody defines body for PostSandboxesSandboxIDConnect for application/json ContentType.
+//
+// Deprecated: this type has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 type PostSandboxesSandboxIDConnectJSONRequestBody = ConnectSandbox
 
 // PostSandboxesSandboxIDForkJSONRequestBody defines body for PostSandboxesSandboxIDFork for application/json ContentType.
@@ -1852,11 +2291,6 @@ type PostSecretsJSONRequestBody = NewSecret
 // PostSecretsSecretIDJSONRequestBody defines body for PostSecretsSecretID for application/json ContentType.
 type PostSecretsSecretIDJSONRequestBody = SecretUpdate
 
-// PostTemplatesJSONRequestBody defines body for PostTemplates for application/json ContentType.
-//
-// Deprecated: this type has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-type PostTemplatesJSONRequestBody = TemplateBuildRequest
-
 // DeleteTemplatesTagsJSONRequestBody defines body for DeleteTemplatesTags for application/json ContentType.
 type DeleteTemplatesTagsJSONRequestBody = DeleteTemplateTagsRequest
 
@@ -1868,15 +2302,11 @@ type PostTemplatesTagsJSONRequestBody = AssignTemplateTagsRequest
 // Deprecated: this type has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 type PatchTemplatesTemplateIDJSONRequestBody = TemplateUpdateRequest
 
-// PostTemplatesTemplateIDJSONRequestBody defines body for PostTemplatesTemplateID for application/json ContentType.
-//
-// Deprecated: this type has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-type PostTemplatesTemplateIDJSONRequestBody = TemplateBuildRequest
+// PostV2SandboxesJSONRequestBody defines body for PostV2Sandboxes for application/json ContentType.
+type PostV2SandboxesJSONRequestBody = NewSandboxV2
 
-// PostV2TemplatesJSONRequestBody defines body for PostV2Templates for application/json ContentType.
-//
-// Deprecated: this type has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-type PostV2TemplatesJSONRequestBody = TemplateBuildRequestV2
+// PostV2SandboxesSandboxIDConnectJSONRequestBody defines body for PostV2SandboxesSandboxIDConnect for application/json ContentType.
+type PostV2SandboxesSandboxIDConnectJSONRequestBody = ConnectSandboxV2
 
 // PatchV2TemplatesTemplateIDJSONRequestBody defines body for PatchV2TemplatesTemplateID for application/json ContentType.
 type PatchV2TemplatesTemplateIDJSONRequestBody = TemplateUpdateRequest
@@ -2101,35 +2531,6 @@ func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
 // The interface specification for the client above.
 type ClientInterface interface {
 
-	// PostAccessTokensWithBody Create access token
-	//
-	// Create a new access token. Deprecated; use an API key (E2B_API_KEY) instead.
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /access-tokens (the `PostAccessTokens` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostAccessTokensWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PostAccessTokens Create access token
-	//
-	// Create a new access token. Deprecated; use an API key (E2B_API_KEY) instead.
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /access-tokens (the `PostAccessTokens` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostAccessTokens(ctx context.Context, body PostAccessTokensJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// DeleteAccessTokensAccessTokenID Delete access token
-	//
-	// Delete an access token.
-	//
-	// Corresponds with DELETE /access-tokens/{accessTokenID} (the `DeleteAccessTokensAccessTokenID` operationId).
-	DeleteAccessTokensAccessTokenID(ctx context.Context, accessTokenID AccessTokenID, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// GetAdminSandboxesRunningCounts Count running sandboxes by team
 	//
 	// Returns a shared snapshot normally refreshed after five seconds. A
@@ -2137,6 +2538,15 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /admin/sandboxes/running-counts (the `GetAdminSandboxesRunningCounts` operationId).
 	GetAdminSandboxesRunningCounts(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetAdminSandboxesSandboxID Get a sandbox's team and state
+	//
+	// Reads the team and state of a sandbox from its latest lifecycle event.
+	// The state lags the sandbox while that event is in flight. A sandbox
+	// whose events have expired is not found.
+	//
+	// Corresponds with GET /admin/sandboxes/{sandboxID} (the `GetAdminSandboxesSandboxID` operationId).
+	GetAdminSandboxesSandboxID(ctx context.Context, sandboxID SandboxID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// PostAdminTeamsTeamIDApiKeysWithBody Create team API key as admin
 	//
@@ -2227,6 +2637,111 @@ type ClientInterface interface {
 	// Corresponds with PATCH /api-keys/{apiKeyID} (the `PatchApiKeysApiKeyID` operationId).
 	PatchApiKeysApiKeyID(ctx context.Context, apiKeyID ApiKeyID, body PatchApiKeysApiKeyIDJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// GetClustersClusterIDRigs List rigs of a cluster
+	//
+	// List the orchestrator node pools ("rigs") of a cluster with a snapshot of their scaling groups. Forwarded to the cluster's edge service; a cluster with no rig management configured returns an empty list, and the local cluster answers 501.
+	//
+	// Corresponds with GET /clusters/{clusterID}/rigs (the `GetClustersClusterIDRigs` operationId).
+	GetClustersClusterIDRigs(ctx context.Context, clusterID ClusterID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// DeleteClustersClusterIDRigsInstancesInstanceID Terminate an instance of a rig
+	//
+	// Terminate an instance in whichever rig's scaling group it belongs to. The caller chooses whether the rig shrinks or the instance is replaced.
+	//
+	// Corresponds with DELETE /clusters/{clusterID}/rigs/instances/{instanceID} (the `DeleteClustersClusterIDRigsInstancesInstanceID` operationId).
+	DeleteClustersClusterIDRigsInstancesInstanceID(ctx context.Context, clusterID ClusterID, instanceID string, params *DeleteClustersClusterIDRigsInstancesInstanceIDParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PutClustersClusterIDRigsRigIDCapacityWithBody Set the capacity of a rig
+	//
+	// Set the desired instance count on the rig's scaling group. The value is passed to the cloud provider unchanged; violations of the group's bounds or conflicting concurrent operations surface as errors.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with PUT /clusters/{clusterID}/rigs/{rigID}/capacity (the `PutClustersClusterIDRigsRigIDCapacity` operationId).
+	PutClustersClusterIDRigsRigIDCapacityWithBody(ctx context.Context, clusterID ClusterID, rigID RigID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PutClustersClusterIDRigsRigIDCapacity Set the capacity of a rig
+	//
+	// Set the desired instance count on the rig's scaling group. The value is passed to the cloud provider unchanged; violations of the group's bounds or conflicting concurrent operations surface as errors.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with PUT /clusters/{clusterID}/rigs/{rigID}/capacity (the `PutClustersClusterIDRigsRigIDCapacity` operationId).
+	PutClustersClusterIDRigsRigIDCapacity(ctx context.Context, clusterID ClusterID, rigID RigID, body PutClustersClusterIDRigsRigIDCapacityJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetClustersClusterIDRigsRigIDErrors List recent scaling errors of a rig
+	//
+	// List recent scaling errors on the rig's scaling group (e.g. failed instance creations due to resource exhaustion), newest first.
+	//
+	// Corresponds with GET /clusters/{clusterID}/rigs/{rigID}/errors (the `GetClustersClusterIDRigsRigIDErrors` operationId).
+	GetClustersClusterIDRigsRigIDErrors(ctx context.Context, clusterID ClusterID, rigID RigID, params *GetClustersClusterIDRigsRigIDErrorsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetClustersClusterIDRigsRigIDInstances List the instances attached to a rig
+	//
+	// List the instances attached to the rig's scaling group with their creation time and transition state, sorted by instance ID.
+	//
+	// Corresponds with GET /clusters/{clusterID}/rigs/{rigID}/instances (the `GetClustersClusterIDRigsRigIDInstances` operationId).
+	GetClustersClusterIDRigsRigIDInstances(ctx context.Context, clusterID ClusterID, rigID RigID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetEventsSandboxes performs a GET /events/sandboxes (the `GetEventsSandboxes` operationId) request.
+	//
+	// Get all sandbox events for the team associated with the API key.
+	GetEventsSandboxes(ctx context.Context, params *GetEventsSandboxesParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetEventsSandboxesSandboxID performs a GET /events/sandboxes/{sandboxID} (the `GetEventsSandboxesSandboxID` operationId) request.
+	//
+	// Get sandbox events.
+	GetEventsSandboxesSandboxID(ctx context.Context, sandboxID SandboxID, params *GetEventsSandboxesSandboxIDParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetEventsWebhooks performs a GET /events/webhooks (the `GetEventsWebhooks` operationId) request.
+	//
+	// List registered webhooks.
+	GetEventsWebhooks(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostEventsWebhooksWithBody performs a POST /events/webhooks (the `PostEventsWebhooks` operationId) request,
+	// with any type of body and a specified content type.
+	//
+	// Register events webhook.
+	PostEventsWebhooksWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostEventsWebhooks performs a POST /events/webhooks (the `PostEventsWebhooks` operationId) request.
+	// Takes a body of the `application/json` content type.
+	//
+	// Register events webhook.
+	PostEventsWebhooks(ctx context.Context, body PostEventsWebhooksJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// DeleteEventsWebhooksWebhookID performs a DELETE /events/webhooks/{webhookID} (the `DeleteEventsWebhooksWebhookID` operationId) request.
+	//
+	// Delete a registered webhook.
+	DeleteEventsWebhooksWebhookID(ctx context.Context, webhookID WebhookID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetEventsWebhooksWebhookID performs a GET /events/webhooks/{webhookID} (the `GetEventsWebhooksWebhookID` operationId) request.
+	//
+	// Get a registered webhook.
+	GetEventsWebhooksWebhookID(ctx context.Context, webhookID WebhookID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PatchEventsWebhooksWebhookIDWithBody performs a PATCH /events/webhooks/{webhookID} (the `PatchEventsWebhooksWebhookID` operationId) request,
+	// with any type of body and a specified content type.
+	//
+	// Update a registered webhook configuration.
+	PatchEventsWebhooksWebhookIDWithBody(ctx context.Context, webhookID WebhookID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PatchEventsWebhooksWebhookID performs a PATCH /events/webhooks/{webhookID} (the `PatchEventsWebhooksWebhookID` operationId) request.
+	// Takes a body of the `application/json` content type.
+	//
+	// Update a registered webhook configuration.
+	PatchEventsWebhooksWebhookID(ctx context.Context, webhookID WebhookID, body PatchEventsWebhooksWebhookIDJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetEventsWebhooksWebhookIDDeliveries performs a GET /events/webhooks/{webhookID}/deliveries (the `GetEventsWebhooksWebhookIDDeliveries` operationId) request.
+	//
+	// List webhook delivery attempts.
+	GetEventsWebhooksWebhookIDDeliveries(ctx context.Context, webhookID WebhookID, params *GetEventsWebhooksWebhookIDDeliveriesParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetEventsWebhooksWebhookIDStats performs a GET /events/webhooks/{webhookID}/stats (the `GetEventsWebhooksWebhookIDStats` operationId) request.
+	//
+	// Get webhook delivery aggregate stats.
+	GetEventsWebhooksWebhookIDStats(ctx context.Context, webhookID WebhookID, params *GetEventsWebhooksWebhookIDStatsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// GetHealth Health check
 	//
 	// Corresponds with GET /health (the `GetHealth` operationId).
@@ -2275,20 +2790,24 @@ type ClientInterface interface {
 
 	// PostSandboxesWithBody Create sandbox
 	//
-	// Create a sandbox from the template.
+	// Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
 	//
 	// Takes any type of body and a specified content type.
 	//
 	// Corresponds with POST /sandboxes (the `PostSandboxes` operationId).
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostSandboxesWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// PostSandboxes Create sandbox
 	//
-	// Create a sandbox from the template.
+	// Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
 	//
 	// Takes a body of the `application/json` content type.
 	//
 	// Corresponds with POST /sandboxes (the `PostSandboxes` operationId).
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostSandboxes(ctx context.Context, body PostSandboxesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetSandboxesMetrics List sandbox metrics
@@ -2314,20 +2833,24 @@ type ClientInterface interface {
 
 	// PostSandboxesSandboxIDConnectWithBody Connect sandbox
 	//
-	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
 	//
 	// Takes any type of body and a specified content type.
 	//
 	// Corresponds with POST /sandboxes/{sandboxID}/connect (the `PostSandboxesSandboxIDConnect` operationId).
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostSandboxesSandboxIDConnectWithBody(ctx context.Context, sandboxID SandboxID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// PostSandboxesSandboxIDConnect Connect sandbox
 	//
-	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
 	//
 	// Takes a body of the `application/json` content type.
 	//
 	// Corresponds with POST /sandboxes/{sandboxID}/connect (the `PostSandboxesSandboxIDConnect` operationId).
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostSandboxesSandboxIDConnect(ctx context.Context, sandboxID SandboxID, body PostSandboxesSandboxIDConnectJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// PostSandboxesSandboxIDForkWithBody Fork sandbox
@@ -2570,28 +3093,6 @@ type ClientInterface interface {
 	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	GetTemplates(ctx context.Context, params *GetTemplatesParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// PostTemplatesWithBody Create template
-	//
-	// Create a new template.
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /templates (the `PostTemplates` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PostTemplates Create template
-	//
-	// Create a new template.
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /templates (the `PostTemplates` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplates(ctx context.Context, body PostTemplatesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// GetTemplatesAliasesAlias Check template alias
 	//
 	// Check if template with given alias exists.
@@ -2667,37 +3168,6 @@ type ClientInterface interface {
 	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PatchTemplatesTemplateID(ctx context.Context, templateID TemplateID, body PatchTemplatesTemplateIDJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// PostTemplatesTemplateIDWithBody Rebuild template
-	//
-	// Rebuild an template.
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /templates/{templateID} (the `PostTemplatesTemplateID` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesTemplateIDWithBody(ctx context.Context, templateID TemplateID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PostTemplatesTemplateID Rebuild template
-	//
-	// Rebuild an template.
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /templates/{templateID} (the `PostTemplatesTemplateID` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesTemplateID(ctx context.Context, templateID TemplateID, body PostTemplatesTemplateIDJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PostTemplatesTemplateIDBuildsBuildID Start template build
-	//
-	// Start the build.
-	//
-	// Corresponds with POST /templates/{templateID}/builds/{buildID} (the `PostTemplatesTemplateIDBuildsBuildID` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesTemplateIDBuildsBuildID(ctx context.Context, templateID TemplateID, buildID BuildID, reqEditors ...RequestEditorFn) (*http.Response, error)
-
 	// GetTemplatesTemplateIDBuildsBuildIDLogs Template build logs
 	//
 	// Get template build logs.
@@ -2733,6 +3203,42 @@ type ClientInterface interface {
 	// Corresponds with GET /v2/sandboxes (the `GetV2Sandboxes` operationId).
 	GetV2Sandboxes(ctx context.Context, params *GetV2SandboxesParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// PostV2SandboxesWithBody Create sandbox (v2)
+	//
+	// Create a sandbox from the template. All system communication with the sandbox is secured.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v2/sandboxes (the `PostV2Sandboxes` operationId).
+	PostV2SandboxesWithBody(ctx context.Context, params *PostV2SandboxesParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostV2Sandboxes Create sandbox (v2)
+	//
+	// Create a sandbox from the template. All system communication with the sandbox is secured.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v2/sandboxes (the `PostV2Sandboxes` operationId).
+	PostV2Sandboxes(ctx context.Context, params *PostV2SandboxesParams, body PostV2SandboxesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostV2SandboxesSandboxIDConnectWithBody Connect sandbox (v2)
+	//
+	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. The request body is optional; an omitted timeout defaults to 300 seconds.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v2/sandboxes/{sandboxID}/connect (the `PostV2SandboxesSandboxIDConnect` operationId).
+	PostV2SandboxesSandboxIDConnectWithBody(ctx context.Context, sandboxID SandboxID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// PostV2SandboxesSandboxIDConnect Connect sandbox (v2)
+	//
+	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. The request body is optional; an omitted timeout defaults to 300 seconds.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v2/sandboxes/{sandboxID}/connect (the `PostV2SandboxesSandboxIDConnect` operationId).
+	PostV2SandboxesSandboxIDConnect(ctx context.Context, sandboxID SandboxID, body PostV2SandboxesSandboxIDConnectJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// GetV2SandboxesSandboxIDLogs Sandbox logs (v2)
 	//
 	// Get sandbox logs.
@@ -2746,28 +3252,6 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /v2/templates (the `GetV2Templates` operationId).
 	GetV2Templates(ctx context.Context, params *GetV2TemplatesParams, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PostV2TemplatesWithBody Create template (v2)
-	//
-	// Create a new template.
-	//
-	// Takes any type of body and a specified content type.
-	//
-	// Corresponds with POST /v2/templates (the `PostV2Templates` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostV2TemplatesWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	// PostV2Templates Create template (v2)
-	//
-	// Create a new template.
-	//
-	// Takes a body of the `application/json` content type.
-	//
-	// Corresponds with POST /v2/templates (the `PostV2Templates` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostV2Templates(ctx context.Context, body PostV2TemplatesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// PatchV2TemplatesTemplateIDWithBody Update template (v2)
 	//
@@ -2863,63 +3347,6 @@ type ClientInterface interface {
 	GetVolumesVolumeID(ctx context.Context, volumeID VolumeID, reqEditors ...RequestEditorFn) (*http.Response, error)
 }
 
-// PostAccessTokensWithBody Create access token
-//
-// Create a new access token. Deprecated; use an API key (E2B_API_KEY) instead.
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /access-tokens (the `PostAccessTokens` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostAccessTokensWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostAccessTokensRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// PostAccessTokens Create access token
-//
-// Create a new access token. Deprecated; use an API key (E2B_API_KEY) instead.
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /access-tokens (the `PostAccessTokens` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostAccessTokens(ctx context.Context, body PostAccessTokensJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostAccessTokensRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// DeleteAccessTokensAccessTokenID Delete access token
-//
-// Delete an access token.
-//
-// Corresponds with DELETE /access-tokens/{accessTokenID} (the `DeleteAccessTokensAccessTokenID` operationId).
-func (c *Client) DeleteAccessTokensAccessTokenID(ctx context.Context, accessTokenID AccessTokenID, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewDeleteAccessTokensAccessTokenIDRequest(c.Server, accessTokenID)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
 // GetAdminSandboxesRunningCounts Count running sandboxes by team
 //
 // Returns a shared snapshot normally refreshed after five seconds. A
@@ -2928,6 +3355,25 @@ func (c *Client) DeleteAccessTokensAccessTokenID(ctx context.Context, accessToke
 // Corresponds with GET /admin/sandboxes/running-counts (the `GetAdminSandboxesRunningCounts` operationId).
 func (c *Client) GetAdminSandboxesRunningCounts(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetAdminSandboxesRunningCountsRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetAdminSandboxesSandboxID Get a sandbox's team and state
+//
+// Reads the team and state of a sandbox from its latest lifecycle event.
+// The state lags the sandbox while that event is in flight. A sandbox
+// whose events have expired is not found.
+//
+// Corresponds with GET /admin/sandboxes/{sandboxID} (the `GetAdminSandboxesSandboxID` operationId).
+func (c *Client) GetAdminSandboxesSandboxID(ctx context.Context, sandboxID SandboxID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetAdminSandboxesSandboxIDRequest(c.Server, sandboxID)
 	if err != nil {
 		return nil, err
 	}
@@ -3137,6 +3583,281 @@ func (c *Client) PatchApiKeysApiKeyID(ctx context.Context, apiKeyID ApiKeyID, bo
 	return c.Client.Do(req)
 }
 
+// GetClustersClusterIDRigs List rigs of a cluster
+//
+// List the orchestrator node pools ("rigs") of a cluster with a snapshot of their scaling groups. Forwarded to the cluster's edge service; a cluster with no rig management configured returns an empty list, and the local cluster answers 501.
+//
+// Corresponds with GET /clusters/{clusterID}/rigs (the `GetClustersClusterIDRigs` operationId).
+func (c *Client) GetClustersClusterIDRigs(ctx context.Context, clusterID ClusterID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetClustersClusterIDRigsRequest(c.Server, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// DeleteClustersClusterIDRigsInstancesInstanceID Terminate an instance of a rig
+//
+// Terminate an instance in whichever rig's scaling group it belongs to. The caller chooses whether the rig shrinks or the instance is replaced.
+//
+// Corresponds with DELETE /clusters/{clusterID}/rigs/instances/{instanceID} (the `DeleteClustersClusterIDRigsInstancesInstanceID` operationId).
+func (c *Client) DeleteClustersClusterIDRigsInstancesInstanceID(ctx context.Context, clusterID ClusterID, instanceID string, params *DeleteClustersClusterIDRigsInstancesInstanceIDParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeleteClustersClusterIDRigsInstancesInstanceIDRequest(c.Server, clusterID, instanceID, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PutClustersClusterIDRigsRigIDCapacityWithBody Set the capacity of a rig
+//
+// Set the desired instance count on the rig's scaling group. The value is passed to the cloud provider unchanged; violations of the group's bounds or conflicting concurrent operations surface as errors.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with PUT /clusters/{clusterID}/rigs/{rigID}/capacity (the `PutClustersClusterIDRigsRigIDCapacity` operationId).
+func (c *Client) PutClustersClusterIDRigsRigIDCapacityWithBody(ctx context.Context, clusterID ClusterID, rigID RigID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPutClustersClusterIDRigsRigIDCapacityRequestWithBody(c.Server, clusterID, rigID, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PutClustersClusterIDRigsRigIDCapacity Set the capacity of a rig
+//
+// Set the desired instance count on the rig's scaling group. The value is passed to the cloud provider unchanged; violations of the group's bounds or conflicting concurrent operations surface as errors.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with PUT /clusters/{clusterID}/rigs/{rigID}/capacity (the `PutClustersClusterIDRigsRigIDCapacity` operationId).
+func (c *Client) PutClustersClusterIDRigsRigIDCapacity(ctx context.Context, clusterID ClusterID, rigID RigID, body PutClustersClusterIDRigsRigIDCapacityJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPutClustersClusterIDRigsRigIDCapacityRequest(c.Server, clusterID, rigID, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetClustersClusterIDRigsRigIDErrors List recent scaling errors of a rig
+//
+// List recent scaling errors on the rig's scaling group (e.g. failed instance creations due to resource exhaustion), newest first.
+//
+// Corresponds with GET /clusters/{clusterID}/rigs/{rigID}/errors (the `GetClustersClusterIDRigsRigIDErrors` operationId).
+func (c *Client) GetClustersClusterIDRigsRigIDErrors(ctx context.Context, clusterID ClusterID, rigID RigID, params *GetClustersClusterIDRigsRigIDErrorsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetClustersClusterIDRigsRigIDErrorsRequest(c.Server, clusterID, rigID, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetClustersClusterIDRigsRigIDInstances List the instances attached to a rig
+//
+// List the instances attached to the rig's scaling group with their creation time and transition state, sorted by instance ID.
+//
+// Corresponds with GET /clusters/{clusterID}/rigs/{rigID}/instances (the `GetClustersClusterIDRigsRigIDInstances` operationId).
+func (c *Client) GetClustersClusterIDRigsRigIDInstances(ctx context.Context, clusterID ClusterID, rigID RigID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetClustersClusterIDRigsRigIDInstancesRequest(c.Server, clusterID, rigID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetEventsSandboxes performs a GET /events/sandboxes (the `GetEventsSandboxes` operationId) request.
+//
+// Get all sandbox events for the team associated with the API key.
+func (c *Client) GetEventsSandboxes(ctx context.Context, params *GetEventsSandboxesParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetEventsSandboxesRequest(c.Server, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetEventsSandboxesSandboxID performs a GET /events/sandboxes/{sandboxID} (the `GetEventsSandboxesSandboxID` operationId) request.
+//
+// Get sandbox events.
+func (c *Client) GetEventsSandboxesSandboxID(ctx context.Context, sandboxID SandboxID, params *GetEventsSandboxesSandboxIDParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetEventsSandboxesSandboxIDRequest(c.Server, sandboxID, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetEventsWebhooks performs a GET /events/webhooks (the `GetEventsWebhooks` operationId) request.
+//
+// List registered webhooks.
+func (c *Client) GetEventsWebhooks(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetEventsWebhooksRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PostEventsWebhooksWithBody performs a POST /events/webhooks (the `PostEventsWebhooks` operationId) request,
+// with any type of body and a specified content type.
+//
+// Register events webhook.
+func (c *Client) PostEventsWebhooksWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostEventsWebhooksRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PostEventsWebhooks performs a POST /events/webhooks (the `PostEventsWebhooks` operationId) request.
+// Takes a body of the `application/json` content type.
+//
+// Register events webhook.
+func (c *Client) PostEventsWebhooks(ctx context.Context, body PostEventsWebhooksJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostEventsWebhooksRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// DeleteEventsWebhooksWebhookID performs a DELETE /events/webhooks/{webhookID} (the `DeleteEventsWebhooksWebhookID` operationId) request.
+//
+// Delete a registered webhook.
+func (c *Client) DeleteEventsWebhooksWebhookID(ctx context.Context, webhookID WebhookID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeleteEventsWebhooksWebhookIDRequest(c.Server, webhookID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetEventsWebhooksWebhookID performs a GET /events/webhooks/{webhookID} (the `GetEventsWebhooksWebhookID` operationId) request.
+//
+// Get a registered webhook.
+func (c *Client) GetEventsWebhooksWebhookID(ctx context.Context, webhookID WebhookID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetEventsWebhooksWebhookIDRequest(c.Server, webhookID)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PatchEventsWebhooksWebhookIDWithBody performs a PATCH /events/webhooks/{webhookID} (the `PatchEventsWebhooksWebhookID` operationId) request,
+// with any type of body and a specified content type.
+//
+// Update a registered webhook configuration.
+func (c *Client) PatchEventsWebhooksWebhookIDWithBody(ctx context.Context, webhookID WebhookID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPatchEventsWebhooksWebhookIDRequestWithBody(c.Server, webhookID, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PatchEventsWebhooksWebhookID performs a PATCH /events/webhooks/{webhookID} (the `PatchEventsWebhooksWebhookID` operationId) request.
+// Takes a body of the `application/json` content type.
+//
+// Update a registered webhook configuration.
+func (c *Client) PatchEventsWebhooksWebhookID(ctx context.Context, webhookID WebhookID, body PatchEventsWebhooksWebhookIDJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPatchEventsWebhooksWebhookIDRequest(c.Server, webhookID, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetEventsWebhooksWebhookIDDeliveries performs a GET /events/webhooks/{webhookID}/deliveries (the `GetEventsWebhooksWebhookIDDeliveries` operationId) request.
+//
+// List webhook delivery attempts.
+func (c *Client) GetEventsWebhooksWebhookIDDeliveries(ctx context.Context, webhookID WebhookID, params *GetEventsWebhooksWebhookIDDeliveriesParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetEventsWebhooksWebhookIDDeliveriesRequest(c.Server, webhookID, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetEventsWebhooksWebhookIDStats performs a GET /events/webhooks/{webhookID}/stats (the `GetEventsWebhooksWebhookIDStats` operationId) request.
+//
+// Get webhook delivery aggregate stats.
+func (c *Client) GetEventsWebhooksWebhookIDStats(ctx context.Context, webhookID WebhookID, params *GetEventsWebhooksWebhookIDStatsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetEventsWebhooksWebhookIDStatsRequest(c.Server, webhookID, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // GetHealth Health check
 //
 // Corresponds with GET /health (the `GetHealth` operationId).
@@ -3244,11 +3965,12 @@ func (c *Client) GetSandboxes(ctx context.Context, params *GetSandboxesParams, r
 
 // PostSandboxesWithBody Create sandbox
 //
-// Create a sandbox from the template.
+// Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
 //
 // Takes any type of body and a specified content type.
 //
 // Corresponds with POST /sandboxes (the `PostSandboxes` operationId).
+// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 func (c *Client) PostSandboxesWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostSandboxesRequestWithBody(c.Server, contentType, body)
 	if err != nil {
@@ -3263,11 +3985,12 @@ func (c *Client) PostSandboxesWithBody(ctx context.Context, contentType string, 
 
 // PostSandboxes Create sandbox
 //
-// Create a sandbox from the template.
+// Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
 //
 // Takes a body of the `application/json` content type.
 //
 // Corresponds with POST /sandboxes (the `PostSandboxes` operationId).
+// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 func (c *Client) PostSandboxes(ctx context.Context, body PostSandboxesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostSandboxesRequest(c.Server, body)
 	if err != nil {
@@ -3333,11 +4056,12 @@ func (c *Client) GetSandboxesSandboxID(ctx context.Context, sandboxID SandboxID,
 
 // PostSandboxesSandboxIDConnectWithBody Connect sandbox
 //
-// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
 //
 // Takes any type of body and a specified content type.
 //
 // Corresponds with POST /sandboxes/{sandboxID}/connect (the `PostSandboxesSandboxIDConnect` operationId).
+// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 func (c *Client) PostSandboxesSandboxIDConnectWithBody(ctx context.Context, sandboxID SandboxID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostSandboxesSandboxIDConnectRequestWithBody(c.Server, sandboxID, contentType, body)
 	if err != nil {
@@ -3352,11 +4076,12 @@ func (c *Client) PostSandboxesSandboxIDConnectWithBody(ctx context.Context, sand
 
 // PostSandboxesSandboxIDConnect Connect sandbox
 //
-// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
 //
 // Takes a body of the `application/json` content type.
 //
 // Corresponds with POST /sandboxes/{sandboxID}/connect (the `PostSandboxesSandboxIDConnect` operationId).
+// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 func (c *Client) PostSandboxesSandboxIDConnect(ctx context.Context, sandboxID SandboxID, body PostSandboxesSandboxIDConnectJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostSandboxesSandboxIDConnectRequest(c.Server, sandboxID, body)
 	if err != nil {
@@ -3885,46 +4610,6 @@ func (c *Client) GetTemplates(ctx context.Context, params *GetTemplatesParams, r
 	return c.Client.Do(req)
 }
 
-// PostTemplatesWithBody Create template
-//
-// Create a new template.
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /templates (the `PostTemplates` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostTemplatesWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostTemplatesRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// PostTemplates Create template
-//
-// Create a new template.
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /templates (the `PostTemplates` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostTemplates(ctx context.Context, body PostTemplatesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostTemplatesRequest(c.Server, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
 // GetTemplatesAliasesAlias Check template alias
 //
 // Check if template with given alias exists.
@@ -4088,64 +4773,6 @@ func (c *Client) PatchTemplatesTemplateID(ctx context.Context, templateID Templa
 	return c.Client.Do(req)
 }
 
-// PostTemplatesTemplateIDWithBody Rebuild template
-//
-// Rebuild an template.
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /templates/{templateID} (the `PostTemplatesTemplateID` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostTemplatesTemplateIDWithBody(ctx context.Context, templateID TemplateID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostTemplatesTemplateIDRequestWithBody(c.Server, templateID, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// PostTemplatesTemplateID Rebuild template
-//
-// Rebuild an template.
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /templates/{templateID} (the `PostTemplatesTemplateID` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostTemplatesTemplateID(ctx context.Context, templateID TemplateID, body PostTemplatesTemplateIDJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostTemplatesTemplateIDRequest(c.Server, templateID, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// PostTemplatesTemplateIDBuildsBuildID Start template build
-//
-// Start the build.
-//
-// Corresponds with POST /templates/{templateID}/builds/{buildID} (the `PostTemplatesTemplateIDBuildsBuildID` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostTemplatesTemplateIDBuildsBuildID(ctx context.Context, templateID TemplateID, buildID BuildID, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostTemplatesTemplateIDBuildsBuildIDRequest(c.Server, templateID, buildID)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
 // GetTemplatesTemplateIDBuildsBuildIDLogs Template build logs
 //
 // Get template build logs.
@@ -4231,6 +4858,82 @@ func (c *Client) GetV2Sandboxes(ctx context.Context, params *GetV2SandboxesParam
 	return c.Client.Do(req)
 }
 
+// PostV2SandboxesWithBody Create sandbox (v2)
+//
+// Create a sandbox from the template. All system communication with the sandbox is secured.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v2/sandboxes (the `PostV2Sandboxes` operationId).
+func (c *Client) PostV2SandboxesWithBody(ctx context.Context, params *PostV2SandboxesParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV2SandboxesRequestWithBody(c.Server, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PostV2Sandboxes Create sandbox (v2)
+//
+// Create a sandbox from the template. All system communication with the sandbox is secured.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v2/sandboxes (the `PostV2Sandboxes` operationId).
+func (c *Client) PostV2Sandboxes(ctx context.Context, params *PostV2SandboxesParams, body PostV2SandboxesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV2SandboxesRequest(c.Server, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PostV2SandboxesSandboxIDConnectWithBody Connect sandbox (v2)
+//
+// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. The request body is optional; an omitted timeout defaults to 300 seconds.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v2/sandboxes/{sandboxID}/connect (the `PostV2SandboxesSandboxIDConnect` operationId).
+func (c *Client) PostV2SandboxesSandboxIDConnectWithBody(ctx context.Context, sandboxID SandboxID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV2SandboxesSandboxIDConnectRequestWithBody(c.Server, sandboxID, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// PostV2SandboxesSandboxIDConnect Connect sandbox (v2)
+//
+// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. The request body is optional; an omitted timeout defaults to 300 seconds.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v2/sandboxes/{sandboxID}/connect (the `PostV2SandboxesSandboxIDConnect` operationId).
+func (c *Client) PostV2SandboxesSandboxIDConnect(ctx context.Context, sandboxID SandboxID, body PostV2SandboxesSandboxIDConnectJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPostV2SandboxesSandboxIDConnectRequest(c.Server, sandboxID, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // GetV2SandboxesSandboxIDLogs Sandbox logs (v2)
 //
 // Get sandbox logs.
@@ -4255,46 +4958,6 @@ func (c *Client) GetV2SandboxesSandboxIDLogs(ctx context.Context, sandboxID Sand
 // Corresponds with GET /v2/templates (the `GetV2Templates` operationId).
 func (c *Client) GetV2Templates(ctx context.Context, params *GetV2TemplatesParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetV2TemplatesRequest(c.Server, params)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// PostV2TemplatesWithBody Create template (v2)
-//
-// Create a new template.
-//
-// Takes any type of body and a specified content type.
-//
-// Corresponds with POST /v2/templates (the `PostV2Templates` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostV2TemplatesWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostV2TemplatesRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-// PostV2Templates Create template (v2)
-//
-// Create a new template.
-//
-// Takes a body of the `application/json` content type.
-//
-// Corresponds with POST /v2/templates (the `PostV2Templates` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *Client) PostV2Templates(ctx context.Context, body PostV2TemplatesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPostV2TemplatesRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
@@ -4508,80 +5171,6 @@ func (c *Client) GetVolumesVolumeID(ctx context.Context, volumeID VolumeID, reqE
 	return c.Client.Do(req)
 }
 
-// NewPostAccessTokensRequest calls the generic PostAccessTokens builder with application/json body
-func NewPostAccessTokensRequest(server string, body PostAccessTokensJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewPostAccessTokensRequestWithBody(server, "application/json", bodyReader)
-}
-
-// NewPostAccessTokensRequestWithBody constructs an http.Request for the PostAccessTokens method, with any body, and a specified content type
-func NewPostAccessTokensRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/access-tokens")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
-}
-
-// NewDeleteAccessTokensAccessTokenIDRequest constructs an http.Request for the DeleteAccessTokensAccessTokenID method
-func NewDeleteAccessTokensAccessTokenIDRequest(server string, accessTokenID AccessTokenID) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "accessTokenID", accessTokenID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
-	if err != nil {
-		return nil, err
-	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/access-tokens/%s", pathParam0)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
-}
-
 // NewGetAdminSandboxesRunningCountsRequest constructs an http.Request for the GetAdminSandboxesRunningCounts method
 func NewGetAdminSandboxesRunningCountsRequest(server string) (*http.Request, error) {
 	var err error
@@ -4592,6 +5181,40 @@ func NewGetAdminSandboxesRunningCountsRequest(server string) (*http.Request, err
 	}
 
 	operationPath := fmt.Sprintf("/admin/sandboxes/running-counts")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetAdminSandboxesSandboxIDRequest constructs an http.Request for the GetAdminSandboxesSandboxID method
+func NewGetAdminSandboxesSandboxIDRequest(server string, sandboxID SandboxID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "sandboxID", sandboxID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/admin/sandboxes/%s", pathParam0)
 	if operationPath[0] == '/' {
 		operationPath = "." + operationPath
 	}
@@ -4909,6 +5532,842 @@ func NewPatchApiKeysApiKeyIDRequestWithBody(server string, apiKeyID ApiKeyID, co
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetClustersClusterIDRigsRequest constructs an http.Request for the GetClustersClusterIDRigs method
+func NewGetClustersClusterIDRigsRequest(server string, clusterID ClusterID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "clusterID", clusterID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/clusters/%s/rigs", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewDeleteClustersClusterIDRigsInstancesInstanceIDRequest constructs an http.Request for the DeleteClustersClusterIDRigsInstancesInstanceID method
+func NewDeleteClustersClusterIDRigsInstancesInstanceIDRequest(server string, clusterID ClusterID, instanceID string, params *DeleteClustersClusterIDRigsInstancesInstanceIDParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "clusterID", clusterID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "instanceID", instanceID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/clusters/%s/rigs/instances/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "decrementDesired", params.DecrementDesired, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewPutClustersClusterIDRigsRigIDCapacityRequest calls the generic PutClustersClusterIDRigsRigIDCapacity builder with application/json body
+func NewPutClustersClusterIDRigsRigIDCapacityRequest(server string, clusterID ClusterID, rigID RigID, body PutClustersClusterIDRigsRigIDCapacityJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPutClustersClusterIDRigsRigIDCapacityRequestWithBody(server, clusterID, rigID, "application/json", bodyReader)
+}
+
+// NewPutClustersClusterIDRigsRigIDCapacityRequestWithBody constructs an http.Request for the PutClustersClusterIDRigsRigIDCapacity method, with any body, and a specified content type
+func NewPutClustersClusterIDRigsRigIDCapacityRequestWithBody(server string, clusterID ClusterID, rigID RigID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "clusterID", clusterID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "rigID", rigID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/clusters/%s/rigs/%s/capacity", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetClustersClusterIDRigsRigIDErrorsRequest constructs an http.Request for the GetClustersClusterIDRigsRigIDErrors method
+func NewGetClustersClusterIDRigsRigIDErrorsRequest(server string, clusterID ClusterID, rigID RigID, params *GetClustersClusterIDRigsRigIDErrorsParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "clusterID", clusterID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "rigID", rigID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/clusters/%s/rigs/%s/errors", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int32"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetClustersClusterIDRigsRigIDInstancesRequest constructs an http.Request for the GetClustersClusterIDRigsRigIDInstances method
+func NewGetClustersClusterIDRigsRigIDInstancesRequest(server string, clusterID ClusterID, rigID RigID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "clusterID", clusterID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "rigID", rigID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/clusters/%s/rigs/%s/instances", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetEventsSandboxesRequest constructs an http.Request for the GetEventsSandboxes method
+func NewGetEventsSandboxesRequest(server string, params *GetEventsSandboxesParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/sandboxes")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Offset != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "offset", *params.Offset, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int32"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int32"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.OrderAsc != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "orderAsc", *params.OrderAsc, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Types != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "types", *params.Types, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "array", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetEventsSandboxesSandboxIDRequest constructs an http.Request for the GetEventsSandboxesSandboxID method
+func NewGetEventsSandboxesSandboxIDRequest(server string, sandboxID SandboxID, params *GetEventsSandboxesSandboxIDParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "sandboxID", sandboxID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/sandboxes/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Offset != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "offset", *params.Offset, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int32"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int32"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.OrderAsc != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "orderAsc", *params.OrderAsc, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Types != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "types", *params.Types, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "array", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetEventsWebhooksRequest constructs an http.Request for the GetEventsWebhooks method
+func NewGetEventsWebhooksRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/webhooks")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewPostEventsWebhooksRequest calls the generic PostEventsWebhooks builder with application/json body
+func NewPostEventsWebhooksRequest(server string, body PostEventsWebhooksJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostEventsWebhooksRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewPostEventsWebhooksRequestWithBody constructs an http.Request for the PostEventsWebhooks method, with any body, and a specified content type
+func NewPostEventsWebhooksRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/webhooks")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewDeleteEventsWebhooksWebhookIDRequest constructs an http.Request for the DeleteEventsWebhooksWebhookID method
+func NewDeleteEventsWebhooksWebhookIDRequest(server string, webhookID WebhookID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "webhookID", webhookID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/webhooks/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetEventsWebhooksWebhookIDRequest constructs an http.Request for the GetEventsWebhooksWebhookID method
+func NewGetEventsWebhooksWebhookIDRequest(server string, webhookID WebhookID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "webhookID", webhookID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/webhooks/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewPatchEventsWebhooksWebhookIDRequest calls the generic PatchEventsWebhooksWebhookID builder with application/json body
+func NewPatchEventsWebhooksWebhookIDRequest(server string, webhookID WebhookID, body PatchEventsWebhooksWebhookIDJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPatchEventsWebhooksWebhookIDRequestWithBody(server, webhookID, "application/json", bodyReader)
+}
+
+// NewPatchEventsWebhooksWebhookIDRequestWithBody constructs an http.Request for the PatchEventsWebhooksWebhookID method, with any body, and a specified content type
+func NewPatchEventsWebhooksWebhookIDRequestWithBody(server string, webhookID WebhookID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "webhookID", webhookID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/webhooks/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetEventsWebhooksWebhookIDDeliveriesRequest constructs an http.Request for the GetEventsWebhooksWebhookIDDeliveries method
+func NewGetEventsWebhooksWebhookIDDeliveriesRequest(server string, webhookID WebhookID, params *GetEventsWebhooksWebhookIDDeliveriesParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "webhookID", webhookID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/webhooks/%s/deliveries", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Cursor != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "cursor", *params.Cursor, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int32"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.OrderAsc != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "orderAsc", *params.OrderAsc, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Start != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "start", *params.Start, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: "date-time"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.End != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "end", *params.End, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: "date-time"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.DeliveryStatus != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "deliveryStatus", *params.DeliveryStatus, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "array", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.EventType != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "eventType", *params.EventType, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "array", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetEventsWebhooksWebhookIDStatsRequest constructs an http.Request for the GetEventsWebhooksWebhookIDStats method
+func NewGetEventsWebhooksWebhookIDStatsRequest(server string, webhookID WebhookID, params *GetEventsWebhooksWebhookIDStatsParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "webhookID", webhookID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/events/webhooks/%s/stats", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Start != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "start", *params.Start, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: "date-time"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.End != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "end", *params.End, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: "date-time"}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -6386,46 +7845,6 @@ func NewGetTemplatesRequest(server string, params *GetTemplatesParams) (*http.Re
 	return req, nil
 }
 
-// NewPostTemplatesRequest calls the generic PostTemplates builder with application/json body
-func NewPostTemplatesRequest(server string, body PostTemplatesJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewPostTemplatesRequestWithBody(server, "application/json", bodyReader)
-}
-
-// NewPostTemplatesRequestWithBody constructs an http.Request for the PostTemplates method, with any body, and a specified content type
-func NewPostTemplatesRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/templates")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
-}
-
 // NewGetTemplatesAliasesAliasRequest constructs an http.Request for the GetTemplatesAliasesAlias method
 func NewGetTemplatesAliasesAliasRequest(server string, alias string) (*http.Request, error) {
 	var err error
@@ -6690,94 +8109,6 @@ func NewPatchTemplatesTemplateIDRequestWithBody(server string, templateID Templa
 	}
 
 	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
-}
-
-// NewPostTemplatesTemplateIDRequest calls the generic PostTemplatesTemplateID builder with application/json body
-func NewPostTemplatesTemplateIDRequest(server string, templateID TemplateID, body PostTemplatesTemplateIDJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewPostTemplatesTemplateIDRequestWithBody(server, templateID, "application/json", bodyReader)
-}
-
-// NewPostTemplatesTemplateIDRequestWithBody constructs an http.Request for the PostTemplatesTemplateID method, with any body, and a specified content type
-func NewPostTemplatesTemplateIDRequestWithBody(server string, templateID TemplateID, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "templateID", templateID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
-	if err != nil {
-		return nil, err
-	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/templates/%s", pathParam0)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
-}
-
-// NewPostTemplatesTemplateIDBuildsBuildIDRequest constructs an http.Request for the PostTemplatesTemplateIDBuildsBuildID method
-func NewPostTemplatesTemplateIDBuildsBuildIDRequest(server string, templateID TemplateID, buildID BuildID) (*http.Request, error) {
-	var err error
-
-	var pathParam0 string
-
-	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "templateID", templateID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
-	if err != nil {
-		return nil, err
-	}
-
-	var pathParam1 string
-
-	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "buildID", buildID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
-	if err != nil {
-		return nil, err
-	}
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/templates/%s/builds/%s", pathParam0, pathParam1)
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
 
 	return req, nil
 }
@@ -7191,6 +8522,108 @@ func NewGetV2SandboxesRequest(server string, params *GetV2SandboxesParams) (*htt
 	return req, nil
 }
 
+// NewPostV2SandboxesRequest calls the generic PostV2Sandboxes builder with application/json body
+func NewPostV2SandboxesRequest(server string, params *PostV2SandboxesParams, body PostV2SandboxesJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV2SandboxesRequestWithBody(server, params, "application/json", bodyReader)
+}
+
+// NewPostV2SandboxesRequestWithBody constructs an http.Request for the PostV2Sandboxes method, with any body, and a specified content type
+func NewPostV2SandboxesRequestWithBody(server string, params *PostV2SandboxesParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v2/sandboxes")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		if params.IdempotencyKey != nil {
+			var headerParam0 string
+
+			headerParam0, err = runtime.StyleParamWithOptions("simple", false, "Idempotency-Key", *params.IdempotencyKey, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+			if err != nil {
+				return nil, err
+			}
+
+			req.Header.Set("Idempotency-Key", headerParam0)
+		}
+
+	}
+
+	return req, nil
+}
+
+// NewPostV2SandboxesSandboxIDConnectRequest calls the generic PostV2SandboxesSandboxIDConnect builder with application/json body
+func NewPostV2SandboxesSandboxIDConnectRequest(server string, sandboxID SandboxID, body PostV2SandboxesSandboxIDConnectJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewPostV2SandboxesSandboxIDConnectRequestWithBody(server, sandboxID, "application/json", bodyReader)
+}
+
+// NewPostV2SandboxesSandboxIDConnectRequestWithBody constructs an http.Request for the PostV2SandboxesSandboxIDConnect method, with any body, and a specified content type
+func NewPostV2SandboxesSandboxIDConnectRequestWithBody(server string, sandboxID SandboxID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "sandboxID", sandboxID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v2/sandboxes/%s/connect", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewGetV2SandboxesSandboxIDLogsRequest constructs an http.Request for the GetV2SandboxesSandboxIDLogs method
 func NewGetV2SandboxesSandboxIDLogsRequest(server string, sandboxID SandboxID, params *GetV2SandboxesSandboxIDLogsParams) (*http.Request, error) {
 	var err error
@@ -7374,46 +8807,6 @@ func NewGetV2TemplatesRequest(server string, params *GetV2TemplatesParams) (*htt
 	if err != nil {
 		return nil, err
 	}
-
-	return req, nil
-}
-
-// NewPostV2TemplatesRequest calls the generic PostV2Templates builder with application/json body
-func NewPostV2TemplatesRequest(server string, body PostV2TemplatesJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewPostV2TemplatesRequestWithBody(server, "application/json", bodyReader)
-}
-
-// NewPostV2TemplatesRequestWithBody constructs an http.Request for the PostV2Templates method, with any body, and a specified content type
-func NewPostV2TemplatesRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
-
-	serverURL, err := url.Parse(server)
-	if err != nil {
-		return nil, err
-	}
-
-	operationPath := fmt.Sprintf("/v2/templates")
-	if operationPath[0] == '/' {
-		operationPath = "." + operationPath
-	}
-
-	queryURL, err := serverURL.Parse(operationPath)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -7738,37 +9131,6 @@ func WithBaseURL(baseURL string) ClientOption {
 // ClientWithResponsesInterface is the interface specification for the client with responses above.
 type ClientWithResponsesInterface interface {
 
-	// PostAccessTokensWithBodyWithResponse Create access token
-	//
-	// Create a new access token. Deprecated; use an API key (E2B_API_KEY) instead.
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /access-tokens (the `PostAccessTokens` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostAccessTokensWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostAccessTokensResponse, error)
-
-	// PostAccessTokensWithResponse Create access token
-	//
-	// Create a new access token. Deprecated; use an API key (E2B_API_KEY) instead.
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /access-tokens (the `PostAccessTokens` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostAccessTokensWithResponse(ctx context.Context, body PostAccessTokensJSONRequestBody, reqEditors ...RequestEditorFn) (*PostAccessTokensResponse, error)
-
-	// DeleteAccessTokensAccessTokenIDWithResponse Delete access token
-	//
-	// Delete an access token.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with DELETE /access-tokens/{accessTokenID} (the `DeleteAccessTokensAccessTokenID` operationId).
-	DeleteAccessTokensAccessTokenIDWithResponse(ctx context.Context, accessTokenID AccessTokenID, reqEditors ...RequestEditorFn) (*DeleteAccessTokensAccessTokenIDResponse, error)
-
 	// GetAdminSandboxesRunningCountsWithResponse Count running sandboxes by team
 	//
 	// Returns a shared snapshot normally refreshed after five seconds. A
@@ -7778,6 +9140,17 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with GET /admin/sandboxes/running-counts (the `GetAdminSandboxesRunningCounts` operationId).
 	GetAdminSandboxesRunningCountsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetAdminSandboxesRunningCountsResponse, error)
+
+	// GetAdminSandboxesSandboxIDWithResponse Get a sandbox's team and state
+	//
+	// Reads the team and state of a sandbox from its latest lifecycle event.
+	// The state lags the sandbox while that event is in flight. A sandbox
+	// whose events have expired is not found.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /admin/sandboxes/{sandboxID} (the `GetAdminSandboxesSandboxID` operationId).
+	GetAdminSandboxesSandboxIDWithResponse(ctx context.Context, sandboxID SandboxID, reqEditors ...RequestEditorFn) (*GetAdminSandboxesSandboxIDResponse, error)
 
 	// PostAdminTeamsTeamIDApiKeysWithBodyWithResponse Create team API key as admin
 	//
@@ -7878,6 +9251,137 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with PATCH /api-keys/{apiKeyID} (the `PatchApiKeysApiKeyID` operationId).
 	PatchApiKeysApiKeyIDWithResponse(ctx context.Context, apiKeyID ApiKeyID, body PatchApiKeysApiKeyIDJSONRequestBody, reqEditors ...RequestEditorFn) (*PatchApiKeysApiKeyIDResponse, error)
 
+	// GetClustersClusterIDRigsWithResponse List rigs of a cluster
+	//
+	// List the orchestrator node pools ("rigs") of a cluster with a snapshot of their scaling groups. Forwarded to the cluster's edge service; a cluster with no rig management configured returns an empty list, and the local cluster answers 501.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /clusters/{clusterID}/rigs (the `GetClustersClusterIDRigs` operationId).
+	GetClustersClusterIDRigsWithResponse(ctx context.Context, clusterID ClusterID, reqEditors ...RequestEditorFn) (*GetClustersClusterIDRigsResponse, error)
+
+	// DeleteClustersClusterIDRigsInstancesInstanceIDWithResponse Terminate an instance of a rig
+	//
+	// Terminate an instance in whichever rig's scaling group it belongs to. The caller chooses whether the rig shrinks or the instance is replaced.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with DELETE /clusters/{clusterID}/rigs/instances/{instanceID} (the `DeleteClustersClusterIDRigsInstancesInstanceID` operationId).
+	DeleteClustersClusterIDRigsInstancesInstanceIDWithResponse(ctx context.Context, clusterID ClusterID, instanceID string, params *DeleteClustersClusterIDRigsInstancesInstanceIDParams, reqEditors ...RequestEditorFn) (*DeleteClustersClusterIDRigsInstancesInstanceIDResponse, error)
+
+	// PutClustersClusterIDRigsRigIDCapacityWithBodyWithResponse Set the capacity of a rig
+	//
+	// Set the desired instance count on the rig's scaling group. The value is passed to the cloud provider unchanged; violations of the group's bounds or conflicting concurrent operations surface as errors.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PUT /clusters/{clusterID}/rigs/{rigID}/capacity (the `PutClustersClusterIDRigsRigIDCapacity` operationId).
+	PutClustersClusterIDRigsRigIDCapacityWithBodyWithResponse(ctx context.Context, clusterID ClusterID, rigID RigID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutClustersClusterIDRigsRigIDCapacityResponse, error)
+
+	// PutClustersClusterIDRigsRigIDCapacityWithResponse Set the capacity of a rig
+	//
+	// Set the desired instance count on the rig's scaling group. The value is passed to the cloud provider unchanged; violations of the group's bounds or conflicting concurrent operations surface as errors.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PUT /clusters/{clusterID}/rigs/{rigID}/capacity (the `PutClustersClusterIDRigsRigIDCapacity` operationId).
+	PutClustersClusterIDRigsRigIDCapacityWithResponse(ctx context.Context, clusterID ClusterID, rigID RigID, body PutClustersClusterIDRigsRigIDCapacityJSONRequestBody, reqEditors ...RequestEditorFn) (*PutClustersClusterIDRigsRigIDCapacityResponse, error)
+
+	// GetClustersClusterIDRigsRigIDErrorsWithResponse List recent scaling errors of a rig
+	//
+	// List recent scaling errors on the rig's scaling group (e.g. failed instance creations due to resource exhaustion), newest first.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /clusters/{clusterID}/rigs/{rigID}/errors (the `GetClustersClusterIDRigsRigIDErrors` operationId).
+	GetClustersClusterIDRigsRigIDErrorsWithResponse(ctx context.Context, clusterID ClusterID, rigID RigID, params *GetClustersClusterIDRigsRigIDErrorsParams, reqEditors ...RequestEditorFn) (*GetClustersClusterIDRigsRigIDErrorsResponse, error)
+
+	// GetClustersClusterIDRigsRigIDInstancesWithResponse List the instances attached to a rig
+	//
+	// List the instances attached to the rig's scaling group with their creation time and transition state, sorted by instance ID.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /clusters/{clusterID}/rigs/{rigID}/instances (the `GetClustersClusterIDRigsRigIDInstances` operationId).
+	GetClustersClusterIDRigsRigIDInstancesWithResponse(ctx context.Context, clusterID ClusterID, rigID RigID, reqEditors ...RequestEditorFn) (*GetClustersClusterIDRigsRigIDInstancesResponse, error)
+
+	// GetEventsSandboxesWithResponse performs a GET /events/sandboxes (the `GetEventsSandboxes` operationId) request.
+	//
+	// Get all sandbox events for the team associated with the API key.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	GetEventsSandboxesWithResponse(ctx context.Context, params *GetEventsSandboxesParams, reqEditors ...RequestEditorFn) (*GetEventsSandboxesResponse, error)
+
+	// GetEventsSandboxesSandboxIDWithResponse performs a GET /events/sandboxes/{sandboxID} (the `GetEventsSandboxesSandboxID` operationId) request.
+	//
+	// Get sandbox events.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	GetEventsSandboxesSandboxIDWithResponse(ctx context.Context, sandboxID SandboxID, params *GetEventsSandboxesSandboxIDParams, reqEditors ...RequestEditorFn) (*GetEventsSandboxesSandboxIDResponse, error)
+
+	// GetEventsWebhooksWithResponse performs a GET /events/webhooks (the `GetEventsWebhooks` operationId) request.
+	//
+	// List registered webhooks.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	GetEventsWebhooksWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetEventsWebhooksResponse, error)
+
+	// PostEventsWebhooksWithBodyWithResponse performs a POST /events/webhooks (the `PostEventsWebhooks` operationId) request,
+	// with any type of body and a specified content type.
+	//
+	// Register events webhook.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	PostEventsWebhooksWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostEventsWebhooksResponse, error)
+
+	// PostEventsWebhooksWithResponse performs a POST /events/webhooks (the `PostEventsWebhooks` operationId) request.
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Register events webhook.
+	PostEventsWebhooksWithResponse(ctx context.Context, body PostEventsWebhooksJSONRequestBody, reqEditors ...RequestEditorFn) (*PostEventsWebhooksResponse, error)
+
+	// DeleteEventsWebhooksWebhookIDWithResponse performs a DELETE /events/webhooks/{webhookID} (the `DeleteEventsWebhooksWebhookID` operationId) request.
+	//
+	// Delete a registered webhook.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	DeleteEventsWebhooksWebhookIDWithResponse(ctx context.Context, webhookID WebhookID, reqEditors ...RequestEditorFn) (*DeleteEventsWebhooksWebhookIDResponse, error)
+
+	// GetEventsWebhooksWebhookIDWithResponse performs a GET /events/webhooks/{webhookID} (the `GetEventsWebhooksWebhookID` operationId) request.
+	//
+	// Get a registered webhook.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	GetEventsWebhooksWebhookIDWithResponse(ctx context.Context, webhookID WebhookID, reqEditors ...RequestEditorFn) (*GetEventsWebhooksWebhookIDResponse, error)
+
+	// PatchEventsWebhooksWebhookIDWithBodyWithResponse performs a PATCH /events/webhooks/{webhookID} (the `PatchEventsWebhooksWebhookID` operationId) request,
+	// with any type of body and a specified content type.
+	//
+	// Update a registered webhook configuration.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	PatchEventsWebhooksWebhookIDWithBodyWithResponse(ctx context.Context, webhookID WebhookID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PatchEventsWebhooksWebhookIDResponse, error)
+
+	// PatchEventsWebhooksWebhookIDWithResponse performs a PATCH /events/webhooks/{webhookID} (the `PatchEventsWebhooksWebhookID` operationId) request.
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Update a registered webhook configuration.
+	PatchEventsWebhooksWebhookIDWithResponse(ctx context.Context, webhookID WebhookID, body PatchEventsWebhooksWebhookIDJSONRequestBody, reqEditors ...RequestEditorFn) (*PatchEventsWebhooksWebhookIDResponse, error)
+
+	// GetEventsWebhooksWebhookIDDeliveriesWithResponse performs a GET /events/webhooks/{webhookID}/deliveries (the `GetEventsWebhooksWebhookIDDeliveries` operationId) request.
+	//
+	// List webhook delivery attempts.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	GetEventsWebhooksWebhookIDDeliveriesWithResponse(ctx context.Context, webhookID WebhookID, params *GetEventsWebhooksWebhookIDDeliveriesParams, reqEditors ...RequestEditorFn) (*GetEventsWebhooksWebhookIDDeliveriesResponse, error)
+
+	// GetEventsWebhooksWebhookIDStatsWithResponse performs a GET /events/webhooks/{webhookID}/stats (the `GetEventsWebhooksWebhookIDStats` operationId) request.
+	//
+	// Get webhook delivery aggregate stats.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	GetEventsWebhooksWebhookIDStatsWithResponse(ctx context.Context, webhookID WebhookID, params *GetEventsWebhooksWebhookIDStatsParams, reqEditors ...RequestEditorFn) (*GetEventsWebhooksWebhookIDStatsResponse, error)
+
 	// GetHealthWithResponse Health check
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -7934,20 +9438,24 @@ type ClientWithResponsesInterface interface {
 
 	// PostSandboxesWithBodyWithResponse Create sandbox
 	//
-	// Create a sandbox from the template.
+	// Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /sandboxes (the `PostSandboxes` operationId).
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostSandboxesWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostSandboxesResponse, error)
 
 	// PostSandboxesWithResponse Create sandbox
 	//
-	// Create a sandbox from the template.
+	// Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /sandboxes (the `PostSandboxes` operationId).
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostSandboxesWithResponse(ctx context.Context, body PostSandboxesJSONRequestBody, reqEditors ...RequestEditorFn) (*PostSandboxesResponse, error)
 
 	// GetSandboxesMetricsWithResponse List sandbox metrics
@@ -7979,20 +9487,24 @@ type ClientWithResponsesInterface interface {
 
 	// PostSandboxesSandboxIDConnectWithBodyWithResponse Connect sandbox
 	//
-	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /sandboxes/{sandboxID}/connect (the `PostSandboxesSandboxIDConnect` operationId).
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostSandboxesSandboxIDConnectWithBodyWithResponse(ctx context.Context, sandboxID SandboxID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostSandboxesSandboxIDConnectResponse, error)
 
 	// PostSandboxesSandboxIDConnectWithResponse Connect sandbox
 	//
-	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /sandboxes/{sandboxID}/connect (the `PostSandboxesSandboxIDConnect` operationId).
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostSandboxesSandboxIDConnectWithResponse(ctx context.Context, sandboxID SandboxID, body PostSandboxesSandboxIDConnectJSONRequestBody, reqEditors ...RequestEditorFn) (*PostSandboxesSandboxIDConnectResponse, error)
 
 	// PostSandboxesSandboxIDForkWithBodyWithResponse Fork sandbox
@@ -8255,28 +9767,6 @@ type ClientWithResponsesInterface interface {
 	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	GetTemplatesWithResponse(ctx context.Context, params *GetTemplatesParams, reqEditors ...RequestEditorFn) (*GetTemplatesResponse, error)
 
-	// PostTemplatesWithBodyWithResponse Create template
-	//
-	// Create a new template.
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /templates (the `PostTemplates` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostTemplatesResponse, error)
-
-	// PostTemplatesWithResponse Create template
-	//
-	// Create a new template.
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /templates (the `PostTemplates` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesWithResponse(ctx context.Context, body PostTemplatesJSONRequestBody, reqEditors ...RequestEditorFn) (*PostTemplatesResponse, error)
-
 	// GetTemplatesAliasesAliasWithResponse Check template alias
 	//
 	// Check if template with given alias exists.
@@ -8358,39 +9848,6 @@ type ClientWithResponsesInterface interface {
 	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PatchTemplatesTemplateIDWithResponse(ctx context.Context, templateID TemplateID, body PatchTemplatesTemplateIDJSONRequestBody, reqEditors ...RequestEditorFn) (*PatchTemplatesTemplateIDResponse, error)
 
-	// PostTemplatesTemplateIDWithBodyWithResponse Rebuild template
-	//
-	// Rebuild an template.
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /templates/{templateID} (the `PostTemplatesTemplateID` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesTemplateIDWithBodyWithResponse(ctx context.Context, templateID TemplateID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostTemplatesTemplateIDResponse, error)
-
-	// PostTemplatesTemplateIDWithResponse Rebuild template
-	//
-	// Rebuild an template.
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /templates/{templateID} (the `PostTemplatesTemplateID` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesTemplateIDWithResponse(ctx context.Context, templateID TemplateID, body PostTemplatesTemplateIDJSONRequestBody, reqEditors ...RequestEditorFn) (*PostTemplatesTemplateIDResponse, error)
-
-	// PostTemplatesTemplateIDBuildsBuildIDWithResponse Start template build
-	//
-	// Start the build.
-	//
-	// Returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /templates/{templateID}/builds/{buildID} (the `PostTemplatesTemplateIDBuildsBuildID` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostTemplatesTemplateIDBuildsBuildIDWithResponse(ctx context.Context, templateID TemplateID, buildID BuildID, reqEditors ...RequestEditorFn) (*PostTemplatesTemplateIDBuildsBuildIDResponse, error)
-
 	// GetTemplatesTemplateIDBuildsBuildIDLogsWithResponse Template build logs
 	//
 	// Get template build logs.
@@ -8436,6 +9893,42 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with GET /v2/sandboxes (the `GetV2Sandboxes` operationId).
 	GetV2SandboxesWithResponse(ctx context.Context, params *GetV2SandboxesParams, reqEditors ...RequestEditorFn) (*GetV2SandboxesResponse, error)
 
+	// PostV2SandboxesWithBodyWithResponse Create sandbox (v2)
+	//
+	// Create a sandbox from the template. All system communication with the sandbox is secured.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v2/sandboxes (the `PostV2Sandboxes` operationId).
+	PostV2SandboxesWithBodyWithResponse(ctx context.Context, params *PostV2SandboxesParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV2SandboxesResponse, error)
+
+	// PostV2SandboxesWithResponse Create sandbox (v2)
+	//
+	// Create a sandbox from the template. All system communication with the sandbox is secured.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v2/sandboxes (the `PostV2Sandboxes` operationId).
+	PostV2SandboxesWithResponse(ctx context.Context, params *PostV2SandboxesParams, body PostV2SandboxesJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV2SandboxesResponse, error)
+
+	// PostV2SandboxesSandboxIDConnectWithBodyWithResponse Connect sandbox (v2)
+	//
+	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. The request body is optional; an omitted timeout defaults to 300 seconds.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v2/sandboxes/{sandboxID}/connect (the `PostV2SandboxesSandboxIDConnect` operationId).
+	PostV2SandboxesSandboxIDConnectWithBodyWithResponse(ctx context.Context, sandboxID SandboxID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV2SandboxesSandboxIDConnectResponse, error)
+
+	// PostV2SandboxesSandboxIDConnectWithResponse Connect sandbox (v2)
+	//
+	// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. The request body is optional; an omitted timeout defaults to 300 seconds.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v2/sandboxes/{sandboxID}/connect (the `PostV2SandboxesSandboxIDConnect` operationId).
+	PostV2SandboxesSandboxIDConnectWithResponse(ctx context.Context, sandboxID SandboxID, body PostV2SandboxesSandboxIDConnectJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV2SandboxesSandboxIDConnectResponse, error)
+
 	// GetV2SandboxesSandboxIDLogsWithResponse Sandbox logs (v2)
 	//
 	// Get sandbox logs.
@@ -8453,28 +9946,6 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with GET /v2/templates (the `GetV2Templates` operationId).
 	GetV2TemplatesWithResponse(ctx context.Context, params *GetV2TemplatesParams, reqEditors ...RequestEditorFn) (*GetV2TemplatesResponse, error)
-
-	// PostV2TemplatesWithBodyWithResponse Create template (v2)
-	//
-	// Create a new template.
-	//
-	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /v2/templates (the `PostV2Templates` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostV2TemplatesWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV2TemplatesResponse, error)
-
-	// PostV2TemplatesWithResponse Create template (v2)
-	//
-	// Create a new template.
-	//
-	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-	//
-	// Corresponds with POST /v2/templates (the `PostV2Templates` operationId).
-	//
-	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-	PostV2TemplatesWithResponse(ctx context.Context, body PostV2TemplatesJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV2TemplatesResponse, error)
 
 	// PatchV2TemplatesTemplateIDWithBodyWithResponse Update template (v2)
 	//
@@ -8576,121 +10047,9 @@ type ClientWithResponsesInterface interface {
 	GetVolumesVolumeIDWithResponse(ctx context.Context, volumeID VolumeID, reqEditors ...RequestEditorFn) (*GetVolumesVolumeIDResponse, error)
 }
 
-type PostAccessTokensResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON201 the response for an HTTP 201 `application/json` response
-	JSON201 *CreatedAccessToken
-	// JSON401 the response for an HTTP 401 `application/json` response
-	JSON401 *N401
-	// JSON410 the response for an HTTP 410 `application/json` response
-	JSON410 *N410
-	// JSON500 the response for an HTTP 500 `application/json` response
-	JSON500 *N500
-}
-
-// GetJSON201 returns the response for an HTTP 201 `application/json` response
-func (r PostAccessTokensResponse) GetJSON201() *CreatedAccessToken {
-	return r.JSON201
-}
-
-// GetJSON401 returns the response for an HTTP 401 `application/json` response
-func (r PostAccessTokensResponse) GetJSON401() *N401 {
-	return r.JSON401
-}
-
-// GetJSON410 returns the response for an HTTP 410 `application/json` response
-func (r PostAccessTokensResponse) GetJSON410() *N410 {
-	return r.JSON410
-}
-
-// GetJSON500 returns the response for an HTTP 500 `application/json` response
-func (r PostAccessTokensResponse) GetJSON500() *N500 {
-	return r.JSON500
-}
-
-// GetBody returns the raw response body bytes
-func (r PostAccessTokensResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r PostAccessTokensResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r PostAccessTokensResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r PostAccessTokensResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type DeleteAccessTokensAccessTokenIDResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON401 the response for an HTTP 401 `application/json` response
-	JSON401 *N401
-	// JSON404 the response for an HTTP 404 `application/json` response
-	JSON404 *N404
-	// JSON500 the response for an HTTP 500 `application/json` response
-	JSON500 *N500
-}
-
-// GetJSON401 returns the response for an HTTP 401 `application/json` response
-func (r DeleteAccessTokensAccessTokenIDResponse) GetJSON401() *N401 {
-	return r.JSON401
-}
-
-// GetJSON404 returns the response for an HTTP 404 `application/json` response
-func (r DeleteAccessTokensAccessTokenIDResponse) GetJSON404() *N404 {
-	return r.JSON404
-}
-
-// GetJSON500 returns the response for an HTTP 500 `application/json` response
-func (r DeleteAccessTokensAccessTokenIDResponse) GetJSON500() *N500 {
-	return r.JSON500
-}
-
-// GetBody returns the raw response body bytes
-func (r DeleteAccessTokensAccessTokenIDResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r DeleteAccessTokensAccessTokenIDResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r DeleteAccessTokensAccessTokenIDResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r DeleteAccessTokensAccessTokenIDResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
+// GetAdminSandboxesRunningCountsResponse429Headers the declared response headers of an HTTP 429 response for GetAdminSandboxesRunningCounts
+type GetAdminSandboxesRunningCountsResponse429Headers struct {
+	RetryAfter *int
 }
 
 type GetAdminSandboxesRunningCountsResponse struct {
@@ -8700,8 +10059,12 @@ type GetAdminSandboxesRunningCountsResponse struct {
 	JSON200 *AdminTeamRunningSandboxCounts
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetAdminSandboxesRunningCountsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -8712,6 +10075,11 @@ func (r GetAdminSandboxesRunningCountsResponse) GetJSON200() *AdminTeamRunningSa
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetAdminSandboxesRunningCountsResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetAdminSandboxesRunningCountsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -8748,6 +10116,94 @@ func (r GetAdminSandboxesRunningCountsResponse) ContentType() string {
 	return ""
 }
 
+// GetAdminSandboxesSandboxIDResponse429Headers the declared response headers of an HTTP 429 response for GetAdminSandboxesSandboxID
+type GetAdminSandboxesSandboxIDResponse429Headers struct {
+	RetryAfter *int
+}
+
+type GetAdminSandboxesSandboxIDResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *AdminSandbox
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetAdminSandboxesSandboxIDResponse429Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetAdminSandboxesSandboxIDResponse) GetJSON200() *AdminSandbox {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r GetAdminSandboxesSandboxIDResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetAdminSandboxesSandboxIDResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetAdminSandboxesSandboxIDResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetAdminSandboxesSandboxIDResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetAdminSandboxesSandboxIDResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetAdminSandboxesSandboxIDResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetAdminSandboxesSandboxIDResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetAdminSandboxesSandboxIDResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetAdminSandboxesSandboxIDResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// PostAdminTeamsTeamIDApiKeysResponse429Headers the declared response headers of an HTTP 429 response for PostAdminTeamsTeamIDApiKeys
+type PostAdminTeamsTeamIDApiKeysResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostAdminTeamsTeamIDApiKeysResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -8761,8 +10217,12 @@ type PostAdminTeamsTeamIDApiKeysResponse struct {
 	JSON403 *N403
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostAdminTeamsTeamIDApiKeysResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -8788,6 +10248,11 @@ func (r PostAdminTeamsTeamIDApiKeysResponse) GetJSON403() *N403 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r PostAdminTeamsTeamIDApiKeysResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostAdminTeamsTeamIDApiKeysResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -8824,6 +10289,11 @@ func (r PostAdminTeamsTeamIDApiKeysResponse) ContentType() string {
 	return ""
 }
 
+// DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse429Headers the declared response headers of an HTTP 429 response for DeleteAdminTeamsTeamIDApiKeysApiKeyID
+type DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -8833,8 +10303,12 @@ type DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse429Headers
 }
 
 // GetJSON400 returns the response for an HTTP 400 `application/json` response
@@ -8850,6 +10324,11 @@ func (r DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -8886,6 +10365,11 @@ func (r DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse) ContentType() string {
 	return ""
 }
 
+// PostAdminTeamsTeamIDBuildsCancelResponse429Headers the declared response headers of an HTTP 429 response for PostAdminTeamsTeamIDBuildsCancel
+type PostAdminTeamsTeamIDBuildsCancelResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostAdminTeamsTeamIDBuildsCancelResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -8895,8 +10379,12 @@ type PostAdminTeamsTeamIDBuildsCancelResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostAdminTeamsTeamIDBuildsCancelResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -8912,6 +10400,11 @@ func (r PostAdminTeamsTeamIDBuildsCancelResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r PostAdminTeamsTeamIDBuildsCancelResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostAdminTeamsTeamIDBuildsCancelResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -8948,6 +10441,11 @@ func (r PostAdminTeamsTeamIDBuildsCancelResponse) ContentType() string {
 	return ""
 }
 
+// PostAdminTeamsTeamIDSandboxesKillResponse429Headers the declared response headers of an HTTP 429 response for PostAdminTeamsTeamIDSandboxesKill
+type PostAdminTeamsTeamIDSandboxesKillResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostAdminTeamsTeamIDSandboxesKillResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -8957,8 +10455,12 @@ type PostAdminTeamsTeamIDSandboxesKillResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostAdminTeamsTeamIDSandboxesKillResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -8974,6 +10476,11 @@ func (r PostAdminTeamsTeamIDSandboxesKillResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r PostAdminTeamsTeamIDSandboxesKillResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostAdminTeamsTeamIDSandboxesKillResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9010,6 +10517,11 @@ func (r PostAdminTeamsTeamIDSandboxesKillResponse) ContentType() string {
 	return ""
 }
 
+// GetApiKeysResponse429Headers the declared response headers of an HTTP 429 response for GetApiKeys
+type GetApiKeysResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetApiKeysResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9017,8 +10529,12 @@ type GetApiKeysResponse struct {
 	JSON200 *[]TeamAPIKey
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetApiKeysResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -9029,6 +10545,11 @@ func (r GetApiKeysResponse) GetJSON200() *[]TeamAPIKey {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetApiKeysResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetApiKeysResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9065,6 +10586,11 @@ func (r GetApiKeysResponse) ContentType() string {
 	return ""
 }
 
+// PostApiKeysResponse429Headers the declared response headers of an HTTP 429 response for PostApiKeys
+type PostApiKeysResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostApiKeysResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9072,8 +10598,12 @@ type PostApiKeysResponse struct {
 	JSON201 *CreatedTeamAPIKey
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostApiKeysResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -9084,6 +10614,11 @@ func (r PostApiKeysResponse) GetJSON201() *CreatedTeamAPIKey {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r PostApiKeysResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostApiKeysResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9120,6 +10655,11 @@ func (r PostApiKeysResponse) ContentType() string {
 	return ""
 }
 
+// DeleteApiKeysApiKeyIDResponse429Headers the declared response headers of an HTTP 429 response for DeleteApiKeysApiKeyID
+type DeleteApiKeysApiKeyIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type DeleteApiKeysApiKeyIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9127,8 +10667,12 @@ type DeleteApiKeysApiKeyIDResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *DeleteApiKeysApiKeyIDResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -9139,6 +10683,11 @@ func (r DeleteApiKeysApiKeyIDResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r DeleteApiKeysApiKeyIDResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r DeleteApiKeysApiKeyIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9175,6 +10724,11 @@ func (r DeleteApiKeysApiKeyIDResponse) ContentType() string {
 	return ""
 }
 
+// PatchApiKeysApiKeyIDResponse429Headers the declared response headers of an HTTP 429 response for PatchApiKeysApiKeyID
+type PatchApiKeysApiKeyIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PatchApiKeysApiKeyIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9182,8 +10736,12 @@ type PatchApiKeysApiKeyIDResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PatchApiKeysApiKeyIDResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -9194,6 +10752,11 @@ func (r PatchApiKeysApiKeyIDResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r PatchApiKeysApiKeyIDResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PatchApiKeysApiKeyIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9230,16 +10793,1059 @@ func (r PatchApiKeysApiKeyIDResponse) ContentType() string {
 	return ""
 }
 
+// GetClustersClusterIDRigsResponse429Headers the declared response headers of an HTTP 429 response for GetClustersClusterIDRigs
+type GetClustersClusterIDRigsResponse429Headers struct {
+	RetryAfter *int
+}
+
+type GetClustersClusterIDRigsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]Rig
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+	// JSON501 the response for an HTTP 501 `application/json` response
+	JSON501 *N501
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetClustersClusterIDRigsResponse429Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetClustersClusterIDRigsResponse) GetJSON200() *[]Rig {
+	return r.JSON200
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetClustersClusterIDRigsResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetClustersClusterIDRigsResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetClustersClusterIDRigsResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetClustersClusterIDRigsResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetJSON501 returns the response for an HTTP 501 `application/json` response
+func (r GetClustersClusterIDRigsResponse) GetJSON501() *N501 {
+	return r.JSON501
+}
+
+// GetBody returns the raw response body bytes
+func (r GetClustersClusterIDRigsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetClustersClusterIDRigsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetClustersClusterIDRigsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetClustersClusterIDRigsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// DeleteClustersClusterIDRigsInstancesInstanceIDResponse429Headers the declared response headers of an HTTP 429 response for DeleteClustersClusterIDRigsInstancesInstanceID
+type DeleteClustersClusterIDRigsInstancesInstanceIDResponse429Headers struct {
+	RetryAfter *int
+}
+
+type DeleteClustersClusterIDRigsInstancesInstanceIDResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+	// JSON501 the response for an HTTP 501 `application/json` response
+	JSON501 *N501
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *DeleteClustersClusterIDRigsInstancesInstanceIDResponse429Headers
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) GetJSON409() *N409 {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetJSON501 returns the response for an HTTP 501 `application/json` response
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) GetJSON501() *N501 {
+	return r.JSON501
+}
+
+// GetBody returns the raw response body bytes
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r DeleteClustersClusterIDRigsInstancesInstanceIDResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// PutClustersClusterIDRigsRigIDCapacityResponse429Headers the declared response headers of an HTTP 429 response for PutClustersClusterIDRigsRigIDCapacity
+type PutClustersClusterIDRigsRigIDCapacityResponse429Headers struct {
+	RetryAfter *int
+}
+
+type PutClustersClusterIDRigsRigIDCapacityResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+	// JSON501 the response for an HTTP 501 `application/json` response
+	JSON501 *N501
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PutClustersClusterIDRigsRigIDCapacityResponse429Headers
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) GetJSON409() *N409 {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetJSON501 returns the response for an HTTP 501 `application/json` response
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) GetJSON501() *N501 {
+	return r.JSON501
+}
+
+// GetBody returns the raw response body bytes
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PutClustersClusterIDRigsRigIDCapacityResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// GetClustersClusterIDRigsRigIDErrorsResponse429Headers the declared response headers of an HTTP 429 response for GetClustersClusterIDRigsRigIDErrors
+type GetClustersClusterIDRigsRigIDErrorsResponse429Headers struct {
+	RetryAfter *int
+}
+
+type GetClustersClusterIDRigsRigIDErrorsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]RigError
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+	// JSON501 the response for an HTTP 501 `application/json` response
+	JSON501 *N501
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetClustersClusterIDRigsRigIDErrorsResponse429Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) GetJSON200() *[]RigError {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetJSON501 returns the response for an HTTP 501 `application/json` response
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) GetJSON501() *N501 {
+	return r.JSON501
+}
+
+// GetBody returns the raw response body bytes
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetClustersClusterIDRigsRigIDErrorsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// GetClustersClusterIDRigsRigIDInstancesResponse429Headers the declared response headers of an HTTP 429 response for GetClustersClusterIDRigsRigIDInstances
+type GetClustersClusterIDRigsRigIDInstancesResponse429Headers struct {
+	RetryAfter *int
+}
+
+type GetClustersClusterIDRigsRigIDInstancesResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]RigInstance
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+	// JSON501 the response for an HTTP 501 `application/json` response
+	JSON501 *N501
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetClustersClusterIDRigsRigIDInstancesResponse429Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) GetJSON200() *[]RigInstance {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetJSON501 returns the response for an HTTP 501 `application/json` response
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) GetJSON501() *N501 {
+	return r.JSON501
+}
+
+// GetBody returns the raw response body bytes
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetClustersClusterIDRigsRigIDInstancesResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetEventsSandboxesResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]SandboxEvent
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetEventsSandboxesResponse) GetJSON200() *[]SandboxEvent {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r GetEventsSandboxesResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetEventsSandboxesResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetEventsSandboxesResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetEventsSandboxesResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetEventsSandboxesResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetEventsSandboxesResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetEventsSandboxesResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetEventsSandboxesResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetEventsSandboxesSandboxIDResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]SandboxEvent
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetEventsSandboxesSandboxIDResponse) GetJSON200() *[]SandboxEvent {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r GetEventsSandboxesSandboxIDResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetEventsSandboxesSandboxIDResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetEventsSandboxesSandboxIDResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetEventsSandboxesSandboxIDResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetEventsSandboxesSandboxIDResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetEventsSandboxesSandboxIDResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetEventsSandboxesSandboxIDResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetEventsSandboxesSandboxIDResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetEventsWebhooksResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]WebhookDetail
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetEventsWebhooksResponse) GetJSON200() *[]WebhookDetail {
+	return r.JSON200
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetEventsWebhooksResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetEventsWebhooksResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetEventsWebhooksResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetEventsWebhooksResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetEventsWebhooksResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetEventsWebhooksResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetEventsWebhooksResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type PostEventsWebhooksResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *WebhookCreation
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r PostEventsWebhooksResponse) GetJSON201() *WebhookCreation {
+	return r.JSON201
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r PostEventsWebhooksResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r PostEventsWebhooksResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r PostEventsWebhooksResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r PostEventsWebhooksResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r PostEventsWebhooksResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r PostEventsWebhooksResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostEventsWebhooksResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PostEventsWebhooksResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type DeleteEventsWebhooksWebhookIDResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r DeleteEventsWebhooksWebhookIDResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r DeleteEventsWebhooksWebhookIDResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r DeleteEventsWebhooksWebhookIDResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r DeleteEventsWebhooksWebhookIDResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r DeleteEventsWebhooksWebhookIDResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeleteEventsWebhooksWebhookIDResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r DeleteEventsWebhooksWebhookIDResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetEventsWebhooksWebhookIDResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *WebhookDetail
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetEventsWebhooksWebhookIDResponse) GetJSON200() *WebhookDetail {
+	return r.JSON200
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetEventsWebhooksWebhookIDResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetEventsWebhooksWebhookIDResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetEventsWebhooksWebhookIDResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetEventsWebhooksWebhookIDResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetEventsWebhooksWebhookIDResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetEventsWebhooksWebhookIDResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetEventsWebhooksWebhookIDResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type PatchEventsWebhooksWebhookIDResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *WebhookDetail
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r PatchEventsWebhooksWebhookIDResponse) GetJSON200() *WebhookDetail {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r PatchEventsWebhooksWebhookIDResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r PatchEventsWebhooksWebhookIDResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r PatchEventsWebhooksWebhookIDResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r PatchEventsWebhooksWebhookIDResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r PatchEventsWebhooksWebhookIDResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r PatchEventsWebhooksWebhookIDResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PatchEventsWebhooksWebhookIDResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PatchEventsWebhooksWebhookIDResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetEventsWebhooksWebhookIDDeliveriesResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *WebhookDeliveriesListPayload
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) GetJSON200() *WebhookDeliveriesListPayload {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetEventsWebhooksWebhookIDDeliveriesResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetEventsWebhooksWebhookIDStatsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *WebhookDeliveryStats
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetEventsWebhooksWebhookIDStatsResponse) GetJSON200() *WebhookDeliveryStats {
+	return r.JSON200
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r GetEventsWebhooksWebhookIDStatsResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetEventsWebhooksWebhookIDStatsResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r GetEventsWebhooksWebhookIDStatsResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetBody returns the raw response body bytes
+func (r GetEventsWebhooksWebhookIDStatsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetEventsWebhooksWebhookIDStatsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetEventsWebhooksWebhookIDStatsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetEventsWebhooksWebhookIDStatsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// GetHealthResponse429Headers the declared response headers of an HTTP 429 response for GetHealth
+type GetHealthResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetHealthResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetHealthResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetHealthResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetHealthResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetBody returns the raw response body bytes
@@ -9271,6 +11877,11 @@ func (r GetHealthResponse) ContentType() string {
 	return ""
 }
 
+// GetNodesResponse429Headers the declared response headers of an HTTP 429 response for GetNodes
+type GetNodesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetNodesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9278,8 +11889,12 @@ type GetNodesResponse struct {
 	JSON200 *[]Node
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetNodesResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -9290,6 +11905,11 @@ func (r GetNodesResponse) GetJSON200() *[]Node {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetNodesResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetNodesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9326,6 +11946,11 @@ func (r GetNodesResponse) ContentType() string {
 	return ""
 }
 
+// GetNodesNodeIDResponse429Headers the declared response headers of an HTTP 429 response for GetNodesNodeID
+type GetNodesNodeIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetNodesNodeIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9335,8 +11960,12 @@ type GetNodesNodeIDResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetNodesNodeIDResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -9352,6 +11981,11 @@ func (r GetNodesNodeIDResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetNodesNodeIDResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetNodesNodeIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9388,6 +12022,11 @@ func (r GetNodesNodeIDResponse) ContentType() string {
 	return ""
 }
 
+// PostNodesNodeIDResponse429Headers the declared response headers of an HTTP 429 response for PostNodesNodeID
+type PostNodesNodeIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostNodesNodeIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9397,8 +12036,12 @@ type PostNodesNodeIDResponse struct {
 	JSON404 *N404
 	// JSON409 the response for an HTTP 409 `application/json` response
 	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostNodesNodeIDResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -9414,6 +12057,11 @@ func (r PostNodesNodeIDResponse) GetJSON404() *N404 {
 // GetJSON409 returns the response for an HTTP 409 `application/json` response
 func (r PostNodesNodeIDResponse) GetJSON409() *N409 {
 	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostNodesNodeIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9450,6 +12098,11 @@ func (r PostNodesNodeIDResponse) ContentType() string {
 	return ""
 }
 
+// GetSandboxesResponse429Headers the declared response headers of an HTTP 429 response for GetSandboxes
+type GetSandboxesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetSandboxesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9459,8 +12112,12 @@ type GetSandboxesResponse struct {
 	JSON400 *N400
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetSandboxesResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -9476,6 +12133,11 @@ func (r GetSandboxesResponse) GetJSON400() *N400 {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetSandboxesResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetSandboxesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9512,6 +12174,11 @@ func (r GetSandboxesResponse) ContentType() string {
 	return ""
 }
 
+// PostSandboxesResponse429Headers the declared response headers of an HTTP 429 response for PostSandboxes
+type PostSandboxesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSandboxesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9521,12 +12188,16 @@ type PostSandboxesResponse struct {
 	JSON400 *N400
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
 	// JSON503 the response for an HTTP 503 `application/json` response
 	JSON503 *N503
 	// JSON504 the response for an HTTP 504 `application/json` response
 	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSandboxesResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -9542,6 +12213,11 @@ func (r PostSandboxesResponse) GetJSON400() *N400 {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r PostSandboxesResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostSandboxesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9588,6 +12264,11 @@ func (r PostSandboxesResponse) ContentType() string {
 	return ""
 }
 
+// GetSandboxesMetricsResponse429Headers the declared response headers of an HTTP 429 response for GetSandboxesMetrics
+type GetSandboxesMetricsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetSandboxesMetricsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9597,8 +12278,12 @@ type GetSandboxesMetricsResponse struct {
 	JSON400 *N400
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetSandboxesMetricsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -9614,6 +12299,11 @@ func (r GetSandboxesMetricsResponse) GetJSON400() *N400 {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetSandboxesMetricsResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetSandboxesMetricsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9650,6 +12340,11 @@ func (r GetSandboxesMetricsResponse) ContentType() string {
 	return ""
 }
 
+// DeleteSandboxesSandboxIDResponse429Headers the declared response headers of an HTTP 429 response for DeleteSandboxesSandboxID
+type DeleteSandboxesSandboxIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type DeleteSandboxesSandboxIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9657,8 +12352,12 @@ type DeleteSandboxesSandboxIDResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *DeleteSandboxesSandboxIDResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -9669,6 +12368,11 @@ func (r DeleteSandboxesSandboxIDResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r DeleteSandboxesSandboxIDResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r DeleteSandboxesSandboxIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9705,6 +12409,11 @@ func (r DeleteSandboxesSandboxIDResponse) ContentType() string {
 	return ""
 }
 
+// GetSandboxesSandboxIDResponse429Headers the declared response headers of an HTTP 429 response for GetSandboxesSandboxID
+type GetSandboxesSandboxIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetSandboxesSandboxIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9714,8 +12423,12 @@ type GetSandboxesSandboxIDResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetSandboxesSandboxIDResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -9731,6 +12444,11 @@ func (r GetSandboxesSandboxIDResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetSandboxesSandboxIDResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetSandboxesSandboxIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9767,6 +12485,11 @@ func (r GetSandboxesSandboxIDResponse) ContentType() string {
 	return ""
 }
 
+// PostSandboxesSandboxIDConnectResponse429Headers the declared response headers of an HTTP 429 response for PostSandboxesSandboxIDConnect
+type PostSandboxesSandboxIDConnectResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSandboxesSandboxIDConnectResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9782,12 +12505,16 @@ type PostSandboxesSandboxIDConnectResponse struct {
 	JSON404 *N404
 	// JSON409 the response for an HTTP 409 `application/json` response
 	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
 	// JSON503 the response for an HTTP 503 `application/json` response
 	JSON503 *N503
 	// JSON504 the response for an HTTP 504 `application/json` response
 	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSandboxesSandboxIDConnectResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -9818,6 +12545,11 @@ func (r PostSandboxesSandboxIDConnectResponse) GetJSON404() *N404 {
 // GetJSON409 returns the response for an HTTP 409 `application/json` response
 func (r PostSandboxesSandboxIDConnectResponse) GetJSON409() *N409 {
 	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostSandboxesSandboxIDConnectResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9864,6 +12596,11 @@ func (r PostSandboxesSandboxIDConnectResponse) ContentType() string {
 	return ""
 }
 
+// PostSandboxesSandboxIDForkResponse429Headers the declared response headers of an HTTP 429 response for PostSandboxesSandboxIDFork
+type PostSandboxesSandboxIDForkResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSandboxesSandboxIDForkResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9875,10 +12612,14 @@ type PostSandboxesSandboxIDForkResponse struct {
 	JSON404 *N404
 	// JSON409 the response for an HTTP 409 `application/json` response
 	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
 	// JSON503 the response for an HTTP 503 `application/json` response
 	JSON503 *N503
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSandboxesSandboxIDForkResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -9899,6 +12640,11 @@ func (r PostSandboxesSandboxIDForkResponse) GetJSON404() *N404 {
 // GetJSON409 returns the response for an HTTP 409 `application/json` response
 func (r PostSandboxesSandboxIDForkResponse) GetJSON409() *N409 {
 	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostSandboxesSandboxIDForkResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -9940,6 +12686,11 @@ func (r PostSandboxesSandboxIDForkResponse) ContentType() string {
 	return ""
 }
 
+// GetSandboxesSandboxIDLogsResponse429Headers the declared response headers of an HTTP 429 response for GetSandboxesSandboxIDLogs
+type GetSandboxesSandboxIDLogsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetSandboxesSandboxIDLogsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -9949,8 +12700,12 @@ type GetSandboxesSandboxIDLogsResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetSandboxesSandboxIDLogsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -9966,6 +12721,11 @@ func (r GetSandboxesSandboxIDLogsResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetSandboxesSandboxIDLogsResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetSandboxesSandboxIDLogsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -10002,6 +12762,11 @@ func (r GetSandboxesSandboxIDLogsResponse) ContentType() string {
 	return ""
 }
 
+// GetSandboxesSandboxIDMetricsResponse429Headers the declared response headers of an HTTP 429 response for GetSandboxesSandboxIDMetrics
+type GetSandboxesSandboxIDMetricsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetSandboxesSandboxIDMetricsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10013,8 +12778,12 @@ type GetSandboxesSandboxIDMetricsResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetSandboxesSandboxIDMetricsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -10035,6 +12804,11 @@ func (r GetSandboxesSandboxIDMetricsResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetSandboxesSandboxIDMetricsResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetSandboxesSandboxIDMetricsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -10071,6 +12845,11 @@ func (r GetSandboxesSandboxIDMetricsResponse) ContentType() string {
 	return ""
 }
 
+// PutSandboxesSandboxIDNetworkResponse429Headers the declared response headers of an HTTP 429 response for PutSandboxesSandboxIDNetwork
+type PutSandboxesSandboxIDNetworkResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PutSandboxesSandboxIDNetworkResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10080,8 +12859,12 @@ type PutSandboxesSandboxIDNetworkResponse struct {
 	JSON404 *N404
 	// JSON409 the response for an HTTP 409 `application/json` response
 	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PutSandboxesSandboxIDNetworkResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -10097,6 +12880,11 @@ func (r PutSandboxesSandboxIDNetworkResponse) GetJSON404() *N404 {
 // GetJSON409 returns the response for an HTTP 409 `application/json` response
 func (r PutSandboxesSandboxIDNetworkResponse) GetJSON409() *N409 {
 	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PutSandboxesSandboxIDNetworkResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -10133,6 +12921,11 @@ func (r PutSandboxesSandboxIDNetworkResponse) ContentType() string {
 	return ""
 }
 
+// PostSandboxesSandboxIDPauseResponse429Headers the declared response headers of an HTTP 429 response for PostSandboxesSandboxIDPause
+type PostSandboxesSandboxIDPauseResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSandboxesSandboxIDPauseResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10142,8 +12935,14 @@ type PostSandboxesSandboxIDPauseResponse struct {
 	JSON404 *N404
 	// JSON409 the response for an HTTP 409 `application/json` response
 	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// JSON503 the response for an HTTP 503 `application/json` response
+	JSON503 *N503
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSandboxesSandboxIDPauseResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -10161,9 +12960,19 @@ func (r PostSandboxesSandboxIDPauseResponse) GetJSON409() *N409 {
 	return r.JSON409
 }
 
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostSandboxesSandboxIDPauseResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
 func (r PostSandboxesSandboxIDPauseResponse) GetJSON500() *N500 {
 	return r.JSON500
+}
+
+// GetJSON503 returns the response for an HTTP 503 `application/json` response
+func (r PostSandboxesSandboxIDPauseResponse) GetJSON503() *N503 {
+	return r.JSON503
 }
 
 // GetBody returns the raw response body bytes
@@ -10195,6 +13004,11 @@ func (r PostSandboxesSandboxIDPauseResponse) ContentType() string {
 	return ""
 }
 
+// PostSandboxesSandboxIDRefreshesResponse429Headers the declared response headers of an HTTP 429 response for PostSandboxesSandboxIDRefreshes
+type PostSandboxesSandboxIDRefreshesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSandboxesSandboxIDRefreshesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10202,6 +13016,10 @@ type PostSandboxesSandboxIDRefreshesResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSandboxesSandboxIDRefreshesResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -10212,6 +13030,11 @@ func (r PostSandboxesSandboxIDRefreshesResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r PostSandboxesSandboxIDRefreshesResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostSandboxesSandboxIDRefreshesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetBody returns the raw response body bytes
@@ -10243,6 +13066,11 @@ func (r PostSandboxesSandboxIDRefreshesResponse) ContentType() string {
 	return ""
 }
 
+// PostSandboxesSandboxIDResumeResponse429Headers the declared response headers of an HTTP 429 response for PostSandboxesSandboxIDResume
+type PostSandboxesSandboxIDResumeResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSandboxesSandboxIDResumeResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10256,12 +13084,16 @@ type PostSandboxesSandboxIDResumeResponse struct {
 	JSON404 *N404
 	// JSON409 the response for an HTTP 409 `application/json` response
 	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
 	// JSON503 the response for an HTTP 503 `application/json` response
 	JSON503 *N503
 	// JSON504 the response for an HTTP 504 `application/json` response
 	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSandboxesSandboxIDResumeResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -10287,6 +13119,11 @@ func (r PostSandboxesSandboxIDResumeResponse) GetJSON404() *N404 {
 // GetJSON409 returns the response for an HTTP 409 `application/json` response
 func (r PostSandboxesSandboxIDResumeResponse) GetJSON409() *N409 {
 	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostSandboxesSandboxIDResumeResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -10333,6 +13170,11 @@ func (r PostSandboxesSandboxIDResumeResponse) ContentType() string {
 	return ""
 }
 
+// PostSandboxesSandboxIDSnapshotsResponse429Headers the declared response headers of an HTTP 429 response for PostSandboxesSandboxIDSnapshots
+type PostSandboxesSandboxIDSnapshotsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSandboxesSandboxIDSnapshotsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10344,8 +13186,12 @@ type PostSandboxesSandboxIDSnapshotsResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSandboxesSandboxIDSnapshotsResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -10366,6 +13212,11 @@ func (r PostSandboxesSandboxIDSnapshotsResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r PostSandboxesSandboxIDSnapshotsResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostSandboxesSandboxIDSnapshotsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -10402,6 +13253,11 @@ func (r PostSandboxesSandboxIDSnapshotsResponse) ContentType() string {
 	return ""
 }
 
+// PostSandboxesSandboxIDTimeoutResponse429Headers the declared response headers of an HTTP 429 response for PostSandboxesSandboxIDTimeout
+type PostSandboxesSandboxIDTimeoutResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSandboxesSandboxIDTimeoutResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10409,8 +13265,12 @@ type PostSandboxesSandboxIDTimeoutResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSandboxesSandboxIDTimeoutResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -10421,6 +13281,11 @@ func (r PostSandboxesSandboxIDTimeoutResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r PostSandboxesSandboxIDTimeoutResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostSandboxesSandboxIDTimeoutResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -10462,6 +13327,11 @@ type GetSecretsResponse200Headers struct {
 	XNextToken *string
 }
 
+// GetSecretsResponse429Headers the declared response headers of an HTTP 429 response for GetSecrets
+type GetSecretsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetSecretsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10487,6 +13357,8 @@ type GetSecretsResponse struct {
 	JSON504 *N504
 	// Headers200 the parsed response headers for an HTTP 200 response
 	Headers200 *GetSecretsResponse200Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetSecretsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -10568,6 +13440,11 @@ func (r GetSecretsResponse) ContentType() string {
 	return ""
 }
 
+// PostSecretsResponse429Headers the declared response headers of an HTTP 429 response for PostSecrets
+type PostSecretsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSecretsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10582,7 +13459,7 @@ type PostSecretsResponse struct {
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
 	// JSON409 the response for an HTTP 409 `application/json` response
-	JSON409 *N409
+	JSON409 *Error
 	// JSON429 the response for an HTTP 429 `application/json` response
 	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
@@ -10591,6 +13468,8 @@ type PostSecretsResponse struct {
 	JSON502 *N502
 	// JSON504 the response for an HTTP 504 `application/json` response
 	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSecretsResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -10619,7 +13498,7 @@ func (r PostSecretsResponse) GetJSON404() *N404 {
 }
 
 // GetJSON409 returns the response for an HTTP 409 `application/json` response
-func (r PostSecretsResponse) GetJSON409() *N409 {
+func (r PostSecretsResponse) GetJSON409() *Error {
 	return r.JSON409
 }
 
@@ -10672,6 +13551,11 @@ func (r PostSecretsResponse) ContentType() string {
 	return ""
 }
 
+// DeleteSecretsSecretIDResponse429Headers the declared response headers of an HTTP 429 response for DeleteSecretsSecretID
+type DeleteSecretsSecretIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type DeleteSecretsSecretIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10693,6 +13577,8 @@ type DeleteSecretsSecretIDResponse struct {
 	JSON502 *N502
 	// JSON504 the response for an HTTP 504 `application/json` response
 	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *DeleteSecretsSecretIDResponse429Headers
 }
 
 // GetJSON400 returns the response for an HTTP 400 `application/json` response
@@ -10769,6 +13655,11 @@ func (r DeleteSecretsSecretIDResponse) ContentType() string {
 	return ""
 }
 
+// GetSecretsSecretIDResponse429Headers the declared response headers of an HTTP 429 response for GetSecretsSecretID
+type GetSecretsSecretIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetSecretsSecretIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10792,6 +13683,8 @@ type GetSecretsSecretIDResponse struct {
 	JSON502 *N502
 	// JSON504 the response for an HTTP 504 `application/json` response
 	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetSecretsSecretIDResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -10873,6 +13766,11 @@ func (r GetSecretsSecretIDResponse) ContentType() string {
 	return ""
 }
 
+// PostSecretsSecretIDResponse429Headers the declared response headers of an HTTP 429 response for PostSecretsSecretID
+type PostSecretsSecretIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostSecretsSecretIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10896,6 +13794,8 @@ type PostSecretsSecretIDResponse struct {
 	JSON502 *N502
 	// JSON504 the response for an HTTP 504 `application/json` response
 	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostSecretsSecretIDResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -10982,6 +13882,11 @@ type GetSnapshotsResponse200Headers struct {
 	XNextToken *string
 }
 
+// GetSnapshotsResponse429Headers the declared response headers of an HTTP 429 response for GetSnapshots
+type GetSnapshotsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetSnapshotsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -10989,10 +13894,14 @@ type GetSnapshotsResponse struct {
 	JSON200 *[]SnapshotInfo
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
 	// Headers200 the parsed response headers for an HTTP 200 response
 	Headers200 *GetSnapshotsResponse200Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetSnapshotsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11003,6 +13912,11 @@ func (r GetSnapshotsResponse) GetJSON200() *[]SnapshotInfo {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetSnapshotsResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetSnapshotsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11039,6 +13953,11 @@ func (r GetSnapshotsResponse) ContentType() string {
 	return ""
 }
 
+// GetTeamsResponse429Headers the declared response headers of an HTTP 429 response for GetTeams
+type GetTeamsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetTeamsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11046,8 +13965,12 @@ type GetTeamsResponse struct {
 	JSON200 *[]Team
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTeamsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11058,6 +13981,11 @@ func (r GetTeamsResponse) GetJSON200() *[]Team {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetTeamsResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTeamsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11094,6 +14022,11 @@ func (r GetTeamsResponse) ContentType() string {
 	return ""
 }
 
+// GetTeamsTeamIDMetricsResponse429Headers the declared response headers of an HTTP 429 response for GetTeamsTeamIDMetrics
+type GetTeamsTeamIDMetricsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetTeamsTeamIDMetricsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11105,8 +14038,12 @@ type GetTeamsTeamIDMetricsResponse struct {
 	JSON401 *N401
 	// JSON403 the response for an HTTP 403 `application/json` response
 	JSON403 *N403
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTeamsTeamIDMetricsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11127,6 +14064,11 @@ func (r GetTeamsTeamIDMetricsResponse) GetJSON401() *N401 {
 // GetJSON403 returns the response for an HTTP 403 `application/json` response
 func (r GetTeamsTeamIDMetricsResponse) GetJSON403() *N403 {
 	return r.JSON403
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTeamsTeamIDMetricsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11163,6 +14105,11 @@ func (r GetTeamsTeamIDMetricsResponse) ContentType() string {
 	return ""
 }
 
+// GetTeamsTeamIDMetricsMaxResponse429Headers the declared response headers of an HTTP 429 response for GetTeamsTeamIDMetricsMax
+type GetTeamsTeamIDMetricsMaxResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetTeamsTeamIDMetricsMaxResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11174,8 +14121,12 @@ type GetTeamsTeamIDMetricsMaxResponse struct {
 	JSON401 *N401
 	// JSON403 the response for an HTTP 403 `application/json` response
 	JSON403 *N403
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTeamsTeamIDMetricsMaxResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11196,6 +14147,11 @@ func (r GetTeamsTeamIDMetricsMaxResponse) GetJSON401() *N401 {
 // GetJSON403 returns the response for an HTTP 403 `application/json` response
 func (r GetTeamsTeamIDMetricsMaxResponse) GetJSON403() *N403 {
 	return r.JSON403
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTeamsTeamIDMetricsMaxResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11232,6 +14188,11 @@ func (r GetTeamsTeamIDMetricsMaxResponse) ContentType() string {
 	return ""
 }
 
+// GetTemplatesResponse429Headers the declared response headers of an HTTP 429 response for GetTemplates
+type GetTemplatesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetTemplatesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11239,8 +14200,12 @@ type GetTemplatesResponse struct {
 	JSON200 *[]Template
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTemplatesResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11251,6 +14216,11 @@ func (r GetTemplatesResponse) GetJSON200() *[]Template {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetTemplatesResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTemplatesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11287,66 +14257,9 @@ func (r GetTemplatesResponse) ContentType() string {
 	return ""
 }
 
-type PostTemplatesResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON202 the response for an HTTP 202 `application/json` response
-	JSON202 *TemplateLegacy
-	// JSON400 the response for an HTTP 400 `application/json` response
-	JSON400 *N400
-	// JSON401 the response for an HTTP 401 `application/json` response
-	JSON401 *N401
-	// JSON500 the response for an HTTP 500 `application/json` response
-	JSON500 *N500
-}
-
-// GetJSON202 returns the response for an HTTP 202 `application/json` response
-func (r PostTemplatesResponse) GetJSON202() *TemplateLegacy {
-	return r.JSON202
-}
-
-// GetJSON400 returns the response for an HTTP 400 `application/json` response
-func (r PostTemplatesResponse) GetJSON400() *N400 {
-	return r.JSON400
-}
-
-// GetJSON401 returns the response for an HTTP 401 `application/json` response
-func (r PostTemplatesResponse) GetJSON401() *N401 {
-	return r.JSON401
-}
-
-// GetJSON500 returns the response for an HTTP 500 `application/json` response
-func (r PostTemplatesResponse) GetJSON500() *N500 {
-	return r.JSON500
-}
-
-// GetBody returns the raw response body bytes
-func (r PostTemplatesResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r PostTemplatesResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r PostTemplatesResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r PostTemplatesResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
+// GetTemplatesAliasesAliasResponse429Headers the declared response headers of an HTTP 429 response for GetTemplatesAliasesAlias
+type GetTemplatesAliasesAliasResponse429Headers struct {
+	RetryAfter *int
 }
 
 type GetTemplatesAliasesAliasResponse struct {
@@ -11360,8 +14273,12 @@ type GetTemplatesAliasesAliasResponse struct {
 	JSON403 *N403
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTemplatesAliasesAliasResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11382,6 +14299,11 @@ func (r GetTemplatesAliasesAliasResponse) GetJSON403() *N403 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetTemplatesAliasesAliasResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTemplatesAliasesAliasResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11418,6 +14340,11 @@ func (r GetTemplatesAliasesAliasResponse) ContentType() string {
 	return ""
 }
 
+// DeleteTemplatesTagsResponse429Headers the declared response headers of an HTTP 429 response for DeleteTemplatesTags
+type DeleteTemplatesTagsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type DeleteTemplatesTagsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11427,8 +14354,12 @@ type DeleteTemplatesTagsResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *DeleteTemplatesTagsResponse429Headers
 }
 
 // GetJSON400 returns the response for an HTTP 400 `application/json` response
@@ -11444,6 +14375,11 @@ func (r DeleteTemplatesTagsResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r DeleteTemplatesTagsResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r DeleteTemplatesTagsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11480,6 +14416,11 @@ func (r DeleteTemplatesTagsResponse) ContentType() string {
 	return ""
 }
 
+// PostTemplatesTagsResponse429Headers the declared response headers of an HTTP 429 response for PostTemplatesTags
+type PostTemplatesTagsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostTemplatesTagsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11491,8 +14432,12 @@ type PostTemplatesTagsResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostTemplatesTagsResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -11513,6 +14458,11 @@ func (r PostTemplatesTagsResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r PostTemplatesTagsResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostTemplatesTagsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11549,18 +14499,32 @@ func (r PostTemplatesTagsResponse) ContentType() string {
 	return ""
 }
 
+// DeleteTemplatesTemplateIDResponse429Headers the declared response headers of an HTTP 429 response for DeleteTemplatesTemplateID
+type DeleteTemplatesTemplateIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type DeleteTemplatesTemplateIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *DeleteTemplatesTemplateIDResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r DeleteTemplatesTemplateIDResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r DeleteTemplatesTemplateIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11602,6 +14566,11 @@ type GetTemplatesTemplateIDResponse200Headers struct {
 	XNextToken *string
 }
 
+// GetTemplatesTemplateIDResponse429Headers the declared response headers of an HTTP 429 response for GetTemplatesTemplateID
+type GetTemplatesTemplateIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetTemplatesTemplateIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11609,10 +14578,14 @@ type GetTemplatesTemplateIDResponse struct {
 	JSON200 *TemplateWithBuilds
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
 	// Headers200 the parsed response headers for an HTTP 200 response
 	Headers200 *GetTemplatesTemplateIDResponse200Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTemplatesTemplateIDResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11623,6 +14596,11 @@ func (r GetTemplatesTemplateIDResponse) GetJSON200() *TemplateWithBuilds {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetTemplatesTemplateIDResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTemplatesTemplateIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11659,6 +14637,11 @@ func (r GetTemplatesTemplateIDResponse) ContentType() string {
 	return ""
 }
 
+// PatchTemplatesTemplateIDResponse429Headers the declared response headers of an HTTP 429 response for PatchTemplatesTemplateID
+type PatchTemplatesTemplateIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PatchTemplatesTemplateIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11666,8 +14649,12 @@ type PatchTemplatesTemplateIDResponse struct {
 	JSON400 *N400
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PatchTemplatesTemplateIDResponse429Headers
 }
 
 // GetJSON400 returns the response for an HTTP 400 `application/json` response
@@ -11678,6 +14665,11 @@ func (r PatchTemplatesTemplateIDResponse) GetJSON400() *N400 {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r PatchTemplatesTemplateIDResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PatchTemplatesTemplateIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11714,107 +14706,9 @@ func (r PatchTemplatesTemplateIDResponse) ContentType() string {
 	return ""
 }
 
-type PostTemplatesTemplateIDResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON202 the response for an HTTP 202 `application/json` response
-	JSON202 *TemplateLegacy
-	// JSON401 the response for an HTTP 401 `application/json` response
-	JSON401 *N401
-	// JSON500 the response for an HTTP 500 `application/json` response
-	JSON500 *N500
-}
-
-// GetJSON202 returns the response for an HTTP 202 `application/json` response
-func (r PostTemplatesTemplateIDResponse) GetJSON202() *TemplateLegacy {
-	return r.JSON202
-}
-
-// GetJSON401 returns the response for an HTTP 401 `application/json` response
-func (r PostTemplatesTemplateIDResponse) GetJSON401() *N401 {
-	return r.JSON401
-}
-
-// GetJSON500 returns the response for an HTTP 500 `application/json` response
-func (r PostTemplatesTemplateIDResponse) GetJSON500() *N500 {
-	return r.JSON500
-}
-
-// GetBody returns the raw response body bytes
-func (r PostTemplatesTemplateIDResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r PostTemplatesTemplateIDResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r PostTemplatesTemplateIDResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r PostTemplatesTemplateIDResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
-}
-
-type PostTemplatesTemplateIDBuildsBuildIDResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON401 the response for an HTTP 401 `application/json` response
-	JSON401 *N401
-	// JSON500 the response for an HTTP 500 `application/json` response
-	JSON500 *N500
-}
-
-// GetJSON401 returns the response for an HTTP 401 `application/json` response
-func (r PostTemplatesTemplateIDBuildsBuildIDResponse) GetJSON401() *N401 {
-	return r.JSON401
-}
-
-// GetJSON500 returns the response for an HTTP 500 `application/json` response
-func (r PostTemplatesTemplateIDBuildsBuildIDResponse) GetJSON500() *N500 {
-	return r.JSON500
-}
-
-// GetBody returns the raw response body bytes
-func (r PostTemplatesTemplateIDBuildsBuildIDResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r PostTemplatesTemplateIDBuildsBuildIDResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r PostTemplatesTemplateIDBuildsBuildIDResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r PostTemplatesTemplateIDBuildsBuildIDResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
+// GetTemplatesTemplateIDBuildsBuildIDLogsResponse429Headers the declared response headers of an HTTP 429 response for GetTemplatesTemplateIDBuildsBuildIDLogs
+type GetTemplatesTemplateIDBuildsBuildIDLogsResponse429Headers struct {
+	RetryAfter *int
 }
 
 type GetTemplatesTemplateIDBuildsBuildIDLogsResponse struct {
@@ -11826,8 +14720,12 @@ type GetTemplatesTemplateIDBuildsBuildIDLogsResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTemplatesTemplateIDBuildsBuildIDLogsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11843,6 +14741,11 @@ func (r GetTemplatesTemplateIDBuildsBuildIDLogsResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetTemplatesTemplateIDBuildsBuildIDLogsResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTemplatesTemplateIDBuildsBuildIDLogsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11879,6 +14782,11 @@ func (r GetTemplatesTemplateIDBuildsBuildIDLogsResponse) ContentType() string {
 	return ""
 }
 
+// GetTemplatesTemplateIDBuildsBuildIDStatusResponse429Headers the declared response headers of an HTTP 429 response for GetTemplatesTemplateIDBuildsBuildIDStatus
+type GetTemplatesTemplateIDBuildsBuildIDStatusResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetTemplatesTemplateIDBuildsBuildIDStatusResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11888,8 +14796,12 @@ type GetTemplatesTemplateIDBuildsBuildIDStatusResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTemplatesTemplateIDBuildsBuildIDStatusResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -11905,6 +14817,11 @@ func (r GetTemplatesTemplateIDBuildsBuildIDStatusResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetTemplatesTemplateIDBuildsBuildIDStatusResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTemplatesTemplateIDBuildsBuildIDStatusResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -11941,6 +14858,11 @@ func (r GetTemplatesTemplateIDBuildsBuildIDStatusResponse) ContentType() string 
 	return ""
 }
 
+// GetTemplatesTemplateIDFilesHashResponse429Headers the declared response headers of an HTTP 429 response for GetTemplatesTemplateIDFilesHash
+type GetTemplatesTemplateIDFilesHashResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetTemplatesTemplateIDFilesHashResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -11952,8 +14874,12 @@ type GetTemplatesTemplateIDFilesHashResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTemplatesTemplateIDFilesHashResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -11974,6 +14900,11 @@ func (r GetTemplatesTemplateIDFilesHashResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetTemplatesTemplateIDFilesHashResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTemplatesTemplateIDFilesHashResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12010,6 +14941,11 @@ func (r GetTemplatesTemplateIDFilesHashResponse) ContentType() string {
 	return ""
 }
 
+// GetTemplatesTemplateIDTagsResponse429Headers the declared response headers of an HTTP 429 response for GetTemplatesTemplateIDTags
+type GetTemplatesTemplateIDTagsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetTemplatesTemplateIDTagsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12021,8 +14957,12 @@ type GetTemplatesTemplateIDTagsResponse struct {
 	JSON403 *N403
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetTemplatesTemplateIDTagsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -12043,6 +14983,11 @@ func (r GetTemplatesTemplateIDTagsResponse) GetJSON403() *N403 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetTemplatesTemplateIDTagsResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetTemplatesTemplateIDTagsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12085,6 +15030,11 @@ type GetV2SandboxesResponse200Headers struct {
 	XTotalRunning *int32
 }
 
+// GetV2SandboxesResponse429Headers the declared response headers of an HTTP 429 response for GetV2Sandboxes
+type GetV2SandboxesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetV2SandboxesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12094,10 +15044,14 @@ type GetV2SandboxesResponse struct {
 	JSON400 *N400
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
 	// Headers200 the parsed response headers for an HTTP 200 response
 	Headers200 *GetV2SandboxesResponse200Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetV2SandboxesResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -12113,6 +15067,11 @@ func (r GetV2SandboxesResponse) GetJSON400() *N400 {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetV2SandboxesResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetV2SandboxesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12149,6 +15108,226 @@ func (r GetV2SandboxesResponse) ContentType() string {
 	return ""
 }
 
+// PostV2SandboxesResponse429Headers the declared response headers of an HTTP 429 response for PostV2Sandboxes
+type PostV2SandboxesResponse429Headers struct {
+	RetryAfter *int
+}
+
+type PostV2SandboxesResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *Sandbox
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *Error
+	// JSON422 the response for an HTTP 422 `application/json` response
+	JSON422 *Error
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+	// JSON503 the response for an HTTP 503 `application/json` response
+	JSON503 *N503
+	// JSON504 the response for an HTTP 504 `application/json` response
+	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostV2SandboxesResponse429Headers
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON201() *Sandbox {
+	return r.JSON201
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON409() *Error {
+	return r.JSON409
+}
+
+// GetJSON422 returns the response for an HTTP 422 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON422() *Error {
+	return r.JSON422
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetJSON503 returns the response for an HTTP 503 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON503() *N503 {
+	return r.JSON503
+}
+
+// GetJSON504 returns the response for an HTTP 504 `application/json` response
+func (r PostV2SandboxesResponse) GetJSON504() *N504 {
+	return r.JSON504
+}
+
+// GetBody returns the raw response body bytes
+func (r PostV2SandboxesResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV2SandboxesResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV2SandboxesResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PostV2SandboxesResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// PostV2SandboxesSandboxIDConnectResponse429Headers the declared response headers of an HTTP 429 response for PostV2SandboxesSandboxIDConnect
+type PostV2SandboxesSandboxIDConnectResponse429Headers struct {
+	RetryAfter *int
+}
+
+type PostV2SandboxesSandboxIDConnectResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *Sandbox
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *Sandbox
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
+	// JSON401 the response for an HTTP 401 `application/json` response
+	JSON401 *N401
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *N404
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
+	// JSON500 the response for an HTTP 500 `application/json` response
+	JSON500 *N500
+	// JSON503 the response for an HTTP 503 `application/json` response
+	JSON503 *N503
+	// JSON504 the response for an HTTP 504 `application/json` response
+	JSON504 *N504
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostV2SandboxesSandboxIDConnectResponse429Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON200() *Sandbox {
+	return r.JSON200
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON201() *Sandbox {
+	return r.JSON201
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON400() *N400 {
+	return r.JSON400
+}
+
+// GetJSON401 returns the response for an HTTP 401 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON401() *N401 {
+	return r.JSON401
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON404() *N404 {
+	return r.JSON404
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON409() *N409 {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON429() *N429 {
+	return r.JSON429
+}
+
+// GetJSON500 returns the response for an HTTP 500 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON500() *N500 {
+	return r.JSON500
+}
+
+// GetJSON503 returns the response for an HTTP 503 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON503() *N503 {
+	return r.JSON503
+}
+
+// GetJSON504 returns the response for an HTTP 504 `application/json` response
+func (r PostV2SandboxesSandboxIDConnectResponse) GetJSON504() *N504 {
+	return r.JSON504
+}
+
+// GetBody returns the raw response body bytes
+func (r PostV2SandboxesSandboxIDConnectResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r PostV2SandboxesSandboxIDConnectResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r PostV2SandboxesSandboxIDConnectResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r PostV2SandboxesSandboxIDConnectResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// GetV2SandboxesSandboxIDLogsResponse429Headers the declared response headers of an HTTP 429 response for GetV2SandboxesSandboxIDLogs
+type GetV2SandboxesSandboxIDLogsResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetV2SandboxesSandboxIDLogsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12158,8 +15337,12 @@ type GetV2SandboxesSandboxIDLogsResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetV2SandboxesSandboxIDLogsResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -12175,6 +15358,11 @@ func (r GetV2SandboxesSandboxIDLogsResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetV2SandboxesSandboxIDLogsResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetV2SandboxesSandboxIDLogsResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12216,6 +15404,11 @@ type GetV2TemplatesResponse200Headers struct {
 	XNextToken *string
 }
 
+// GetV2TemplatesResponse429Headers the declared response headers of an HTTP 429 response for GetV2Templates
+type GetV2TemplatesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetV2TemplatesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12227,10 +15420,14 @@ type GetV2TemplatesResponse struct {
 	JSON401 *N401
 	// JSON403 the response for an HTTP 403 `application/json` response
 	JSON403 *N403
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
 	// Headers200 the parsed response headers for an HTTP 200 response
 	Headers200 *GetV2TemplatesResponse200Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetV2TemplatesResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -12251,6 +15448,11 @@ func (r GetV2TemplatesResponse) GetJSON401() *N401 {
 // GetJSON403 returns the response for an HTTP 403 `application/json` response
 func (r GetV2TemplatesResponse) GetJSON403() *N403 {
 	return r.JSON403
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetV2TemplatesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12287,66 +15489,9 @@ func (r GetV2TemplatesResponse) ContentType() string {
 	return ""
 }
 
-type PostV2TemplatesResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	// JSON202 the response for an HTTP 202 `application/json` response
-	JSON202 *TemplateLegacy
-	// JSON400 the response for an HTTP 400 `application/json` response
-	JSON400 *N400
-	// JSON401 the response for an HTTP 401 `application/json` response
-	JSON401 *N401
-	// JSON500 the response for an HTTP 500 `application/json` response
-	JSON500 *N500
-}
-
-// GetJSON202 returns the response for an HTTP 202 `application/json` response
-func (r PostV2TemplatesResponse) GetJSON202() *TemplateLegacy {
-	return r.JSON202
-}
-
-// GetJSON400 returns the response for an HTTP 400 `application/json` response
-func (r PostV2TemplatesResponse) GetJSON400() *N400 {
-	return r.JSON400
-}
-
-// GetJSON401 returns the response for an HTTP 401 `application/json` response
-func (r PostV2TemplatesResponse) GetJSON401() *N401 {
-	return r.JSON401
-}
-
-// GetJSON500 returns the response for an HTTP 500 `application/json` response
-func (r PostV2TemplatesResponse) GetJSON500() *N500 {
-	return r.JSON500
-}
-
-// GetBody returns the raw response body bytes
-func (r PostV2TemplatesResponse) GetBody() []byte {
-	return r.Body
-}
-
-// Status returns HTTPResponse.Status
-func (r PostV2TemplatesResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r PostV2TemplatesResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
-func (r PostV2TemplatesResponse) ContentType() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Header.Get("Content-Type")
-	}
-	return ""
+// PatchV2TemplatesTemplateIDResponse429Headers the declared response headers of an HTTP 429 response for PatchV2TemplatesTemplateID
+type PatchV2TemplatesTemplateIDResponse429Headers struct {
+	RetryAfter *int
 }
 
 type PatchV2TemplatesTemplateIDResponse struct {
@@ -12358,8 +15503,12 @@ type PatchV2TemplatesTemplateIDResponse struct {
 	JSON400 *N400
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PatchV2TemplatesTemplateIDResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -12375,6 +15524,11 @@ func (r PatchV2TemplatesTemplateIDResponse) GetJSON400() *N400 {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r PatchV2TemplatesTemplateIDResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PatchV2TemplatesTemplateIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12411,18 +15565,39 @@ func (r PatchV2TemplatesTemplateIDResponse) ContentType() string {
 	return ""
 }
 
+// PostV2TemplatesTemplateIDBuildsBuildIDResponse429Headers the declared response headers of an HTTP 429 response for PostV2TemplatesTemplateIDBuildsBuildID
+type PostV2TemplatesTemplateIDBuildsBuildIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostV2TemplatesTemplateIDBuildsBuildIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *N400
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostV2TemplatesTemplateIDBuildsBuildIDResponse429Headers
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r PostV2TemplatesTemplateIDBuildsBuildIDResponse) GetJSON400() *N400 {
+	return r.JSON400
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r PostV2TemplatesTemplateIDBuildsBuildIDResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostV2TemplatesTemplateIDBuildsBuildIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12459,6 +15634,11 @@ func (r PostV2TemplatesTemplateIDBuildsBuildIDResponse) ContentType() string {
 	return ""
 }
 
+// PostV3TemplatesResponse429Headers the declared response headers of an HTTP 429 response for PostV3Templates
+type PostV3TemplatesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostV3TemplatesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12470,8 +15650,14 @@ type PostV3TemplatesResponse struct {
 	JSON401 *N401
 	// JSON403 the response for an HTTP 403 `application/json` response
 	JSON403 *N403
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *N409
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostV3TemplatesResponse429Headers
 }
 
 // GetJSON202 returns the response for an HTTP 202 `application/json` response
@@ -12492,6 +15678,16 @@ func (r PostV3TemplatesResponse) GetJSON401() *N401 {
 // GetJSON403 returns the response for an HTTP 403 `application/json` response
 func (r PostV3TemplatesResponse) GetJSON403() *N403 {
 	return r.JSON403
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r PostV3TemplatesResponse) GetJSON409() *N409 {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostV3TemplatesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12528,6 +15724,11 @@ func (r PostV3TemplatesResponse) ContentType() string {
 	return ""
 }
 
+// GetVolumesResponse429Headers the declared response headers of an HTTP 429 response for GetVolumes
+type GetVolumesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetVolumesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12535,8 +15736,12 @@ type GetVolumesResponse struct {
 	JSON200 *[]Volume
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetVolumesResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -12547,6 +15752,11 @@ func (r GetVolumesResponse) GetJSON200() *[]Volume {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r GetVolumesResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetVolumesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12583,6 +15793,11 @@ func (r GetVolumesResponse) ContentType() string {
 	return ""
 }
 
+// PostVolumesResponse429Headers the declared response headers of an HTTP 429 response for PostVolumes
+type PostVolumesResponse429Headers struct {
+	RetryAfter *int
+}
+
 type PostVolumesResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12592,8 +15807,12 @@ type PostVolumesResponse struct {
 	JSON400 *N400
 	// JSON401 the response for an HTTP 401 `application/json` response
 	JSON401 *N401
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *PostVolumesResponse429Headers
 }
 
 // GetJSON201 returns the response for an HTTP 201 `application/json` response
@@ -12609,6 +15828,11 @@ func (r PostVolumesResponse) GetJSON400() *N400 {
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
 func (r PostVolumesResponse) GetJSON401() *N401 {
 	return r.JSON401
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r PostVolumesResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12645,6 +15869,11 @@ func (r PostVolumesResponse) ContentType() string {
 	return ""
 }
 
+// DeleteVolumesVolumeIDResponse429Headers the declared response headers of an HTTP 429 response for DeleteVolumesVolumeID
+type DeleteVolumesVolumeIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type DeleteVolumesVolumeIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12652,8 +15881,12 @@ type DeleteVolumesVolumeIDResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *DeleteVolumesVolumeIDResponse429Headers
 }
 
 // GetJSON401 returns the response for an HTTP 401 `application/json` response
@@ -12664,6 +15897,11 @@ func (r DeleteVolumesVolumeIDResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r DeleteVolumesVolumeIDResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r DeleteVolumesVolumeIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12700,6 +15938,11 @@ func (r DeleteVolumesVolumeIDResponse) ContentType() string {
 	return ""
 }
 
+// GetVolumesVolumeIDResponse429Headers the declared response headers of an HTTP 429 response for GetVolumesVolumeID
+type GetVolumesVolumeIDResponse429Headers struct {
+	RetryAfter *int
+}
+
 type GetVolumesVolumeIDResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12709,8 +15952,12 @@ type GetVolumesVolumeIDResponse struct {
 	JSON401 *N401
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *N404
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *N429
 	// JSON500 the response for an HTTP 500 `application/json` response
 	JSON500 *N500
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *GetVolumesVolumeIDResponse429Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -12726,6 +15973,11 @@ func (r GetVolumesVolumeIDResponse) GetJSON401() *N401 {
 // GetJSON404 returns the response for an HTTP 404 `application/json` response
 func (r GetVolumesVolumeIDResponse) GetJSON404() *N404 {
 	return r.JSON404
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r GetVolumesVolumeIDResponse) GetJSON429() *N429 {
+	return r.JSON429
 }
 
 // GetJSON500 returns the response for an HTTP 500 `application/json` response
@@ -12762,54 +16014,6 @@ func (r GetVolumesVolumeIDResponse) ContentType() string {
 	return ""
 }
 
-// PostAccessTokensWithBodyWithResponse Create access token
-//
-// Create a new access token. Deprecated; use an API key (E2B_API_KEY) instead.
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /access-tokens (the `PostAccessTokens` operationId).
-//
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostAccessTokensWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostAccessTokensResponse, error) {
-	rsp, err := c.PostAccessTokensWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostAccessTokensResponse(rsp)
-}
-
-// PostAccessTokensWithResponse Create access token
-//
-// Create a new access token. Deprecated; use an API key (E2B_API_KEY) instead.
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /access-tokens (the `PostAccessTokens` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostAccessTokensWithResponse(ctx context.Context, body PostAccessTokensJSONRequestBody, reqEditors ...RequestEditorFn) (*PostAccessTokensResponse, error) {
-	rsp, err := c.PostAccessTokens(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostAccessTokensResponse(rsp)
-}
-
-// DeleteAccessTokensAccessTokenIDWithResponse Delete access token
-//
-// Delete an access token.
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with DELETE /access-tokens/{accessTokenID} (the `DeleteAccessTokensAccessTokenID` operationId).
-func (c *ClientWithResponses) DeleteAccessTokensAccessTokenIDWithResponse(ctx context.Context, accessTokenID AccessTokenID, reqEditors ...RequestEditorFn) (*DeleteAccessTokensAccessTokenIDResponse, error) {
-	rsp, err := c.DeleteAccessTokensAccessTokenID(ctx, accessTokenID, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseDeleteAccessTokensAccessTokenIDResponse(rsp)
-}
-
 // GetAdminSandboxesRunningCountsWithResponse Count running sandboxes by team
 //
 // Returns a shared snapshot normally refreshed after five seconds. A
@@ -12824,6 +16028,23 @@ func (c *ClientWithResponses) GetAdminSandboxesRunningCountsWithResponse(ctx con
 		return nil, err
 	}
 	return ParseGetAdminSandboxesRunningCountsResponse(rsp)
+}
+
+// GetAdminSandboxesSandboxIDWithResponse Get a sandbox's team and state
+//
+// Reads the team and state of a sandbox from its latest lifecycle event.
+// The state lags the sandbox while that event is in flight. A sandbox
+// whose events have expired is not found.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /admin/sandboxes/{sandboxID} (the `GetAdminSandboxesSandboxID` operationId).
+func (c *ClientWithResponses) GetAdminSandboxesSandboxIDWithResponse(ctx context.Context, sandboxID SandboxID, reqEditors ...RequestEditorFn) (*GetAdminSandboxesSandboxIDResponse, error) {
+	rsp, err := c.GetAdminSandboxesSandboxID(ctx, sandboxID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetAdminSandboxesSandboxIDResponse(rsp)
 }
 
 // PostAdminTeamsTeamIDApiKeysWithBodyWithResponse Create team API key as admin
@@ -12991,6 +16212,239 @@ func (c *ClientWithResponses) PatchApiKeysApiKeyIDWithResponse(ctx context.Conte
 	return ParsePatchApiKeysApiKeyIDResponse(rsp)
 }
 
+// GetClustersClusterIDRigsWithResponse List rigs of a cluster
+//
+// List the orchestrator node pools ("rigs") of a cluster with a snapshot of their scaling groups. Forwarded to the cluster's edge service; a cluster with no rig management configured returns an empty list, and the local cluster answers 501.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /clusters/{clusterID}/rigs (the `GetClustersClusterIDRigs` operationId).
+func (c *ClientWithResponses) GetClustersClusterIDRigsWithResponse(ctx context.Context, clusterID ClusterID, reqEditors ...RequestEditorFn) (*GetClustersClusterIDRigsResponse, error) {
+	rsp, err := c.GetClustersClusterIDRigs(ctx, clusterID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetClustersClusterIDRigsResponse(rsp)
+}
+
+// DeleteClustersClusterIDRigsInstancesInstanceIDWithResponse Terminate an instance of a rig
+//
+// Terminate an instance in whichever rig's scaling group it belongs to. The caller chooses whether the rig shrinks or the instance is replaced.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with DELETE /clusters/{clusterID}/rigs/instances/{instanceID} (the `DeleteClustersClusterIDRigsInstancesInstanceID` operationId).
+func (c *ClientWithResponses) DeleteClustersClusterIDRigsInstancesInstanceIDWithResponse(ctx context.Context, clusterID ClusterID, instanceID string, params *DeleteClustersClusterIDRigsInstancesInstanceIDParams, reqEditors ...RequestEditorFn) (*DeleteClustersClusterIDRigsInstancesInstanceIDResponse, error) {
+	rsp, err := c.DeleteClustersClusterIDRigsInstancesInstanceID(ctx, clusterID, instanceID, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeleteClustersClusterIDRigsInstancesInstanceIDResponse(rsp)
+}
+
+// PutClustersClusterIDRigsRigIDCapacityWithBodyWithResponse Set the capacity of a rig
+//
+// Set the desired instance count on the rig's scaling group. The value is passed to the cloud provider unchanged; violations of the group's bounds or conflicting concurrent operations surface as errors.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PUT /clusters/{clusterID}/rigs/{rigID}/capacity (the `PutClustersClusterIDRigsRigIDCapacity` operationId).
+func (c *ClientWithResponses) PutClustersClusterIDRigsRigIDCapacityWithBodyWithResponse(ctx context.Context, clusterID ClusterID, rigID RigID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutClustersClusterIDRigsRigIDCapacityResponse, error) {
+	rsp, err := c.PutClustersClusterIDRigsRigIDCapacityWithBody(ctx, clusterID, rigID, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePutClustersClusterIDRigsRigIDCapacityResponse(rsp)
+}
+
+// PutClustersClusterIDRigsRigIDCapacityWithResponse Set the capacity of a rig
+//
+// Set the desired instance count on the rig's scaling group. The value is passed to the cloud provider unchanged; violations of the group's bounds or conflicting concurrent operations surface as errors.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PUT /clusters/{clusterID}/rigs/{rigID}/capacity (the `PutClustersClusterIDRigsRigIDCapacity` operationId).
+func (c *ClientWithResponses) PutClustersClusterIDRigsRigIDCapacityWithResponse(ctx context.Context, clusterID ClusterID, rigID RigID, body PutClustersClusterIDRigsRigIDCapacityJSONRequestBody, reqEditors ...RequestEditorFn) (*PutClustersClusterIDRigsRigIDCapacityResponse, error) {
+	rsp, err := c.PutClustersClusterIDRigsRigIDCapacity(ctx, clusterID, rigID, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePutClustersClusterIDRigsRigIDCapacityResponse(rsp)
+}
+
+// GetClustersClusterIDRigsRigIDErrorsWithResponse List recent scaling errors of a rig
+//
+// List recent scaling errors on the rig's scaling group (e.g. failed instance creations due to resource exhaustion), newest first.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /clusters/{clusterID}/rigs/{rigID}/errors (the `GetClustersClusterIDRigsRigIDErrors` operationId).
+func (c *ClientWithResponses) GetClustersClusterIDRigsRigIDErrorsWithResponse(ctx context.Context, clusterID ClusterID, rigID RigID, params *GetClustersClusterIDRigsRigIDErrorsParams, reqEditors ...RequestEditorFn) (*GetClustersClusterIDRigsRigIDErrorsResponse, error) {
+	rsp, err := c.GetClustersClusterIDRigsRigIDErrors(ctx, clusterID, rigID, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetClustersClusterIDRigsRigIDErrorsResponse(rsp)
+}
+
+// GetClustersClusterIDRigsRigIDInstancesWithResponse List the instances attached to a rig
+//
+// List the instances attached to the rig's scaling group with their creation time and transition state, sorted by instance ID.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /clusters/{clusterID}/rigs/{rigID}/instances (the `GetClustersClusterIDRigsRigIDInstances` operationId).
+func (c *ClientWithResponses) GetClustersClusterIDRigsRigIDInstancesWithResponse(ctx context.Context, clusterID ClusterID, rigID RigID, reqEditors ...RequestEditorFn) (*GetClustersClusterIDRigsRigIDInstancesResponse, error) {
+	rsp, err := c.GetClustersClusterIDRigsRigIDInstances(ctx, clusterID, rigID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetClustersClusterIDRigsRigIDInstancesResponse(rsp)
+}
+
+// GetEventsSandboxesWithResponse performs a GET /events/sandboxes (the `GetEventsSandboxes` operationId) request.
+//
+// Get all sandbox events for the team associated with the API key.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) GetEventsSandboxesWithResponse(ctx context.Context, params *GetEventsSandboxesParams, reqEditors ...RequestEditorFn) (*GetEventsSandboxesResponse, error) {
+	rsp, err := c.GetEventsSandboxes(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetEventsSandboxesResponse(rsp)
+}
+
+// GetEventsSandboxesSandboxIDWithResponse performs a GET /events/sandboxes/{sandboxID} (the `GetEventsSandboxesSandboxID` operationId) request.
+//
+// Get sandbox events.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) GetEventsSandboxesSandboxIDWithResponse(ctx context.Context, sandboxID SandboxID, params *GetEventsSandboxesSandboxIDParams, reqEditors ...RequestEditorFn) (*GetEventsSandboxesSandboxIDResponse, error) {
+	rsp, err := c.GetEventsSandboxesSandboxID(ctx, sandboxID, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetEventsSandboxesSandboxIDResponse(rsp)
+}
+
+// GetEventsWebhooksWithResponse performs a GET /events/webhooks (the `GetEventsWebhooks` operationId) request.
+//
+// List registered webhooks.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) GetEventsWebhooksWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetEventsWebhooksResponse, error) {
+	rsp, err := c.GetEventsWebhooks(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetEventsWebhooksResponse(rsp)
+}
+
+// PostEventsWebhooksWithBodyWithResponse performs a POST /events/webhooks (the `PostEventsWebhooks` operationId) request,
+// with any type of body and a specified content type.
+//
+// Register events webhook.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) PostEventsWebhooksWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostEventsWebhooksResponse, error) {
+	rsp, err := c.PostEventsWebhooksWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostEventsWebhooksResponse(rsp)
+}
+
+// PostEventsWebhooksWithResponse performs a POST /events/webhooks (the `PostEventsWebhooks` operationId) request.
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Register events webhook.
+func (c *ClientWithResponses) PostEventsWebhooksWithResponse(ctx context.Context, body PostEventsWebhooksJSONRequestBody, reqEditors ...RequestEditorFn) (*PostEventsWebhooksResponse, error) {
+	rsp, err := c.PostEventsWebhooks(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostEventsWebhooksResponse(rsp)
+}
+
+// DeleteEventsWebhooksWebhookIDWithResponse performs a DELETE /events/webhooks/{webhookID} (the `DeleteEventsWebhooksWebhookID` operationId) request.
+//
+// Delete a registered webhook.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) DeleteEventsWebhooksWebhookIDWithResponse(ctx context.Context, webhookID WebhookID, reqEditors ...RequestEditorFn) (*DeleteEventsWebhooksWebhookIDResponse, error) {
+	rsp, err := c.DeleteEventsWebhooksWebhookID(ctx, webhookID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeleteEventsWebhooksWebhookIDResponse(rsp)
+}
+
+// GetEventsWebhooksWebhookIDWithResponse performs a GET /events/webhooks/{webhookID} (the `GetEventsWebhooksWebhookID` operationId) request.
+//
+// Get a registered webhook.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) GetEventsWebhooksWebhookIDWithResponse(ctx context.Context, webhookID WebhookID, reqEditors ...RequestEditorFn) (*GetEventsWebhooksWebhookIDResponse, error) {
+	rsp, err := c.GetEventsWebhooksWebhookID(ctx, webhookID, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetEventsWebhooksWebhookIDResponse(rsp)
+}
+
+// PatchEventsWebhooksWebhookIDWithBodyWithResponse performs a PATCH /events/webhooks/{webhookID} (the `PatchEventsWebhooksWebhookID` operationId) request,
+// with any type of body and a specified content type.
+//
+// Update a registered webhook configuration.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) PatchEventsWebhooksWebhookIDWithBodyWithResponse(ctx context.Context, webhookID WebhookID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PatchEventsWebhooksWebhookIDResponse, error) {
+	rsp, err := c.PatchEventsWebhooksWebhookIDWithBody(ctx, webhookID, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePatchEventsWebhooksWebhookIDResponse(rsp)
+}
+
+// PatchEventsWebhooksWebhookIDWithResponse performs a PATCH /events/webhooks/{webhookID} (the `PatchEventsWebhooksWebhookID` operationId) request.
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Update a registered webhook configuration.
+func (c *ClientWithResponses) PatchEventsWebhooksWebhookIDWithResponse(ctx context.Context, webhookID WebhookID, body PatchEventsWebhooksWebhookIDJSONRequestBody, reqEditors ...RequestEditorFn) (*PatchEventsWebhooksWebhookIDResponse, error) {
+	rsp, err := c.PatchEventsWebhooksWebhookID(ctx, webhookID, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePatchEventsWebhooksWebhookIDResponse(rsp)
+}
+
+// GetEventsWebhooksWebhookIDDeliveriesWithResponse performs a GET /events/webhooks/{webhookID}/deliveries (the `GetEventsWebhooksWebhookIDDeliveries` operationId) request.
+//
+// List webhook delivery attempts.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) GetEventsWebhooksWebhookIDDeliveriesWithResponse(ctx context.Context, webhookID WebhookID, params *GetEventsWebhooksWebhookIDDeliveriesParams, reqEditors ...RequestEditorFn) (*GetEventsWebhooksWebhookIDDeliveriesResponse, error) {
+	rsp, err := c.GetEventsWebhooksWebhookIDDeliveries(ctx, webhookID, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetEventsWebhooksWebhookIDDeliveriesResponse(rsp)
+}
+
+// GetEventsWebhooksWebhookIDStatsWithResponse performs a GET /events/webhooks/{webhookID}/stats (the `GetEventsWebhooksWebhookIDStats` operationId) request.
+//
+// Get webhook delivery aggregate stats.
+//
+// Returns a wrapper object for the known response body format(s).
+func (c *ClientWithResponses) GetEventsWebhooksWebhookIDStatsWithResponse(ctx context.Context, webhookID WebhookID, params *GetEventsWebhooksWebhookIDStatsParams, reqEditors ...RequestEditorFn) (*GetEventsWebhooksWebhookIDStatsResponse, error) {
+	rsp, err := c.GetEventsWebhooksWebhookIDStats(ctx, webhookID, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetEventsWebhooksWebhookIDStatsResponse(rsp)
+}
+
 // GetHealthWithResponse Health check
 //
 // Returns a wrapper object for the known response body format(s).
@@ -13083,11 +16537,13 @@ func (c *ClientWithResponses) GetSandboxesWithResponse(ctx context.Context, para
 
 // PostSandboxesWithBodyWithResponse Create sandbox
 //
-// Create a sandbox from the template.
+// Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /sandboxes (the `PostSandboxes` operationId).
+//
+// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 func (c *ClientWithResponses) PostSandboxesWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostSandboxesResponse, error) {
 	rsp, err := c.PostSandboxesWithBody(ctx, contentType, body, reqEditors...)
 	if err != nil {
@@ -13098,11 +16554,12 @@ func (c *ClientWithResponses) PostSandboxesWithBodyWithResponse(ctx context.Cont
 
 // PostSandboxesWithResponse Create sandbox
 //
-// Create a sandbox from the template.
+// Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /sandboxes (the `PostSandboxes` operationId).
+// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 func (c *ClientWithResponses) PostSandboxesWithResponse(ctx context.Context, body PostSandboxesJSONRequestBody, reqEditors ...RequestEditorFn) (*PostSandboxesResponse, error) {
 	rsp, err := c.PostSandboxes(ctx, body, reqEditors...)
 	if err != nil {
@@ -13158,11 +16615,13 @@ func (c *ClientWithResponses) GetSandboxesSandboxIDWithResponse(ctx context.Cont
 
 // PostSandboxesSandboxIDConnectWithBodyWithResponse Connect sandbox
 //
-// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /sandboxes/{sandboxID}/connect (the `PostSandboxesSandboxIDConnect` operationId).
+//
+// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 func (c *ClientWithResponses) PostSandboxesSandboxIDConnectWithBodyWithResponse(ctx context.Context, sandboxID SandboxID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostSandboxesSandboxIDConnectResponse, error) {
 	rsp, err := c.PostSandboxesSandboxIDConnectWithBody(ctx, sandboxID, contentType, body, reqEditors...)
 	if err != nil {
@@ -13173,11 +16632,12 @@ func (c *ClientWithResponses) PostSandboxesSandboxIDConnectWithBodyWithResponse(
 
 // PostSandboxesSandboxIDConnectWithResponse Connect sandbox
 //
-// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /sandboxes/{sandboxID}/connect (the `PostSandboxesSandboxIDConnect` operationId).
+// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 func (c *ClientWithResponses) PostSandboxesSandboxIDConnectWithResponse(ctx context.Context, sandboxID SandboxID, body PostSandboxesSandboxIDConnectJSONRequestBody, reqEditors ...RequestEditorFn) (*PostSandboxesSandboxIDConnectResponse, error) {
 	rsp, err := c.PostSandboxesSandboxIDConnect(ctx, sandboxID, body, reqEditors...)
 	if err != nil {
@@ -13613,39 +17073,6 @@ func (c *ClientWithResponses) GetTemplatesWithResponse(ctx context.Context, para
 	return ParseGetTemplatesResponse(rsp)
 }
 
-// PostTemplatesWithBodyWithResponse Create template
-//
-// Create a new template.
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /templates (the `PostTemplates` operationId).
-//
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostTemplatesWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostTemplatesResponse, error) {
-	rsp, err := c.PostTemplatesWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostTemplatesResponse(rsp)
-}
-
-// PostTemplatesWithResponse Create template
-//
-// Create a new template.
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /templates (the `PostTemplates` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostTemplatesWithResponse(ctx context.Context, body PostTemplatesJSONRequestBody, reqEditors ...RequestEditorFn) (*PostTemplatesResponse, error) {
-	rsp, err := c.PostTemplates(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostTemplatesResponse(rsp)
-}
-
 // GetTemplatesAliasesAliasWithResponse Check template alias
 //
 // Check if template with given alias exists.
@@ -13780,56 +17207,6 @@ func (c *ClientWithResponses) PatchTemplatesTemplateIDWithResponse(ctx context.C
 	return ParsePatchTemplatesTemplateIDResponse(rsp)
 }
 
-// PostTemplatesTemplateIDWithBodyWithResponse Rebuild template
-//
-// Rebuild an template.
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /templates/{templateID} (the `PostTemplatesTemplateID` operationId).
-//
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostTemplatesTemplateIDWithBodyWithResponse(ctx context.Context, templateID TemplateID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostTemplatesTemplateIDResponse, error) {
-	rsp, err := c.PostTemplatesTemplateIDWithBody(ctx, templateID, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostTemplatesTemplateIDResponse(rsp)
-}
-
-// PostTemplatesTemplateIDWithResponse Rebuild template
-//
-// Rebuild an template.
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /templates/{templateID} (the `PostTemplatesTemplateID` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostTemplatesTemplateIDWithResponse(ctx context.Context, templateID TemplateID, body PostTemplatesTemplateIDJSONRequestBody, reqEditors ...RequestEditorFn) (*PostTemplatesTemplateIDResponse, error) {
-	rsp, err := c.PostTemplatesTemplateID(ctx, templateID, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostTemplatesTemplateIDResponse(rsp)
-}
-
-// PostTemplatesTemplateIDBuildsBuildIDWithResponse Start template build
-//
-// Start the build.
-//
-// Returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /templates/{templateID}/builds/{buildID} (the `PostTemplatesTemplateIDBuildsBuildID` operationId).
-//
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostTemplatesTemplateIDBuildsBuildIDWithResponse(ctx context.Context, templateID TemplateID, buildID BuildID, reqEditors ...RequestEditorFn) (*PostTemplatesTemplateIDBuildsBuildIDResponse, error) {
-	rsp, err := c.PostTemplatesTemplateIDBuildsBuildID(ctx, templateID, buildID, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostTemplatesTemplateIDBuildsBuildIDResponse(rsp)
-}
-
 // GetTemplatesTemplateIDBuildsBuildIDLogsWithResponse Template build logs
 //
 // Get template build logs.
@@ -13905,6 +17282,66 @@ func (c *ClientWithResponses) GetV2SandboxesWithResponse(ctx context.Context, pa
 	return ParseGetV2SandboxesResponse(rsp)
 }
 
+// PostV2SandboxesWithBodyWithResponse Create sandbox (v2)
+//
+// Create a sandbox from the template. All system communication with the sandbox is secured.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v2/sandboxes (the `PostV2Sandboxes` operationId).
+func (c *ClientWithResponses) PostV2SandboxesWithBodyWithResponse(ctx context.Context, params *PostV2SandboxesParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV2SandboxesResponse, error) {
+	rsp, err := c.PostV2SandboxesWithBody(ctx, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV2SandboxesResponse(rsp)
+}
+
+// PostV2SandboxesWithResponse Create sandbox (v2)
+//
+// Create a sandbox from the template. All system communication with the sandbox is secured.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v2/sandboxes (the `PostV2Sandboxes` operationId).
+func (c *ClientWithResponses) PostV2SandboxesWithResponse(ctx context.Context, params *PostV2SandboxesParams, body PostV2SandboxesJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV2SandboxesResponse, error) {
+	rsp, err := c.PostV2Sandboxes(ctx, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV2SandboxesResponse(rsp)
+}
+
+// PostV2SandboxesSandboxIDConnectWithBodyWithResponse Connect sandbox (v2)
+//
+// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. The request body is optional; an omitted timeout defaults to 300 seconds.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v2/sandboxes/{sandboxID}/connect (the `PostV2SandboxesSandboxIDConnect` operationId).
+func (c *ClientWithResponses) PostV2SandboxesSandboxIDConnectWithBodyWithResponse(ctx context.Context, sandboxID SandboxID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV2SandboxesSandboxIDConnectResponse, error) {
+	rsp, err := c.PostV2SandboxesSandboxIDConnectWithBody(ctx, sandboxID, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV2SandboxesSandboxIDConnectResponse(rsp)
+}
+
+// PostV2SandboxesSandboxIDConnectWithResponse Connect sandbox (v2)
+//
+// Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. The request body is optional; an omitted timeout defaults to 300 seconds.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v2/sandboxes/{sandboxID}/connect (the `PostV2SandboxesSandboxIDConnect` operationId).
+func (c *ClientWithResponses) PostV2SandboxesSandboxIDConnectWithResponse(ctx context.Context, sandboxID SandboxID, body PostV2SandboxesSandboxIDConnectJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV2SandboxesSandboxIDConnectResponse, error) {
+	rsp, err := c.PostV2SandboxesSandboxIDConnect(ctx, sandboxID, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParsePostV2SandboxesSandboxIDConnectResponse(rsp)
+}
+
 // GetV2SandboxesSandboxIDLogsWithResponse Sandbox logs (v2)
 //
 // Get sandbox logs.
@@ -13933,39 +17370,6 @@ func (c *ClientWithResponses) GetV2TemplatesWithResponse(ctx context.Context, pa
 		return nil, err
 	}
 	return ParseGetV2TemplatesResponse(rsp)
-}
-
-// PostV2TemplatesWithBodyWithResponse Create template (v2)
-//
-// Create a new template.
-//
-// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /v2/templates (the `PostV2Templates` operationId).
-//
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostV2TemplatesWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostV2TemplatesResponse, error) {
-	rsp, err := c.PostV2TemplatesWithBody(ctx, contentType, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostV2TemplatesResponse(rsp)
-}
-
-// PostV2TemplatesWithResponse Create template (v2)
-//
-// Create a new template.
-//
-// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
-//
-// Corresponds with POST /v2/templates (the `PostV2Templates` operationId).
-// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
-func (c *ClientWithResponses) PostV2TemplatesWithResponse(ctx context.Context, body PostV2TemplatesJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV2TemplatesResponse, error) {
-	rsp, err := c.PostV2Templates(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePostV2TemplatesResponse(rsp)
 }
 
 // PatchV2TemplatesTemplateIDWithBodyWithResponse Update template (v2)
@@ -14133,96 +17537,6 @@ func (c *ClientWithResponses) GetVolumesVolumeIDWithResponse(ctx context.Context
 	return ParseGetVolumesVolumeIDResponse(rsp)
 }
 
-// ParsePostAccessTokensResponse parses an HTTP response from a PostAccessTokensWithResponse call
-func ParsePostAccessTokensResponse(rsp *http.Response) (*PostAccessTokensResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &PostAccessTokensResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
-		var dest CreatedAccessToken
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON201 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
-		var dest N401
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON401 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 410:
-		var dest N410
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON410 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
-		var dest N500
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON500 = &dest
-
-	}
-
-	return response, nil
-}
-
-// ParseDeleteAccessTokensAccessTokenIDResponse parses an HTTP response from a DeleteAccessTokensAccessTokenIDWithResponse call
-func ParseDeleteAccessTokensAccessTokenIDResponse(rsp *http.Response) (*DeleteAccessTokensAccessTokenIDResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &DeleteAccessTokensAccessTokenIDResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case rsp.StatusCode == 204:
-		break // No content-type
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
-		var dest N401
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON401 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
-		var dest N404
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON404 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
-		var dest N500
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON500 = &dest
-
-	}
-
-	return response, nil
-}
-
 // ParseGetAdminSandboxesRunningCountsResponse parses an HTTP response from a GetAdminSandboxesRunningCountsWithResponse call
 func ParseGetAdminSandboxesRunningCountsResponse(rsp *http.Response) (*GetAdminSandboxesRunningCountsResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -14251,6 +17565,13 @@ func ParseGetAdminSandboxesRunningCountsResponse(rsp *http.Response) (*GetAdminS
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14258,6 +17579,93 @@ func ParseGetAdminSandboxesRunningCountsResponse(rsp *http.Response) (*GetAdminS
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetAdminSandboxesRunningCountsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseGetAdminSandboxesSandboxIDResponse parses an HTTP response from a GetAdminSandboxesSandboxIDWithResponse call
+func ParseGetAdminSandboxesSandboxIDResponse(rsp *http.Response) (*GetAdminSandboxesSandboxIDResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetAdminSandboxesSandboxIDResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest AdminSandbox
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetAdminSandboxesSandboxIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14312,6 +17720,13 @@ func ParsePostAdminTeamsTeamIDApiKeysResponse(rsp *http.Response) (*PostAdminTea
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14319,6 +17734,19 @@ func ParsePostAdminTeamsTeamIDApiKeysResponse(rsp *http.Response) (*PostAdminTea
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostAdminTeamsTeamIDApiKeysResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14362,6 +17790,13 @@ func ParseDeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse(rsp *http.Response) (*De
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14369,6 +17804,19 @@ func ParseDeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse(rsp *http.Response) (*De
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers DeleteAdminTeamsTeamIDApiKeysApiKeyIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14409,6 +17857,13 @@ func ParsePostAdminTeamsTeamIDBuildsCancelResponse(rsp *http.Response) (*PostAdm
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14416,6 +17871,19 @@ func ParsePostAdminTeamsTeamIDBuildsCancelResponse(rsp *http.Response) (*PostAdm
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostAdminTeamsTeamIDBuildsCancelResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14456,6 +17924,13 @@ func ParsePostAdminTeamsTeamIDSandboxesKillResponse(rsp *http.Response) (*PostAd
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14463,6 +17938,19 @@ func ParsePostAdminTeamsTeamIDSandboxesKillResponse(rsp *http.Response) (*PostAd
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostAdminTeamsTeamIDSandboxesKillResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14496,6 +17984,13 @@ func ParseGetApiKeysResponse(rsp *http.Response) (*GetApiKeysResponse, error) {
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14503,6 +17998,19 @@ func ParseGetApiKeysResponse(rsp *http.Response) (*GetApiKeysResponse, error) {
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetApiKeysResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14536,6 +18044,13 @@ func ParsePostApiKeysResponse(rsp *http.Response) (*PostApiKeysResponse, error) 
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14543,6 +18058,19 @@ func ParsePostApiKeysResponse(rsp *http.Response) (*PostApiKeysResponse, error) 
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostApiKeysResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14579,6 +18107,13 @@ func ParseDeleteApiKeysApiKeyIDResponse(rsp *http.Response) (*DeleteApiKeysApiKe
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14586,6 +18121,19 @@ func ParseDeleteApiKeysApiKeyIDResponse(rsp *http.Response) (*DeleteApiKeysApiKe
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers DeleteApiKeysApiKeyIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14607,6 +18155,884 @@ func ParsePatchApiKeysApiKeyIDResponse(rsp *http.Response) (*PatchApiKeysApiKeyI
 	switch {
 	case rsp.StatusCode == 200:
 		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PatchApiKeysApiKeyIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseGetClustersClusterIDRigsResponse parses an HTTP response from a GetClustersClusterIDRigsWithResponse call
+func ParseGetClustersClusterIDRigsResponse(rsp *http.Response) (*GetClustersClusterIDRigsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetClustersClusterIDRigsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []Rig
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest N501
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetClustersClusterIDRigsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseDeleteClustersClusterIDRigsInstancesInstanceIDResponse parses an HTTP response from a DeleteClustersClusterIDRigsInstancesInstanceIDWithResponse call
+func ParseDeleteClustersClusterIDRigsInstancesInstanceIDResponse(rsp *http.Response) (*DeleteClustersClusterIDRigsInstancesInstanceIDResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeleteClustersClusterIDRigsInstancesInstanceIDResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 202:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest N409
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest N501
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers DeleteClustersClusterIDRigsInstancesInstanceIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParsePutClustersClusterIDRigsRigIDCapacityResponse parses an HTTP response from a PutClustersClusterIDRigsRigIDCapacityWithResponse call
+func ParsePutClustersClusterIDRigsRigIDCapacityResponse(rsp *http.Response) (*PutClustersClusterIDRigsRigIDCapacityResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PutClustersClusterIDRigsRigIDCapacityResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 202:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest N409
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest N501
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PutClustersClusterIDRigsRigIDCapacityResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseGetClustersClusterIDRigsRigIDErrorsResponse parses an HTTP response from a GetClustersClusterIDRigsRigIDErrorsWithResponse call
+func ParseGetClustersClusterIDRigsRigIDErrorsResponse(rsp *http.Response) (*GetClustersClusterIDRigsRigIDErrorsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetClustersClusterIDRigsRigIDErrorsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []RigError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest N501
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetClustersClusterIDRigsRigIDErrorsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseGetClustersClusterIDRigsRigIDInstancesResponse parses an HTTP response from a GetClustersClusterIDRigsRigIDInstancesWithResponse call
+func ParseGetClustersClusterIDRigsRigIDInstancesResponse(rsp *http.Response) (*GetClustersClusterIDRigsRigIDInstancesResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetClustersClusterIDRigsRigIDInstancesResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []RigInstance
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest N501
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetClustersClusterIDRigsRigIDInstancesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseGetEventsSandboxesResponse parses an HTTP response from a GetEventsSandboxesWithResponse call
+func ParseGetEventsSandboxesResponse(rsp *http.Response) (*GetEventsSandboxesResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetEventsSandboxesResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []SandboxEvent
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetEventsSandboxesSandboxIDResponse parses an HTTP response from a GetEventsSandboxesSandboxIDWithResponse call
+func ParseGetEventsSandboxesSandboxIDResponse(rsp *http.Response) (*GetEventsSandboxesSandboxIDResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetEventsSandboxesSandboxIDResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []SandboxEvent
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetEventsWebhooksResponse parses an HTTP response from a GetEventsWebhooksWithResponse call
+func ParseGetEventsWebhooksResponse(rsp *http.Response) (*GetEventsWebhooksResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetEventsWebhooksResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []WebhookDetail
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePostEventsWebhooksResponse parses an HTTP response from a PostEventsWebhooksWithResponse call
+func ParsePostEventsWebhooksResponse(rsp *http.Response) (*PostEventsWebhooksResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostEventsWebhooksResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest WebhookCreation
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseDeleteEventsWebhooksWebhookIDResponse parses an HTTP response from a DeleteEventsWebhooksWebhookIDWithResponse call
+func ParseDeleteEventsWebhooksWebhookIDResponse(rsp *http.Response) (*DeleteEventsWebhooksWebhookIDResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeleteEventsWebhooksWebhookIDResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetEventsWebhooksWebhookIDResponse parses an HTTP response from a GetEventsWebhooksWebhookIDWithResponse call
+func ParseGetEventsWebhooksWebhookIDResponse(rsp *http.Response) (*GetEventsWebhooksWebhookIDResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetEventsWebhooksWebhookIDResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest WebhookDetail
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParsePatchEventsWebhooksWebhookIDResponse parses an HTTP response from a PatchEventsWebhooksWebhookIDWithResponse call
+func ParsePatchEventsWebhooksWebhookIDResponse(rsp *http.Response) (*PatchEventsWebhooksWebhookIDResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PatchEventsWebhooksWebhookIDResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest WebhookDetail
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetEventsWebhooksWebhookIDDeliveriesResponse parses an HTTP response from a GetEventsWebhooksWebhookIDDeliveriesWithResponse call
+func ParseGetEventsWebhooksWebhookIDDeliveriesResponse(rsp *http.Response) (*GetEventsWebhooksWebhookIDDeliveriesResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetEventsWebhooksWebhookIDDeliveriesResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest WebhookDeliveriesListPayload
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetEventsWebhooksWebhookIDStatsResponse parses an HTTP response from a GetEventsWebhooksWebhookIDStatsWithResponse call
+func ParseGetEventsWebhooksWebhookIDStatsResponse(rsp *http.Response) (*GetEventsWebhooksWebhookIDStatsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetEventsWebhooksWebhookIDStatsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest WebhookDeliveryStats
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
 		var dest N401
@@ -14658,6 +19084,26 @@ func ParseGetHealthResponse(rsp *http.Response) (*GetHealthResponse, error) {
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetHealthResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14691,6 +19137,13 @@ func ParseGetNodesResponse(rsp *http.Response) (*GetNodesResponse, error) {
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14698,6 +19151,19 @@ func ParseGetNodesResponse(rsp *http.Response) (*GetNodesResponse, error) {
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetNodesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14738,6 +19204,13 @@ func ParseGetNodesNodeIDResponse(rsp *http.Response) (*GetNodesNodeIDResponse, e
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14745,6 +19218,19 @@ func ParseGetNodesNodeIDResponse(rsp *http.Response) (*GetNodesNodeIDResponse, e
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetNodesNodeIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14788,6 +19274,13 @@ func ParsePostNodesNodeIDResponse(rsp *http.Response) (*PostNodesNodeIDResponse,
 		}
 		response.JSON409 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14795,6 +19288,19 @@ func ParsePostNodesNodeIDResponse(rsp *http.Response) (*PostNodesNodeIDResponse,
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostNodesNodeIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14835,6 +19341,13 @@ func ParseGetSandboxesResponse(rsp *http.Response) (*GetSandboxesResponse, error
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14842,6 +19355,19 @@ func ParseGetSandboxesResponse(rsp *http.Response) (*GetSandboxesResponse, error
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetSandboxesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14882,6 +19408,13 @@ func ParsePostSandboxesResponse(rsp *http.Response) (*PostSandboxesResponse, err
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14903,6 +19436,19 @@ func ParsePostSandboxesResponse(rsp *http.Response) (*PostSandboxesResponse, err
 		}
 		response.JSON504 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSandboxesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14943,6 +19489,13 @@ func ParseGetSandboxesMetricsResponse(rsp *http.Response) (*GetSandboxesMetricsR
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14950,6 +19503,19 @@ func ParseGetSandboxesMetricsResponse(rsp *http.Response) (*GetSandboxesMetricsR
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetSandboxesMetricsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -14986,6 +19552,13 @@ func ParseDeleteSandboxesSandboxIDResponse(rsp *http.Response) (*DeleteSandboxes
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -14993,6 +19566,19 @@ func ParseDeleteSandboxesSandboxIDResponse(rsp *http.Response) (*DeleteSandboxes
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers DeleteSandboxesSandboxIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15033,6 +19619,13 @@ func ParseGetSandboxesSandboxIDResponse(rsp *http.Response) (*GetSandboxesSandbo
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15040,6 +19633,19 @@ func ParseGetSandboxesSandboxIDResponse(rsp *http.Response) (*GetSandboxesSandbo
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetSandboxesSandboxIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15101,6 +19707,13 @@ func ParsePostSandboxesSandboxIDConnectResponse(rsp *http.Response) (*PostSandbo
 		}
 		response.JSON409 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15122,6 +19735,19 @@ func ParsePostSandboxesSandboxIDConnectResponse(rsp *http.Response) (*PostSandbo
 		}
 		response.JSON504 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSandboxesSandboxIDConnectResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15169,6 +19795,13 @@ func ParsePostSandboxesSandboxIDForkResponse(rsp *http.Response) (*PostSandboxes
 		}
 		response.JSON409 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15183,6 +19816,19 @@ func ParsePostSandboxesSandboxIDForkResponse(rsp *http.Response) (*PostSandboxes
 		}
 		response.JSON503 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSandboxesSandboxIDForkResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15223,6 +19869,13 @@ func ParseGetSandboxesSandboxIDLogsResponse(rsp *http.Response) (*GetSandboxesSa
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15230,6 +19883,19 @@ func ParseGetSandboxesSandboxIDLogsResponse(rsp *http.Response) (*GetSandboxesSa
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetSandboxesSandboxIDLogsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15277,6 +19943,13 @@ func ParseGetSandboxesSandboxIDMetricsResponse(rsp *http.Response) (*GetSandboxe
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15284,6 +19957,19 @@ func ParseGetSandboxesSandboxIDMetricsResponse(rsp *http.Response) (*GetSandboxe
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetSandboxesSandboxIDMetricsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15327,6 +20013,13 @@ func ParsePutSandboxesSandboxIDNetworkResponse(rsp *http.Response) (*PutSandboxe
 		}
 		response.JSON409 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15334,6 +20027,19 @@ func ParsePutSandboxesSandboxIDNetworkResponse(rsp *http.Response) (*PutSandboxe
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PutSandboxesSandboxIDNetworkResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15377,6 +20083,13 @@ func ParsePostSandboxesSandboxIDPauseResponse(rsp *http.Response) (*PostSandboxe
 		}
 		response.JSON409 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15384,6 +20097,26 @@ func ParsePostSandboxesSandboxIDPauseResponse(rsp *http.Response) (*PostSandboxe
 		}
 		response.JSON500 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest N503
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSandboxesSandboxIDPauseResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15420,6 +20153,26 @@ func ParsePostSandboxesSandboxIDRefreshesResponse(rsp *http.Response) (*PostSand
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSandboxesSandboxIDRefreshesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15474,6 +20227,13 @@ func ParsePostSandboxesSandboxIDResumeResponse(rsp *http.Response) (*PostSandbox
 		}
 		response.JSON409 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15495,6 +20255,19 @@ func ParsePostSandboxesSandboxIDResumeResponse(rsp *http.Response) (*PostSandbox
 		}
 		response.JSON504 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSandboxesSandboxIDResumeResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15542,6 +20315,13 @@ func ParsePostSandboxesSandboxIDSnapshotsResponse(rsp *http.Response) (*PostSand
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15549,6 +20329,19 @@ func ParsePostSandboxesSandboxIDSnapshotsResponse(rsp *http.Response) (*PostSand
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSandboxesSandboxIDSnapshotsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15585,6 +20378,13 @@ func ParsePostSandboxesSandboxIDTimeoutResponse(rsp *http.Response) (*PostSandbo
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -15592,6 +20392,19 @@ func ParsePostSandboxesSandboxIDTimeoutResponse(rsp *http.Response) (*PostSandbo
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSandboxesSandboxIDTimeoutResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15694,6 +20507,16 @@ func ParseGetSecretsResponse(rsp *http.Response) (*GetSecretsResponse, error) {
 			headers.XNextToken = &value
 		}
 		response.Headers200 = &headers
+	case rsp.StatusCode == 429:
+		var headers GetSecretsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15749,7 +20572,7 @@ func ParsePostSecretsResponse(rsp *http.Response) (*PostSecretsResponse, error) 
 		response.JSON404 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
-		var dest N409
+		var dest Error
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -15783,6 +20606,19 @@ func ParsePostSecretsResponse(rsp *http.Response) (*PostSecretsResponse, error) 
 		}
 		response.JSON504 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSecretsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15868,6 +20704,19 @@ func ParseDeleteSecretsSecretIDResponse(rsp *http.Response) (*DeleteSecretsSecre
 		}
 		response.JSON504 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers DeleteSecretsSecretIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -15959,6 +20808,19 @@ func ParseGetSecretsSecretIDResponse(rsp *http.Response) (*GetSecretsSecretIDRes
 
 	}
 
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetSecretsSecretIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
 	return response, nil
 }
 
@@ -16048,6 +20910,19 @@ func ParsePostSecretsSecretIDResponse(rsp *http.Response) (*PostSecretsSecretIDR
 
 	}
 
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostSecretsSecretIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
 	return response, nil
 }
 
@@ -16079,6 +20954,13 @@ func ParseGetSnapshotsResponse(rsp *http.Response) (*GetSnapshotsResponse, error
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16099,6 +20981,16 @@ func ParseGetSnapshotsResponse(rsp *http.Response) (*GetSnapshotsResponse, error
 			headers.XNextToken = &value
 		}
 		response.Headers200 = &headers
+	case rsp.StatusCode == 429:
+		var headers GetSnapshotsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16132,6 +21024,13 @@ func ParseGetTeamsResponse(rsp *http.Response) (*GetTeamsResponse, error) {
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16139,6 +21038,19 @@ func ParseGetTeamsResponse(rsp *http.Response) (*GetTeamsResponse, error) {
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetTeamsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16186,6 +21098,13 @@ func ParseGetTeamsTeamIDMetricsResponse(rsp *http.Response) (*GetTeamsTeamIDMetr
 		}
 		response.JSON403 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16193,6 +21112,19 @@ func ParseGetTeamsTeamIDMetricsResponse(rsp *http.Response) (*GetTeamsTeamIDMetr
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetTeamsTeamIDMetricsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16240,6 +21172,13 @@ func ParseGetTeamsTeamIDMetricsMaxResponse(rsp *http.Response) (*GetTeamsTeamIDM
 		}
 		response.JSON403 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16247,6 +21186,19 @@ func ParseGetTeamsTeamIDMetricsMaxResponse(rsp *http.Response) (*GetTeamsTeamIDM
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetTeamsTeamIDMetricsMaxResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16280,6 +21232,13 @@ func ParseGetTemplatesResponse(rsp *http.Response) (*GetTemplatesResponse, error
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16287,53 +21246,19 @@ func ParseGetTemplatesResponse(rsp *http.Response) (*GetTemplatesResponse, error
 		}
 		response.JSON500 = &dest
 
-	}
-
-	return response, nil
-}
-
-// ParsePostTemplatesResponse parses an HTTP response from a PostTemplatesWithResponse call
-func ParsePostTemplatesResponse(rsp *http.Response) (*PostTemplatesResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &PostTemplatesResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
 	}
 
 	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
-		var dest TemplateLegacy
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
+	case rsp.StatusCode == 429:
+		var headers GetTemplatesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
 		}
-		response.JSON202 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
-		var dest N400
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON400 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
-		var dest N401
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON401 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
-		var dest N500
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON500 = &dest
-
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16381,6 +21306,13 @@ func ParseGetTemplatesAliasesAliasResponse(rsp *http.Response) (*GetTemplatesAli
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16388,6 +21320,19 @@ func ParseGetTemplatesAliasesAliasResponse(rsp *http.Response) (*GetTemplatesAli
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetTemplatesAliasesAliasResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16431,6 +21376,13 @@ func ParseDeleteTemplatesTagsResponse(rsp *http.Response) (*DeleteTemplatesTagsR
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16438,6 +21390,19 @@ func ParseDeleteTemplatesTagsResponse(rsp *http.Response) (*DeleteTemplatesTagsR
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers DeleteTemplatesTagsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16485,6 +21450,13 @@ func ParsePostTemplatesTagsResponse(rsp *http.Response) (*PostTemplatesTagsRespo
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16492,6 +21464,19 @@ func ParsePostTemplatesTagsResponse(rsp *http.Response) (*PostTemplatesTagsRespo
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostTemplatesTagsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16521,6 +21506,13 @@ func ParseDeleteTemplatesTemplateIDResponse(rsp *http.Response) (*DeleteTemplate
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16528,6 +21520,19 @@ func ParseDeleteTemplatesTemplateIDResponse(rsp *http.Response) (*DeleteTemplate
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers DeleteTemplatesTemplateIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16561,6 +21566,13 @@ func ParseGetTemplatesTemplateIDResponse(rsp *http.Response) (*GetTemplatesTempl
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16581,6 +21593,16 @@ func ParseGetTemplatesTemplateIDResponse(rsp *http.Response) (*GetTemplatesTempl
 			headers.XNextToken = &value
 		}
 		response.Headers200 = &headers
+	case rsp.StatusCode == 429:
+		var headers GetTemplatesTemplateIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16617,6 +21639,13 @@ func ParsePatchTemplatesTemplateIDResponse(rsp *http.Response) (*PatchTemplatesT
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16624,82 +21653,19 @@ func ParsePatchTemplatesTemplateIDResponse(rsp *http.Response) (*PatchTemplatesT
 		}
 		response.JSON500 = &dest
 
-	}
-
-	return response, nil
-}
-
-// ParsePostTemplatesTemplateIDResponse parses an HTTP response from a PostTemplatesTemplateIDWithResponse call
-func ParsePostTemplatesTemplateIDResponse(rsp *http.Response) (*PostTemplatesTemplateIDResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &PostTemplatesTemplateIDResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
 	}
 
 	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
-		var dest TemplateLegacy
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
+	case rsp.StatusCode == 429:
+		var headers PatchTemplatesTemplateIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
 		}
-		response.JSON202 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
-		var dest N401
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON401 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
-		var dest N500
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON500 = &dest
-
-	}
-
-	return response, nil
-}
-
-// ParsePostTemplatesTemplateIDBuildsBuildIDResponse parses an HTTP response from a PostTemplatesTemplateIDBuildsBuildIDWithResponse call
-func ParsePostTemplatesTemplateIDBuildsBuildIDResponse(rsp *http.Response) (*PostTemplatesTemplateIDBuildsBuildIDResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &PostTemplatesTemplateIDBuildsBuildIDResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case rsp.StatusCode == 202:
-		break // No content-type
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
-		var dest N401
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON401 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
-		var dest N500
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON500 = &dest
-
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16740,6 +21706,13 @@ func ParseGetTemplatesTemplateIDBuildsBuildIDLogsResponse(rsp *http.Response) (*
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16747,6 +21720,19 @@ func ParseGetTemplatesTemplateIDBuildsBuildIDLogsResponse(rsp *http.Response) (*
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetTemplatesTemplateIDBuildsBuildIDLogsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16787,6 +21773,13 @@ func ParseGetTemplatesTemplateIDBuildsBuildIDStatusResponse(rsp *http.Response) 
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16794,6 +21787,19 @@ func ParseGetTemplatesTemplateIDBuildsBuildIDStatusResponse(rsp *http.Response) 
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetTemplatesTemplateIDBuildsBuildIDStatusResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16841,6 +21847,13 @@ func ParseGetTemplatesTemplateIDFilesHashResponse(rsp *http.Response) (*GetTempl
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16848,6 +21861,19 @@ func ParseGetTemplatesTemplateIDFilesHashResponse(rsp *http.Response) (*GetTempl
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetTemplatesTemplateIDFilesHashResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16895,6 +21921,13 @@ func ParseGetTemplatesTemplateIDTagsResponse(rsp *http.Response) (*GetTemplatesT
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16902,6 +21935,19 @@ func ParseGetTemplatesTemplateIDTagsResponse(rsp *http.Response) (*GetTemplatesT
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetTemplatesTemplateIDTagsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -16942,6 +21988,13 @@ func ParseGetV2SandboxesResponse(rsp *http.Response) (*GetV2SandboxesResponse, e
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -16969,6 +22022,213 @@ func ParseGetV2SandboxesResponse(rsp *http.Response) (*GetV2SandboxesResponse, e
 			headers.XTotalRunning = &value
 		}
 		response.Headers200 = &headers
+	case rsp.StatusCode == 429:
+		var headers GetV2SandboxesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParsePostV2SandboxesResponse parses an HTTP response from a PostV2SandboxesWithResponse call
+func ParsePostV2SandboxesResponse(rsp *http.Response) (*PostV2SandboxesResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV2SandboxesResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest Sandbox
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest N503
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 504:
+		var dest N504
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON504 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostV2SandboxesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
+	}
+
+	return response, nil
+}
+
+// ParsePostV2SandboxesSandboxIDConnectResponse parses an HTTP response from a PostV2SandboxesSandboxIDConnectWithResponse call
+func ParsePostV2SandboxesSandboxIDConnectResponse(rsp *http.Response) (*PostV2SandboxesSandboxIDConnectResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &PostV2SandboxesSandboxIDConnectResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Sandbox
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest Sandbox
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest N401
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest N404
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest N409
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest N500
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest N503
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 504:
+		var dest N504
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON504 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostV2SandboxesSandboxIDConnectResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17009,6 +22269,13 @@ func ParseGetV2SandboxesSandboxIDLogsResponse(rsp *http.Response) (*GetV2Sandbox
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -17016,6 +22283,19 @@ func ParseGetV2SandboxesSandboxIDLogsResponse(rsp *http.Response) (*GetV2Sandbox
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetV2SandboxesSandboxIDLogsResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17063,6 +22343,13 @@ func ParseGetV2TemplatesResponse(rsp *http.Response) (*GetV2TemplatesResponse, e
 		}
 		response.JSON403 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -17083,53 +22370,16 @@ func ParseGetV2TemplatesResponse(rsp *http.Response) (*GetV2TemplatesResponse, e
 			headers.XNextToken = &value
 		}
 		response.Headers200 = &headers
-	}
-
-	return response, nil
-}
-
-// ParsePostV2TemplatesResponse parses an HTTP response from a PostV2TemplatesWithResponse call
-func ParsePostV2TemplatesResponse(rsp *http.Response) (*PostV2TemplatesResponse, error) {
-	bodyBytes, err := io.ReadAll(rsp.Body)
-	defer func() { _ = rsp.Body.Close() }()
-	if err != nil {
-		return nil, err
-	}
-
-	response := &PostV2TemplatesResponse{
-		Body:         bodyBytes,
-		HTTPResponse: rsp,
-	}
-
-	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
-		var dest TemplateLegacy
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
+	case rsp.StatusCode == 429:
+		var headers GetV2TemplatesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
 		}
-		response.JSON202 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
-		var dest N400
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON400 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
-		var dest N401
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON401 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
-		var dest N500
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.JSON500 = &dest
-
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17170,6 +22420,13 @@ func ParsePatchV2TemplatesTemplateIDResponse(rsp *http.Response) (*PatchV2Templa
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -17177,6 +22434,19 @@ func ParsePatchV2TemplatesTemplateIDResponse(rsp *http.Response) (*PatchV2Templa
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PatchV2TemplatesTemplateIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17199,12 +22469,26 @@ func ParsePostV2TemplatesTemplateIDBuildsBuildIDResponse(rsp *http.Response) (*P
 	case rsp.StatusCode == 202:
 		break // No content-type
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest N400
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
 		var dest N401
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
 		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
@@ -17213,6 +22497,19 @@ func ParsePostV2TemplatesTemplateIDBuildsBuildIDResponse(rsp *http.Response) (*P
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostV2TemplatesTemplateIDBuildsBuildIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17260,6 +22557,20 @@ func ParsePostV3TemplatesResponse(rsp *http.Response) (*PostV3TemplatesResponse,
 		}
 		response.JSON403 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest N409
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -17267,6 +22578,19 @@ func ParsePostV3TemplatesResponse(rsp *http.Response) (*PostV3TemplatesResponse,
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostV3TemplatesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17300,6 +22624,13 @@ func ParseGetVolumesResponse(rsp *http.Response) (*GetVolumesResponse, error) {
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -17307,6 +22638,19 @@ func ParseGetVolumesResponse(rsp *http.Response) (*GetVolumesResponse, error) {
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetVolumesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17347,6 +22691,13 @@ func ParsePostVolumesResponse(rsp *http.Response) (*PostVolumesResponse, error) 
 		}
 		response.JSON401 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -17354,6 +22705,19 @@ func ParsePostVolumesResponse(rsp *http.Response) (*PostVolumesResponse, error) 
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers PostVolumesResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17390,6 +22754,13 @@ func ParseDeleteVolumesVolumeIDResponse(rsp *http.Response) (*DeleteVolumesVolum
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -17397,6 +22768,19 @@ func ParseDeleteVolumesVolumeIDResponse(rsp *http.Response) (*DeleteVolumesVolum
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers DeleteVolumesVolumeIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil
@@ -17437,6 +22821,13 @@ func ParseGetVolumesVolumeIDResponse(rsp *http.Response) (*GetVolumesVolumeIDRes
 		}
 		response.JSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest N429
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest N500
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -17444,6 +22835,19 @@ func ParseGetVolumesVolumeIDResponse(rsp *http.Response) (*GetVolumesVolumeIDRes
 		}
 		response.JSON500 = &dest
 
+	}
+
+	switch {
+	case rsp.StatusCode == 429:
+		var headers GetVolumesVolumeIDResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers429 = &headers
 	}
 
 	return response, nil

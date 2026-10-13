@@ -22,6 +22,7 @@ linters:
     - errcheck
     - exhaustive
     - exhaustruct
+    - exhaustruct_v5
     - funcorder
     - funlen
     - gochecknoglobals
@@ -76,6 +77,13 @@ linters:
           - revive
 
   settings:
+    usetesting:
+      # t.Context() is cancelled just before the test's Cleanup functions run,
+      # so teardown that must outlive the test takes
+      # context.WithoutCancel(t.Context()) — it keeps the test's values and
+      # drops only the cancellation.
+      context-background: true
+      context-todo: true
     forbidigo:
       forbid:
         - pattern: '.*\.ErrNoRows$'
@@ -181,6 +189,7 @@ linters:
         - { disabled: true, name: line-length-limit }
         - { disabled: true, name: max-control-nesting }
         - { disabled: true, name: max-public-structs }
+        - { disabled: true, name: multiline-if-init }
         - { disabled: true, name: nested-structs }
         - { disabled: true, name: package-comments }
         - { disabled: true, name: package-directory-mismatch }

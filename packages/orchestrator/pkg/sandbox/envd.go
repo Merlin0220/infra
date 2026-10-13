@@ -14,6 +14,7 @@ import (
 	"os"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -22,15 +23,56 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/envd"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
 const (
 	loopDelay = 5 * time.Millisecond
+
+	// maxEnvdResultBodySize caps a JSON result the orchestrator decodes from envd. The
+	// guest writes it; /metrics's is a few KB even with its 32 OOM kills.
+	maxEnvdResultBodySize = 1 << 20
+
+	// envdErrorBodyRunes is the length, in runes, an error or log line cuts a failed call's body to.
+	envdErrorBodyRunes = 100
+	// envdErrorBodyLimit is the most of a failed call's body worth reading. Any
+	// envdErrorBodyRunes runes fit in that many times utf8.UTFMax bytes, and the
+	// extra byte lets Truncate still tell that a longer body was cut.
+	envdErrorBodyLimit = envdErrorBodyRunes*utf8.UTFMax + 1
 )
+
+// envdErrorBody reads the start of a failed envd response for an error or log
+// line. The guest writes the body, so only enough of it to build the message is read.
+func envdErrorBody(r io.Reader) string {
+	body, _ := io.ReadAll(io.LimitReader(r, envdErrorBodyLimit))
+
+	return utils.Truncate(string(body), envdErrorBodyRunes)
+}
+
+// decodeEnvdResult decodes a guest-supplied JSON result, reading at most maxEnvdResultBodySize.
+func decodeEnvdResult(r io.Reader, v any) error {
+	return json.NewDecoder(io.LimitReader(r, maxEnvdResultBodySize)).Decode(v)
+}
+
+// cancelOnClose ends a request's context when its body is closed, so the request's
+// deadline stays in force while the caller reads the body.
+type cancelOnClose struct {
+	io.ReadCloser
+
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+
+	return err
+}
 
 // envdInitExitType classifies the outcome of an envd init call.
 type envdInitExitType string
@@ -71,12 +113,11 @@ const (
 	envdOpFsthaw   envdOp = "fsthaw"
 )
 
-// doRequestWithInfiniteRetries does a request with infinite retries until the context is done.
+// doRequestWithInfiniteRetries POSTs /init with infinite retries until the context is done.
 // The parent context must be bounded — by a deadline/timeout, or by a cancel
 // the caller races against sandbox liveness (WaitForEnvd, bestEffortEnvdReinit).
 func (s *Sandbox) doRequestWithInfiniteRetries(
 	ctx context.Context,
-	method,
 	address string,
 ) (*http.Response, int64, error) {
 	requestCount := int64(0)
@@ -90,6 +131,8 @@ func (s *Sandbox) doRequestWithInfiniteRetries(
 		DefaultWorkdir: utils.DerefOrDefault(s.Config.Envd.DefaultWorkdir, ""),
 		VolumeMounts:   s.convertMounts(s.Config.VolumeMounts),
 		CaBundle:       s.CABundle,
+		// A snapshot may resume with a different number of guest CPUs online.
+		CpuCount: s.guestCpuCount(),
 	}
 
 	for {
@@ -102,7 +145,7 @@ func (s *Sandbox) doRequestWithInfiniteRetries(
 
 		requestCount++
 		reqCtx, cancel := context.WithTimeout(ctx, s.internalConfig.EnvdInitRequestTimeout)
-		request, err := http.NewRequestWithContext(reqCtx, method, address, bytes.NewReader(body))
+		request, err := http.NewRequestWithContext(reqCtx, http.MethodPost, address, bytes.NewReader(body))
 		if err != nil {
 			cancel()
 
@@ -116,11 +159,12 @@ func (s *Sandbox) doRequestWithInfiniteRetries(
 		}
 
 		response, err := sandboxHttpClient.Do(request)
-		cancel()
-
 		if err == nil {
+			response.Body = &cancelOnClose{ReadCloser: response.Body, cancel: cancel}
+
 			return response, requestCount, nil
 		}
+		cancel()
 
 		select {
 		case <-ctx.Done():
@@ -137,7 +181,7 @@ func (s *Sandbox) doRequestWithInfiniteRetries(
 // We always send maxWaitMs, which is what asks for the structured result. An envd
 // predating that parameter answers 204 instead; that is not an error, only an envd whose
 // observed counts are unavailable, so the zero result comes back with ok=false.
-func (s *Sandbox) callEnvdFreeze(ctx context.Context, timeout time.Duration) (result envd.FreezeResult, ok bool, err error) {
+func (s *Sandbox) callEnvdFreeze(ctx context.Context, timeout time.Duration, hierarchy bool, maxCgroups int) (result envd.FreezeResult, ok bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -146,7 +190,15 @@ func (s *Sandbox) callEnvdFreeze(ctx context.Context, timeout time.Duration) (re
 	// we would have given up on it.
 	maxWaitMs := max((timeout - freezeRoundTripMargin).Milliseconds(), 1)
 
-	resp, err := s.doEnvdPost(ctx, string(envdOpFreeze), fmt.Sprintf("maxWaitMs=%d", maxWaitMs))
+	query := fmt.Sprintf("maxWaitMs=%d", maxWaitMs)
+	if hierarchy {
+		// The flag lives here because envd has no LaunchDarkly, so the mode travels on
+		// the request. FreezeResult echoes back what envd actually ran, which is what
+		// makes an envd that ignores this parameter visible rather than assumed.
+		query += fmt.Sprintf("&mode=%s&maxCgroups=%d", envd.PostFreezeParamsModeHierarchy, maxCgroups)
+	}
+
+	resp, err := s.doEnvdPost(ctx, string(envdOpFreeze), query)
 	if err != nil {
 		return envd.FreezeResult{}, false, err
 	}
@@ -157,21 +209,19 @@ func (s *Sandbox) callEnvdFreeze(ctx context.Context, timeout time.Duration) (re
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-
-		return envd.FreezeResult{}, false, fmt.Errorf("freeze returned %d: %s", resp.StatusCode, utils.Truncate(string(body), 100))
+		return envd.FreezeResult{}, false, fmt.Errorf("freeze returned %d: %s", resp.StatusCode, envdErrorBody(resp.Body))
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeEnvdResult(resp.Body, &result); err != nil {
 		return envd.FreezeResult{}, false, fmt.Errorf("decode freeze result: %w", err)
 	}
 
 	return result, true, nil
 }
 
-// callEnvdUnfreeze calls envd's native POST /unfreeze endpoint. Reserved for
-// the pause-failure rollback path; the resume thaw runs via /init's deferred
-// unfreeze and does not use this.
+// callEnvdUnfreeze calls envd's native POST /unfreeze endpoint. Used by the
+// pause-failure rollback and after an in-place checkpoint; the resume thaw runs
+// inside /init and does not use this.
 func (s *Sandbox) callEnvdUnfreeze(ctx context.Context, timeout time.Duration) error {
 	return s.callEnvdPostOp(ctx, timeout, envdOpUnfreeze)
 }
@@ -210,13 +260,11 @@ func (s *Sandbox) callEnvdCollapse(ctx context.Context, timeout time.Duration) (
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-
-		return envd.CollapseResult{}, fmt.Errorf("collapse returned %d: %s", resp.StatusCode, utils.Truncate(string(body), 100))
+		return envd.CollapseResult{}, fmt.Errorf("collapse returned %d: %s", resp.StatusCode, envdErrorBody(resp.Body))
 	}
 
 	var result envd.CollapseResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeEnvdResult(resp.Body, &result); err != nil {
 		return envd.CollapseResult{}, fmt.Errorf("decode collapse result: %w", err)
 	}
 
@@ -236,9 +284,7 @@ func (s *Sandbox) postEnvd(ctx context.Context, timeout time.Duration, path stri
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-
-		return fmt.Errorf("%s returned %d: %s", path, resp.StatusCode, utils.Truncate(string(body), 100))
+		return fmt.Errorf("%s returned %d: %s", path, resp.StatusCode, envdErrorBody(resp.Body))
 	}
 
 	return nil
@@ -315,9 +361,7 @@ func (s *Sandbox) CallEnvdUpgrade(ctx context.Context, localSrcPath, guestBinPat
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-
-		return false, fmt.Errorf("upgrade returned %d: %s", resp.StatusCode, utils.Truncate(string(body), 100))
+		return false, fmt.Errorf("upgrade returned %d: %s", resp.StatusCode, envdErrorBody(resp.Body))
 	}
 
 	// envd answered instead of exec'ing — no swap happened, exec not confirmed.
@@ -395,6 +439,31 @@ func (s *Sandbox) HandoverResult() *EnvdHandoverResult {
 	return s.handoverResult.Load()
 }
 
+// EnvdReportedDefaults is what the running envd last said it is effectively serving with,
+// or nil if it never reported any.
+//
+// Nil is a capability answer rather than an empty one, and callers rely on that: the header
+// and the handover blob's defaults field ship in the same envd, so an envd that reports
+// nothing here is also one whose blob cannot carry the exec context across a swap.
+func (s *Sandbox) EnvdReportedDefaults() *EnvdEffectiveDefaults {
+	return s.envdReportedDefaults.Load()
+}
+
+// EnvdWorkdirWithheld reports that a recorded default workdir was not re-sent at start, so
+// it lives only in the running envd's memory. False on every path that sends one.
+func (s *Sandbox) EnvdWorkdirWithheld() bool {
+	return s.envdWorkdirWithheld
+}
+
+// envdWorkdirWithheld decides whether a recorded workdir is being left in the running
+// process instead of re-sent. BOTH terms are required: a recorded value alone is not
+// withheld if the start path is also sending it, which is exactly the filesystem-only cold
+// boot — it reconstructs and sends the recorded workdir, and it reaches the same
+// live-upgrade gate as a memory resume.
+func envdWorkdirWithheld(meta metadata.Template, sentWorkdir *string) bool {
+	return meta.Context.WorkDir != nil && sentWorkdir == nil
+}
+
 // envdServerURL returns the base URL (scheme://host:port) of the sandbox's envd
 // HTTP server. A non-empty internalConfig.envdServerURLOverride redirects it
 // (test-only; production always uses the slot IP and the default envd port).
@@ -460,22 +529,29 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 		telemetry.WithEnvdVersion(s.Config.Envd.Version),
 		attribute.Int64("timeout_ms", s.internalConfig.EnvdInitRequestTimeout.Milliseconds()),
 		attribute.String("start_type", string(startType)),
+		s.teamAttr(),
 	}
 
 	// success is kept for backward compatibility until consumers move to exit_type.
 	callAttributes := func(exit envdInitExitType) []attribute.KeyValue {
-		return append(attributes,
+		attrs := append(attributes,
 			attribute.Bool("success", exit == envdInitExitSuccess),
 			attribute.String("exit_type", string(exit)),
 		)
+
+		// The cohort is read here rather than appended to attributes at the point the
+		// header decodes, so that every call site yields the same attribute set instead
+		// of one that depends on where in this function it sits. The error path below
+		// returns before any header is read, and only the first WaitForEnvd of a start
+		// records these counters, so on that path there is no report to find.
+		return append(attrs, s.envdProtectionAttrs()...)
 	}
 
-	address := fmt.Sprintf("http://%s:%d/init", s.Slot.HostIPString(), consts.DefaultEnvdServerPort)
+	address := s.envdServerURL() + "/init"
 
-	response, count, err := s.doRequestWithInfiniteRetries(ctx, http.MethodPost, address)
+	response, count, err := s.doRequestWithInfiniteRetries(ctx, address)
 	if err != nil {
-		logger.L().Error(ctx, "failed to init envd after retries",
-			logger.WithSandboxID(s.Runtime.SandboxID),
+		s.log().Error(ctx, "failed to init envd after retries",
 			logger.WithEnvdVersion(s.Config.Envd.Version),
 			zap.Int64("timeout_ms", s.internalConfig.EnvdInitRequestTimeout.Milliseconds()),
 			zap.Int64("attempts", count),
@@ -493,6 +569,49 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 		return fmt.Errorf("failed to init envd: %w", err)
 	}
 
+	defer response.Body.Close()
+	// The response headers are read before the init counters are recorded, so that
+	// anything the guest reports on /init can label the counters for this start.
+	//
+	// Capture the version the running envd reports (X-Envd-Version). This rides
+	// on the /init call the resume path already makes — before and after an
+	// upgrade — so the upgrade trigger can decide/label/confirm against the live
+	// version with no extra round-trip.
+	if v := response.Header.Get("X-Envd-Version"); v != "" {
+		s.setLiveEnvdVersion(v)
+	}
+	// The resume-time audit of the frozen cgroup set (X-Envd-Freeze-Audit). envd exports
+	// no metrics of its own, so this header is what turns the audit into a fleet-wide
+	// number instead of a guest log line nothing joins against.
+	if a := response.Header.Get("X-Envd-Freeze-Audit"); a != "" {
+		s.recordFreezeAudit(ctx, a)
+	}
+	// Alongside the version, capture the handover outcome the new envd advertises
+	// after a live upgrade (X-Envd-Handover) so the trigger can record it.
+	if h := response.Header.Get("X-Envd-Handover"); h != "" {
+		var hr EnvdHandoverResult
+		if err := json.Unmarshal([]byte(h), &hr); err == nil {
+			s.setHandoverResult(&hr)
+		}
+	}
+	// What envd reports it is EFFECTIVELY serving with (X-Envd-Defaults), compared
+	// against what we just sent. Absent on an envd that predates the header, in which
+	// case there is nothing to compare and nothing is counted.
+	if d := response.Header.Get("X-Envd-Defaults"); d != "" {
+		s.compareEnvdDefaults(ctx, d)
+	}
+	// What envd did with cpuCount (X-Envd-Cpus): a refused count must not pass silently.
+	if err := verifyEnvdCpuCount(response.Header.Get("X-Envd-Cpus"), s.guestCpuCount(), s.resolvedVmVcpus); err != nil {
+		telemetry.ReportError(ctx, "envd did not take the cpu count", err,
+			telemetry.WithSandboxID(s.Runtime.SandboxID),
+			telemetry.WithEnvdVersion(s.LiveEnvdVersion()))
+	}
+	// The memory protection configured on envd's cgroup chain (X-Envd-Memory). Read
+	// before the counters below so the cohort it derives labels them for this start.
+	if m := response.Header.Get(envdMemoryHeader); m != "" {
+		s.recordEnvdMemoryProtection(ctx, m, startType, recordMetrics)
+	}
+
 	if recordMetrics && count > 1 {
 		// Retried attempts were transient per-request failures that preceded the success.
 		envdInitCalls.Add(ctx, count-1, metric.WithAttributes(callAttributes(envdInitExitTransient)...))
@@ -503,40 +622,17 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 		envdInitCalls.Add(ctx, 1, metric.WithAttributes(callAttributes(envdInitExitSuccess)...))
 	}
 
-	defer response.Body.Close()
-	// Capture the version the running envd reports (X-Envd-Version). This rides
-	// on the /init call the resume path already makes — before and after an
-	// upgrade — so the upgrade trigger can decide/label/confirm against the live
-	// version with no extra round-trip.
-	if v := response.Header.Get("X-Envd-Version"); v != "" {
-		s.setLiveEnvdVersion(v)
-	}
-	// Alongside the version, capture the handover outcome the new envd advertises
-	// after a live upgrade (X-Envd-Handover) so the trigger can record it.
-	if h := response.Header.Get("X-Envd-Handover"); h != "" {
-		var hr EnvdHandoverResult
-		if err := json.Unmarshal([]byte(h), &hr); err == nil {
-			s.setHandoverResult(&hr)
-		}
-	}
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read envd init response body: %w", err)
-	}
-
 	if response.StatusCode != http.StatusNoContent {
-		logger.L().Error(ctx, "envd init request failed",
-			logger.WithSandboxID(s.Runtime.SandboxID),
+		s.log().Error(ctx, "envd init request failed",
 			logger.WithEnvdVersion(s.Config.Envd.Version),
 			zap.Int("status_code", response.StatusCode),
-			zap.String("response_body", utils.Truncate(string(body), 100)),
+			zap.String("response_body", envdErrorBody(response.Body)),
 		)
 
 		return fmt.Errorf("unexpected status code: %d", response.StatusCode)
 	}
 
-	logger.L().Debug(ctx, "succeeded to init envd",
-		logger.WithSandboxID(s.Runtime.SandboxID),
+	s.log().Debug(ctx, "succeeded to init envd",
 		logger.WithEnvdVersion(s.Config.Envd.Version),
 		zap.Int64("timeout_ms", s.internalConfig.EnvdInitRequestTimeout.Milliseconds()),
 		zap.Int64("attempts", count),
@@ -545,4 +641,334 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 	span.SetStatus(codes.Ok, fmt.Sprintf("envd init returned %d", response.StatusCode))
 
 	return nil
+}
+
+// guestCpuCount is the CPU count sent on /init: vcpu, or the VM's size when a resume allowed a smaller VM.
+func (s *Sandbox) guestCpuCount() int {
+	if s.resolvedVmVcpus > 0 && s.resolvedVmVcpus < s.Config.Vcpu {
+		return int(s.resolvedVmVcpus)
+	}
+
+	return int(s.Config.Vcpu)
+}
+
+// envdCpus is envd's X-Envd-Cpus report; its JSON tags match envd's cpuReport.
+type envdCpus struct {
+	Online   int    `json:"online"`
+	Possible int    `json:"possible"`
+	Target   int    `json:"target"`
+	Rejected string `json:"rejected"`
+}
+
+// The header is guest input: capped on the way in and bounded on the way into a log line.
+const (
+	envdCpusHeaderMaxBytes = 512
+	envdCpusRejectedMaxLen = 100
+)
+
+// errEnvdCannotSetCpus is an envd without CPU hotplug in a VM with spare vCPUs: they all stay online.
+var errEnvdCannotSetCpus = errors.New("envd sent no X-Envd-Cpus, so it cannot offline the spare vcpus")
+
+// verifyEnvdCpuCount checks envd's X-Envd-Cpus answer to the cpuCount sent on /init. No header is an
+// envd that predates CPU hotplug, which matters only when the VM has more vCPUs than the sandbox uses.
+func verifyEnvdCpuCount(header string, want int, vmVcpus int64) error {
+	if header == "" {
+		if vmVcpus > int64(want) {
+			return errEnvdCannotSetCpus
+		}
+
+		return nil
+	}
+	r, err := decodeEnvdHeader[envdCpus](header, envdCpusHeaderMaxBytes)
+	if err != nil {
+		return fmt.Errorf("unreadable X-Envd-Cpus: %w", err)
+	}
+	if r.Rejected != "" {
+		return fmt.Errorf("cpu count %d rejected, guest keeps %d of %d: %s", want, r.Target, r.Possible, utils.Truncate(r.Rejected, envdCpusRejectedMaxLen))
+	}
+	if r.Target != want {
+		return fmt.Errorf("cpu count %d sent, guest targets %d of %d", want, r.Target, r.Possible)
+	}
+
+	return nil
+}
+
+// EnvdEffectiveDefaults is what the running envd reports it is ACTUALLY serving
+// with, from the X-Envd-Defaults header on /init. Its JSON tags match envd's
+// api.effectiveDefaults so the header unmarshals directly.
+//
+// Absent from an envd that predates the header, which is the common case during a
+// rollout and is not an error. The caller skips the comparison on an empty header
+// rather than decoding one, so this type never holds a "no report" state: a zero value
+// reaching the comparison with a user sent would report a mismatch, and it must not be
+// reachable that way. Counting "envd did not tell us" as "envd disagrees" would make
+// the mismatch counter unusable exactly while it is most needed.
+type EnvdEffectiveDefaults struct {
+	User    string  `json:"user"`
+	Workdir *string `json:"workdir,omitempty"`
+	// Fallback is true when envd is still on its compiled-in default user, i.e.
+	// nothing ever told it who to run as.
+	Fallback bool `json:"fallback"`
+}
+
+// Bounds on the guest-written X-Envd-Defaults header. envd runs inside a guest the customer
+// controls, so every byte here is untrusted input that reaches a retained struct, a span
+// attribute and log lines on every /init.
+//
+// The numbers come from what the two fields can legitimately hold, not from the transport:
+// a username (useradd's own limit is 32; glibc LOGIN_NAME_MAX, the loosest bound at which a
+// name still resolves, is 256) and an absolute path (PATH_MAX, 4096). 256 + 4096 + ~40 bytes
+// of JSON envelope rounds up to 8 KiB, which is also the conventional per-header limit. Go's
+// transport default is 10 MiB and covers the whole header block, so it bounds neither.
+const (
+	// envdDefaultsHeaderMaxBytes is the admissible bound, in BYTES, refused before decoding.
+	// This is the one that limits retention: nothing that decodes can exceed it.
+	envdDefaultsHeaderMaxBytes = 8 << 10
+	// envdDefaultsUserMaxLen and envdDefaultsWorkdirMaxLen are display bounds, in RUNES,
+	// applied where a value escapes into a log line or a span attribute. They are not
+	// applied before the comparison: shortening one side of an equality would report a
+	// header that agreed as a mismatch. Multi-byte input can sit under these and still be
+	// refused by the byte cap above, which is the safe direction.
+	envdDefaultsUserMaxLen    = 256
+	envdDefaultsWorkdirMaxLen = 4096
+)
+
+// The source values envdDefaultsApplied reports. Named so the emitted vocabulary is
+// greppable from one place and a test can pin it: the metric's own description
+// deliberately does not enumerate them, because a list in a description is a claim
+// nothing checks.
+const (
+	// defaultsSourceMetadata: the metadata established what the build sent, and we sent it.
+	defaultsSourceMetadata = "metadata"
+	// defaultsSourceIndeterminate: the metadata could not establish it (see
+	// metadata.Template.EnvdDefaultUser), so nothing was sent and the restored process
+	// keeps serving what it holds. A population a rollout needs to size, not an error.
+	defaultsSourceIndeterminate = "indeterminate"
+	// defaultsSourceInherited: the config handed to this resume already carried a default
+	// user, so the derivation did not run and the inherited value was sent. Reachable
+	// because ResumeSandbox mutates the config it is given and the checkpoint path hands
+	// the same one back for the sandbox's next life — so the value came from the metadata
+	// originally, but not on this start. Counted, because the resume still sends a user
+	// and the withheld term is still recorded for the live-upgrade gate; kept separate,
+	// because it is not evidence that this start's derivation worked.
+	defaultsSourceInherited = "inherited"
+)
+
+// resolveEnvdDefaultUser decides which default user a resume sends and, in the same
+// return, the source it is counted under. One function for both, so what was sent and
+// what was reported cannot disagree: two derivations of the same decision are how the
+// counter came to describe a different population than the code took.
+//
+// A configured value wins without consulting the metadata. It is the metadata's own
+// value one life earlier — this function's caller writes it back into the config, and
+// the checkpoint path hands that config to the next resume — but this start did not
+// derive it, so it is not evidence the derivation works.
+func resolveEnvdDefaultUser(meta metadata.Template, configured *string) (*string, string) {
+	if configured != nil {
+		return configured, defaultsSourceInherited
+	}
+
+	if user, ok := meta.EnvdDefaultUser(); ok {
+		return &user, defaultsSourceMetadata
+	}
+
+	return nil, defaultsSourceIndeterminate
+}
+
+// recordEnvdDefaults counts where the default user this resume sent came from, and whether a
+// recorded workdir had to be withheld.
+//
+// Split by sandbox type because this path is not only customer starts: a template build
+// resumes its own sandbox once per uncached layer and again for each prefetch iteration, and
+// those never live-upgrade. Without the split the denominator answers no question.
+//
+// The withheld count sizes what this fix does NOT repair, as an UPPER BOUND rather than the
+// population. Two things make it loose, and the second dominates: a workdir equal to the
+// resolved user's home is withheld to no effect, and — for any build below
+// templates.TemplateV2ReleaseVersion — finalize sent no workdir at all, so the recorded one
+// was never in effect and withholding it loses nothing. Those are precisely the builds the
+// metadata cannot identify, so the counter cannot separate them either.
+//
+// Both labels and the withheld term are passed in rather than derived here, and the metadata
+// is deliberately NOT a parameter: the live-upgrade gate reads the same withheld term, and
+// this counter is the denominator its decline is read against. Deriving it twice is how the
+// two came to disagree — this counted a recorded workdir, the gate counted a recorded workdir
+// that was also not re-sent. With no metadata in scope the divergence cannot come back.
+func recordEnvdDefaults(ctx context.Context, source string, sbxType sandboxtypes.SandboxType, workdirWithheld bool) {
+	attrs := metric.WithAttributes(
+		attribute.String("source", source),
+		attribute.String("sandbox_type", string(sbxType)),
+	)
+	envdDefaultsApplied.Add(ctx, 1, attrs)
+
+	if workdirWithheld {
+		envdDefaultsWorkdirWithheld.Add(ctx, 1, attrs)
+	}
+}
+
+// envdDefaultsField names a field the comparison can disagree on. Values become the
+// `field` label on envdDefaultsMismatch.
+const (
+	envdDefaultsFieldUser    = "user"
+	envdDefaultsFieldWorkdir = "workdir"
+)
+
+// envdDefaultsMismatches reports which fields envd's EFFECTIVE defaults disagree with,
+// given what the orchestrator sent. Pure, so the skip rules are testable without a
+// metric reader — they are the subtle half:
+//
+//   - A value we never sent cannot be violated, so an empty `sent` is skipped rather
+//     than counted. Otherwise every legacy start would report a mismatch against a
+//     value nobody asked for.
+//   - "unset" is normalised to empty on BOTH sides. envd omits the workdir when it
+//     holds none and the orchestrator sends the empty string for the same state, so
+//     comparing the representations rather than the states would fire on every
+//     workdir-less template.
+func envdDefaultsMismatches(eff EnvdEffectiveDefaults, sentUser, sentWorkdir string) []string {
+	var fields []string
+	if sentUser != "" && eff.User != sentUser {
+		fields = append(fields, envdDefaultsFieldUser)
+	}
+	if sentWorkdir != "" && utils.DerefOrDefault(eff.Workdir, "") != sentWorkdir {
+		fields = append(fields, envdDefaultsFieldWorkdir)
+	}
+
+	return fields
+}
+
+// decodeEnvdEffectiveDefaults parses the guest-written header and bounds it, so the size
+// rules are exercised directly by a test rather than only through a sandbox.
+//
+// Over the byte cap is refused rather than parsed: a value that long is not a report we can
+// trust, so it takes the same path as one that fails to decode. That single byte bound is what
+// actually limits retention — everything the header can produce is under it.
+//
+// It deliberately does NOT shorten the values. compareEnvdDefaults tests them against what the
+// host sent, and shortening one side of an equality turns a header that agreed into a reported
+// mismatch. Display bounds belong at the points where a value escapes into a log line or a
+// span, and that is where envdDefaultsField*MaxLen are applied.
+func decodeEnvdEffectiveDefaults(header string) (EnvdEffectiveDefaults, error) {
+	return decodeEnvdHeader[EnvdEffectiveDefaults](header, envdDefaultsHeaderMaxBytes)
+}
+
+// decodeEnvdHeader decodes one guest-written JSON header into T, refusing anything over
+// maxBytes before parsing it. A header envd sets is input from a guest the customer
+// controls, so the byte bound is what limits what one can push through the decoder, and
+// the shape of T does the rest: a field the guest omits is its zero value, a field this
+// orchestrator does not know is ignored. X-Envd-Defaults and X-Envd-Memory decode through
+// it; the older headers keep their own paths.
+func decodeEnvdHeader[T any](header string, maxBytes int) (T, error) {
+	var zero T
+	if len(header) > maxBytes {
+		return zero, fmt.Errorf("header is %d bytes, over the %d-byte cap", len(header), maxBytes)
+	}
+
+	var v T
+	if err := json.Unmarshal([]byte(header), &v); err != nil {
+		return zero, err
+	}
+
+	return v, nil
+}
+
+// effectiveUserForDisplay and effectiveWorkdirForDisplay bound a guest-written value on its way
+// into a log line or a span attribute. Separate from the decode cap because they serve a
+// different purpose: the byte cap decides what is admissible, these decide what is printable.
+func (eff EnvdEffectiveDefaults) effectiveUserForDisplay() string {
+	return utils.Truncate(eff.User, envdDefaultsUserMaxLen)
+}
+
+func (eff EnvdEffectiveDefaults) effectiveWorkdirForDisplay() string {
+	return utils.Truncate(utils.DerefOrDefault(eff.Workdir, ""), envdDefaultsWorkdirMaxLen)
+}
+
+// compareEnvdDefaults checks what envd reports as effective against what we sent, and
+// counts any divergence per field.
+//
+// This is the signal whose absence made the identity loss invisible: the orchestrator
+// could see what it SENT but never what the guest ended up with, and every RPC returned
+// 200 either way. A non-zero count here means a sandbox is running requests as somebody
+// other than its template's user.
+//
+// The header is written by envd, which runs inside a guest the customer controls, so it
+// is untrusted input. It reaches log fields, a span attribute, the retained struct this
+// function stores, and the `field` label — and `field` is ours, not the guest's, so a
+// hostile value cannot inflate label cardinality. The two string fields are bounded in
+// bytes before they decode and in runes wherever they escape (see the display helpers);
+// the retained copy is deliberately whole, so the comparison reads what envd reported.
+func (s *Sandbox) compareEnvdDefaults(ctx context.Context, header string) {
+	eff, err := decodeEnvdEffectiveDefaults(header)
+	if err != nil {
+		logger.L().Warn(ctx, "could not decode the envd effective-defaults header",
+			logger.WithSandboxID(s.Runtime.SandboxID),
+			zap.Error(err),
+		)
+
+		return
+	}
+
+	// Retain it before comparing: the live-upgrade gate reads this to tell an envd that
+	// can carry the exec context itself from one that cannot.
+	s.envdReportedDefaults.Store(&eff)
+
+	sentUser := utils.DerefOrDefault(s.Config.Envd.DefaultUser, "")
+	sentWorkdir := utils.DerefOrDefault(s.Config.Envd.DefaultWorkdir, "")
+
+	for _, field := range envdDefaultsMismatches(eff, sentUser, sentWorkdir) {
+		envdDefaultsMismatch.Add(ctx, 1, metric.WithAttributes(attribute.String("field", field)))
+		logger.L().Error(ctx, "envd is serving different defaults than the ones sent",
+			logger.WithSandboxID(s.Runtime.SandboxID),
+			logger.WithEnvdVersion(s.Config.Envd.Version),
+			zap.String("field", field),
+			zap.String("sent_user", sentUser),
+			zap.String("effective_user", eff.effectiveUserForDisplay()),
+			zap.String("sent_workdir", sentWorkdir),
+			zap.String("effective_workdir", eff.effectiveWorkdirForDisplay()),
+			zap.Bool("envd_on_builtin_fallback", eff.Fallback),
+		)
+	}
+
+	// The realized loss, and the only signal that can see one. A mismatch on the user is
+	// close to unfireable by construction: SetData stores exactly what /init carried and
+	// reportEffectiveDefaults reads that same field back, so the two agree whenever
+	// anything was sent. What a sandbox actually losing its identity looks like is envd
+	// reporting it was never told at all.
+	//
+	// Labelled by whether we sent a user, because the two cases mean opposite things:
+	// not sent is the indeterminate population realizing its loss, which is expected and
+	// worth sizing; sent is a defect, since a delivered user must never read back as
+	// never-told.
+	//
+	// Skipped for a resume whose start does not describe a customer start, the same rule
+	// recordEnvdDefaults follows: this runs on every /init, and the prefetch harvest resumes
+	// every memory pause, so counting throwaways here while applied excludes them would put
+	// roughly twice the samples in this counter for one underlying population. The mismatch
+	// loop above is deliberately NOT skipped — it reports a defect rather than sizing a
+	// population, and a defect on a throwaway is still a defect.
+	if eff.Fallback && !s.skipStartupMetrics {
+		// Split by sandbox type for the same reason recordEnvdDefaults is, and more
+		// strongly: this runs on every /init, creates included, and the build tree starts
+		// sandboxes with no default user in their config at all — so without the split
+		// sent="false" tracks build volume rather than the population at risk. Build
+		// sandboxes also run the host envd, so they emit this header from the first day of
+		// the rollout, before any customer template carries one.
+		envdDefaultsBuiltinFallback.Add(ctx, 1, metric.WithAttributes(
+			attribute.Bool("sent", sentUser != ""),
+			attribute.String("sandbox_type", string(s.Runtime.SandboxType))))
+		if sentUser != "" {
+			logger.L().Error(ctx, "envd reports it was never told a default user, but one was sent",
+				logger.WithSandboxID(s.Runtime.SandboxID),
+				logger.WithEnvdVersion(s.Config.Envd.Version),
+				zap.String("sent", sentUser),
+				zap.String("effective", eff.effectiveUserForDisplay()),
+			)
+		}
+	}
+
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetAttributes(
+			attribute.String("envd.defaults.effective_user", eff.effectiveUserForDisplay()),
+			attribute.Bool("envd.defaults.builtin_fallback", eff.Fallback),
+		)
+	}
 }

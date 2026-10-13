@@ -20,6 +20,7 @@ import (
 	"github.com/e2b-dev/infra/packages/auth/pkg/auth/internal/token"
 	"github.com/e2b-dev/infra/packages/auth/pkg/types"
 	"github.com/e2b-dev/infra/packages/shared/pkg/apierrors"
+	"github.com/e2b-dev/infra/packages/shared/pkg/keys"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
@@ -29,7 +30,6 @@ const (
 	HeaderTeamID        = "X-Team-ID"
 	HeaderAdminToken    = "X-Admin-Token"
 	PrefixAPIKey        = "e2b_"
-	PrefixAccessToken   = "sk_e2b_"
 	PrefixBearer        = "Bearer "
 )
 
@@ -40,6 +40,7 @@ var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/auth/pkg/auth/intern
 var (
 	ErrNoAuthHeader      = errors.New("authorization header is missing")
 	ErrInvalidAuthHeader = errors.New("authorization header is malformed")
+	ErrMalformedAPIKey   = errors.New(keys.MalformedAPIKeyMessage)
 )
 
 // headerKey describes how to extract an authentication token from an HTTP request header.
@@ -47,6 +48,12 @@ type headerKey struct {
 	name         string
 	prefix       string
 	removePrefix string
+
+	// malformedError, when set, is returned instead of ErrInvalidAuthHeader
+	// when the token is present but lacks prefix. Only set it for a scheme
+	// that owns its header exclusively: a shared header must keep the
+	// generic error so another scheme can claim the token.
+	malformedError error
 }
 
 // Authenticator is implemented by types that can authenticate requests against a security scheme.
@@ -64,6 +71,8 @@ type commonAuthenticator[T any] struct {
 	errorMessage   string
 }
 
+const authFailureStatusContextKey = "e2b.auth.middleware.failure_status"
+
 // getHeaderKeysFromRequest extracts the token from the request header.
 func (a *commonAuthenticator[T]) getHeaderKeysFromRequest(req *http.Request) (string, error) {
 	key := req.Header.Get(a.header.name)
@@ -76,6 +85,10 @@ func (a *commonAuthenticator[T]) getHeaderKeysFromRequest(req *http.Request) (st
 	}
 
 	if a.header.prefix != "" && !strings.HasPrefix(key, a.header.prefix) {
+		if a.header.malformedError != nil {
+			return "", a.header.malformedError
+		}
+
 		return "", ErrInvalidAuthHeader
 	}
 
@@ -91,9 +104,12 @@ func (a *commonAuthenticator[T]) Authenticate(ctx context.Context, ginCtx *gin.C
 			attribute.String("auth.reason", err.Error()),
 		)
 
-		// stamp 401 so the ErrorHandler's max(writer, 400) resolves to 401
-		// when every security group fails. without this, auth failures become 400s.
-		ginCtx.Status(http.StatusUnauthorized)
+		// Gin's default 404 is not an authentication failure. This key records
+		// errors returned by common authenticators across security alternatives.
+		if _, hasAuthenticationFailure := ginCtx.Get(authFailureStatusContextKey); !hasAuthenticationFailure {
+			ginCtx.Status(http.StatusUnauthorized)
+			ginCtx.Set(authFailureStatusContextKey, struct{}{})
+		}
 
 		return err
 	}
@@ -111,13 +127,20 @@ func (a *commonAuthenticator[T]) Authenticate(ctx context.Context, ginCtx *gin.C
 		)
 
 		ginCtx.Status(validationError.Code)
+		ginCtx.Set(authFailureStatusContextKey, struct{}{})
 
-		var forbiddenError *internalauthteam.ForbiddenError
-		if errors.As(validationError.Err, &forbiddenError) {
+		if _, ok := errors.AsType[*internalauthteam.ForbiddenError](validationError.Err); ok {
 			return validationError.Err
 		}
 
-		return fmt.Errorf("%s\n%s", a.errorMessage, validationError.ClientMsg)
+		// The scheme's message rejects the credential, which a server error
+		// has not done.
+		message := validationError.ClientMsg
+		if validationError.Code < http.StatusInternalServerError {
+			message = fmt.Sprintf("%s\n%s", a.errorMessage, validationError.ClientMsg)
+		}
+
+		return errors.New(message)
 	}
 
 	telemetry.ReportEvent(ctx, "api key validated")
@@ -206,27 +229,13 @@ func NewApiKeyAuthenticator(validationFunc func(ctx context.Context, ginCtx *gin
 	return &commonAuthenticator[*types.Team]{
 		schemeName: "ApiKeyAuth",
 		header: headerKey{
-			name:   HeaderAPIKey,
-			prefix: PrefixAPIKey,
+			name:           HeaderAPIKey,
+			prefix:         PrefixAPIKey,
+			malformedError: ErrMalformedAPIKey,
 		},
 		validationFunc: validationFunc,
 		setContextFunc: authcontext.SetTeamInfo,
-		errorMessage:   "Invalid API key, please visit https://e2b.dev/docs/api-key for more information.",
-	}
-}
-
-// NewAccessTokenAuthenticator creates an authenticator for the AccessTokenAuth security scheme (Authorization Bearer sk_e2b_).
-func NewAccessTokenAuthenticator(validationFunc func(ctx context.Context, ginCtx *gin.Context, token string) (uuid.UUID, *APIError)) Authenticator {
-	return &commonAuthenticator[uuid.UUID]{
-		schemeName: "AccessTokenAuth",
-		header: headerKey{
-			name:         HeaderAuthorization,
-			prefix:       PrefixAccessToken,
-			removePrefix: PrefixBearer,
-		},
-		validationFunc: validationFunc,
-		setContextFunc: authcontext.SetUserID,
-		errorMessage:   "Invalid Access token, try to login again by running `e2b auth login`.",
+		errorMessage:   keys.InvalidAPIKeyMessage,
 	}
 }
 
@@ -259,24 +268,26 @@ func NewAuthProviderTeamAuthenticator(validationFunc func(ctx context.Context, g
 
 // NewAdminJWTAuthenticator creates an authenticator for the AdminJWTAuth security scheme.
 func NewAdminJWTAuthenticator(verifier *token.JWKSVerifier) Authenticator {
-	return &commonAuthenticator[struct{}]{
+	return &commonAuthenticator[string]{
 		schemeName: "AdminJWTAuth",
 		header: headerKey{
 			name:         HeaderAuthorization,
 			removePrefix: PrefixBearer,
 		},
-		validationFunc: func(ctx context.Context, _ *gin.Context, token string) (struct{}, *APIError) {
-			if _, err := verifier.Verify(ctx, token); err != nil {
-				return struct{}{}, &APIError{
-					Code:      http.StatusUnauthorized,
-					Err:       err,
-					ClientMsg: "Invalid service token.",
-				}
+		validationFunc: func(ctx context.Context, _ *gin.Context, token string) (string, *APIError) {
+			claims, err := verifier.Verify(ctx, token)
+			if err != nil {
+				return "", &APIError{Code: http.StatusUnauthorized, Err: err, ClientMsg: "Invalid service token."}
+			}
+			issuer, err := claims.GetIssuer()
+			if err != nil {
+				return "", &APIError{Code: http.StatusUnauthorized, Err: err, ClientMsg: "Invalid service token."}
 			}
 
-			return struct{}{}, nil
+			return issuer, nil
 		},
-		errorMessage: "Invalid service token.",
+		setContextFunc: authcontext.SetServiceIssuer,
+		errorMessage:   "Invalid service token.",
 	}
 }
 

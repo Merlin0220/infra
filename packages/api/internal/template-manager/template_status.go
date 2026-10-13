@@ -9,7 +9,10 @@ import (
 	"github.com/flowchartsman/retry"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
+	"github.com/e2b-dev/infra/packages/api/internal/clusters"
 	"github.com/e2b-dev/infra/packages/db/pkg/types"
 	"github.com/e2b-dev/infra/packages/db/queries"
 	templatemanagergrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
@@ -19,7 +22,26 @@ import (
 var (
 	buildTimeout             = time.Hour
 	syncWaitingStateDeadline = time.Minute * 40
+
+	// transientErrorGracePeriod bounds how long the poller tolerates transient
+	// status errors — the build keeps running on the builder while we retry.
+	transientErrorGracePeriod = 5 * time.Minute
 )
+
+// errTransientStatus marks a status error worth retrying instead of failing the build.
+var errTransientStatus = errors.New("transient error")
+
+// terminalWriteTimeout bounds a write that records a build's final status.
+const terminalWriteTimeout = 30 * time.Second
+
+// terminalWriteContext returns the context for recording a build's final
+// status. It is detached from ctx because the poll context expires at the build
+// deadline, and pgx fast-fails an expired context while the retry wrapper does
+// not retry context errors: a terminal write made on it never lands, leaving
+// the build in progress forever.
+func terminalWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), terminalWriteTimeout)
+}
 
 func (tm *TemplateManager) BuildStatusSync(ctx context.Context, buildID uuid.UUID, templateID string, clusterID uuid.UUID, nodeID *string) error {
 	if tm.createInProcessingQueue(buildID, templateID) {
@@ -83,9 +105,10 @@ func (tm *TemplateManager) BuildStatusSync(ctx context.Context, buildID uuid.UUI
 }
 
 type templateManagerClient interface {
-	SetStatus(ctx context.Context, buildID uuid.UUID, statusGroup types.BuildStatusGroup, reason *templatemanagergrpc.TemplateBuildStatusReason) error
+	SetTerminalStatus(ctx context.Context, buildID uuid.UUID, statusGroup types.BuildStatusGroup, reason *templatemanagergrpc.TemplateBuildStatusReason) (bool, error)
 	SetFinished(ctx context.Context, buildID uuid.UUID, rootfsSize int64, envdVersion, kernelVersion, firecrackerVersion string) error
 	GetStatus(ctx context.Context, buildId uuid.UUID, templateID string, clusterID uuid.UUID, nodeID string) (*templatemanagergrpc.TemplateBuildStatusResponse, error)
+	DeleteBuild(ctx context.Context, buildID uuid.UUID, templateID string, clusterID uuid.UUID, nodeID string) error
 }
 
 type PollBuildStatus struct {
@@ -99,6 +122,10 @@ type PollBuildStatus struct {
 	nodeID    string
 
 	status *templatemanagergrpc.TemplateBuildStatusResponse
+
+	// transientErrorsSince is when the current run of transient status errors
+	// started. Zero while the builder is answering.
+	transientErrorsSince time.Time
 }
 
 func (c *PollBuildStatus) poll(ctx context.Context) {
@@ -108,29 +135,55 @@ func (c *PollBuildStatus) poll(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// A cancelled window means the poller is going away, not the build.
+			// The periodical sync re-adopts the build, so nothing is recorded.
+			if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				c.logger.Debug(ctx, "Build status polling stopped, leaving the build in progress", zap.Error(ctx.Err()))
+
+				return
+			}
+
 			c.logger.Debug(ctx, "Build status polling timed out, stopping polling")
 
-			statusErr := c.client.SetStatus(ctx, c.buildID, types.BuildStatusGroupFailed, &templatemanagergrpc.TemplateBuildStatusReason{
-				Message: fmt.Sprintf("build status polling timed out. Maximum build time is %s.", buildTimeout),
-			})
-			if statusErr != nil {
-				c.logger.Error(ctx, "error when setting build status", zap.Error(statusErr))
+			if c.setFailed(ctx, fmt.Sprintf("build status polling timed out. Maximum build time is %s.", buildTimeout)) {
+				c.cancelBuildOnNode(ctx)
 			}
 
 			return
 		case <-ticker.C:
 			buildCompleted, err := c.checkBuildStatus(ctx)
 			if err != nil {
-				c.logger.Error(ctx, "Build status polling received unrecoverable error", zap.Error(err))
+				// The check was cut short by the window closing, which says nothing
+				// about the build. The ctx.Done() case decides what to record.
+				if ctx.Err() != nil {
+					c.logger.Debug(ctx, "Build status polling window closed mid-check",
+						zap.Error(errors.Join(ctx.Err(), err)))
 
-				statusErr := c.client.SetStatus(ctx, c.buildID, types.BuildStatusGroupFailed, &templatemanagergrpc.TemplateBuildStatusReason{
-					Message: fmt.Sprintf("polling received unrecoverable error: %s", err),
-				})
-				if statusErr != nil {
-					c.logger.Error(ctx, "error when setting build status", zap.Error(statusErr))
+					continue
 				}
 
+				waitStarting := c.transientErrorsSince.IsZero()
+				failure := c.buildFailure(err)
+				if failure == nil {
+					// Logged once per run of errors, not on every tick.
+					if waitStarting {
+						c.logger.Warn(ctx, "Build status polling received a transient error, keeping the build alive",
+							zap.Error(err), zap.Duration("grace_period", transientErrorGracePeriod))
+					}
+
+					continue
+				}
+
+				c.logger.Error(ctx, "Build status polling failed", zap.Error(failure))
+
+				c.setFailed(ctx, failure.Error())
+
 				return
+			}
+
+			if !c.transientErrorsSince.IsZero() {
+				c.logger.Info(ctx, "Build status polling recovered", zap.Duration("failing_for", time.Since(c.transientErrorsSince)))
+				c.transientErrorsSince = time.Time{}
 			}
 
 			// build status can return empty error when build is still in progress
@@ -142,30 +195,91 @@ func (c *PollBuildStatus) poll(ctx context.Context) {
 	}
 }
 
-// terminalError is a terminal error that should not be retried
-// set like this so that we can check for it using errors.As
-type terminalError struct {
-	err error
+// buildFailure turns a polling error into the reason the build should be failed
+// with, or nil when the error is transient and the poller should just try again.
+func (c *PollBuildStatus) buildFailure(err error) error {
+	if !errors.Is(err, errTransientStatus) {
+		return fmt.Errorf("polling received unrecoverable error: %w", err)
+	}
+
+	if c.transientErrorsSince.IsZero() {
+		c.transientErrorsSince = time.Now()
+	}
+
+	if time.Since(c.transientErrorsSince) >= transientErrorGracePeriod {
+		return fmt.Errorf("polling kept failing for %s: %w", transientErrorGracePeriod, err)
+	}
+
+	return nil
 }
 
-func (e terminalError) Error() string {
-	return e.err.Error()
+// setFailed records the build as failed. It reports false when another poller
+// ended the build first, in which case this write changed nothing.
+func (c *PollBuildStatus) setFailed(ctx context.Context, message string) bool {
+	writeCtx, cancel := terminalWriteContext(ctx)
+	defer cancel()
+
+	recorded, err := c.client.SetTerminalStatus(writeCtx, c.buildID, types.BuildStatusGroupFailed, &templatemanagergrpc.TemplateBuildStatusReason{
+		Message: message,
+	})
+	if err != nil {
+		c.logger.Error(writeCtx, "error when setting build status", zap.Error(err))
+	}
+
+	return recorded
 }
 
-func newTerminalError(err error) error {
-	return terminalError{
-		err: retry.Stop(err),
+// cancelBuildOnNode stops a build the poller has just failed for running out of
+// time. The builder has no deadline of its own, and a build that is no longer in
+// progress is watched by neither the periodical sync nor the admin cancel
+// endpoint, so left alone it holds its node slot to completion. The delete takes
+// the build's artifacts with it, so it must follow a write that ended the build
+// rather than one that lost to another poller.
+func (c *PollBuildStatus) cancelBuildOnNode(ctx context.Context) {
+	writeCtx, cancel := terminalWriteContext(ctx)
+	defer cancel()
+
+	err := c.client.DeleteBuild(writeCtx, c.buildID, c.templateID, c.clusterID, c.nodeID)
+	if err != nil {
+		c.logger.Error(writeCtx, "error when cancelling the timed-out build on the node", zap.Error(err))
+	}
+}
+
+// isTransientStatusError reports whether a status RPC failed for a reason that
+// says nothing about the build itself. gRPC status errors do not unwrap to
+// context.DeadlineExceeded, so the status code has to be inspected explicitly.
+func isTransientStatusError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	// The builder lookup also fails while the instance flaps Unhealthy after a few
+	// missed syncs — as recoverable as the RPC-level errors below.
+	if errors.Is(err, clusters.ErrTemplateBuilderNotFound) {
+		return true
+	}
+
+	st, ok := grpcstatus.FromError(err)
+	if !ok {
+		return false
+	}
+
+	switch st.Code() {
+	case codes.DeadlineExceeded, codes.Unavailable, codes.ResourceExhausted:
+		return true
+	default:
+		return false
 	}
 }
 
 func (c *PollBuildStatus) setStatus(ctx context.Context) error {
 	status, err := c.client.GetStatus(ctx, c.buildID, c.templateID, c.clusterID, c.nodeID)
-	if err != nil && errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("context deadline exceeded: %w", err)
-	} else if err != nil { // retry only on context deadline exceeded
+	if err != nil && isTransientStatusError(err) {
+		return fmt.Errorf("%w when polling build status: %w", errTransientStatus, err)
+	} else if err != nil { // retry only on transient errors
 		c.logger.Error(ctx, "terminal error when polling build status", zap.Error(err))
 
-		return newTerminalError(err)
+		return retry.Stop(err)
 	}
 
 	if status == nil {
@@ -187,7 +301,10 @@ func (c *PollBuildStatus) dispatchBasedOnStatus(ctx context.Context, status *tem
 	switch status.GetStatus() {
 	case templatemanagergrpc.TemplateBuildState_Failed:
 		// build failed
-		err := c.client.SetStatus(ctx, c.buildID, types.BuildStatusGroupFailed, status.GetReason())
+		writeCtx, cancel := terminalWriteContext(ctx)
+		defer cancel()
+
+		_, err := c.client.SetTerminalStatus(writeCtx, c.buildID, types.BuildStatusGroupFailed, status.GetReason())
 		if err != nil {
 			return false, fmt.Errorf("error when setting build status: %w", err)
 		}
@@ -200,8 +317,11 @@ func (c *PollBuildStatus) dispatchBasedOnStatus(ctx context.Context, status *tem
 			return false, errors.New("nil metadata")
 		}
 
+		writeCtx, cancel := terminalWriteContext(ctx)
+		defer cancel()
+
 		err := c.client.SetFinished(
-			ctx,
+			writeCtx,
 			c.buildID,
 			int64(meta.GetRootfsSizeKey()),
 			meta.GetEnvdVersionKey(),
@@ -231,8 +351,6 @@ func (c *PollBuildStatus) checkBuildStatus(ctx context.Context) (bool, error) {
 
 	err := retrier.RunContext(ctx, c.setStatus)
 	if err != nil {
-		c.logger.Error(ctx, "error when calling setStatus", zap.Error(err))
-
 		return false, err
 	}
 
@@ -268,43 +386,64 @@ func (tm *TemplateManager) createInProcessingQueue(buildID uuid.UUID, templateID
 }
 
 func (tm *TemplateManager) SetStatus(ctx context.Context, buildID uuid.UUID, statusGroup types.BuildStatusGroup, reason *templatemanagergrpc.TemplateBuildStatusReason) error {
-	var buildReason types.BuildReason
-	if reason != nil {
-		buildReason = types.BuildReason{
-			Message: reason.GetMessage(),
-		}
-		if step := reason.GetStep(); step != "" {
-			buildReason.Step = &step
-		}
+	if statusGroup.IsTerminal() {
+		_, err := tm.SetTerminalStatus(ctx, buildID, statusGroup, reason)
+
+		return err
 	}
 
 	now := time.Now()
 
-	var err error
-	if statusGroup.IsTerminal() {
-		logger.L().Warn(ctx, "Setting template build status to terminal failure",
-			logger.WithBuildID(buildID.String()),
-			zap.String("reason", buildReason.Message),
-		)
-
-		err = tm.sqlcDB.FailTemplateBuildAndDeactivate(ctx, queries.FailTemplateBuildAndDeactivateParams{
-			Status:     buildStatus(statusGroup),
-			FinishedAt: &now,
-			Reason:     buildReason,
-			BuildID:    buildID,
-		})
-	} else {
-		err = tm.sqlcDB.UpdateEnvBuildStatus(ctx, queries.UpdateEnvBuildStatusParams{
-			Status:     buildStatus(statusGroup),
-			FinishedAt: &now,
-			Reason:     buildReason,
-			BuildID:    buildID,
-		})
-	}
+	err := tm.sqlcDB.UpdateEnvBuildStatus(ctx, queries.UpdateEnvBuildStatusParams{
+		Status:     buildStatus(statusGroup),
+		FinishedAt: &now,
+		Reason:     buildReasonFrom(reason),
+		BuildID:    buildID,
+	})
 
 	tm.buildCache.Invalidate(ctx, buildID)
 
 	return err
+}
+
+// SetTerminalStatus records a build's final outcome and reports whether this
+// write is the one that ended it: several pollers watch the same build, and the
+// build keeps the first outcome recorded.
+func (tm *TemplateManager) SetTerminalStatus(ctx context.Context, buildID uuid.UUID, statusGroup types.BuildStatusGroup, reason *templatemanagergrpc.TemplateBuildStatusReason) (bool, error) {
+	buildReason := buildReasonFrom(reason)
+
+	logger.L().Warn(ctx, "Setting template build status to terminal failure",
+		logger.WithBuildID(buildID.String()),
+		zap.String("reason", buildReason.Message),
+	)
+
+	now := time.Now()
+
+	recorded, err := tm.sqlcDB.FailTemplateBuildAndDeactivate(ctx, queries.FailTemplateBuildAndDeactivateParams{
+		Status:     buildStatus(statusGroup),
+		FinishedAt: &now,
+		Reason:     buildReason,
+		BuildID:    buildID,
+	})
+
+	tm.buildCache.Invalidate(ctx, buildID)
+
+	return recorded, err
+}
+
+func buildReasonFrom(reason *templatemanagergrpc.TemplateBuildStatusReason) types.BuildReason {
+	if reason == nil {
+		return types.BuildReason{}
+	}
+
+	buildReason := types.BuildReason{
+		Message: reason.GetMessage(),
+	}
+	if step := reason.GetStep(); step != "" {
+		buildReason.Step = &step
+	}
+
+	return buildReason
 }
 
 func (tm *TemplateManager) SetFinished(ctx context.Context, buildID uuid.UUID, rootfsSize int64, envdVersion, kernelVersion, firecrackerVersion string) error {

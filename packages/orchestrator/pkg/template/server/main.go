@@ -17,7 +17,9 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/proxy"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	sbxtemplate "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/service"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/envd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/metrics"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/cache"
 	artifactsregistry "github.com/e2b-dev/infra/packages/shared/pkg/artifacts-registry"
@@ -27,6 +29,7 @@ import (
 	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
 
@@ -43,6 +46,7 @@ type ServerStore struct {
 	templatemanager.UnimplementedTemplateServiceServer
 
 	logger            logger.Logger
+	info              *service.ServiceInfo
 	builder           *build.Builder
 	buildCache        *cache.BuildCache
 	buildLogger       logger.Logger
@@ -60,6 +64,7 @@ type ServerStore struct {
 func New(
 	ctx context.Context,
 	config cfg.Config,
+	info *service.ServiceInfo,
 	featureFlags *featureflags.Client,
 	meterProvider metric.MeterProvider,
 	logger logger.Logger,
@@ -72,6 +77,39 @@ func New(
 	uploads *sandbox.Uploads,
 ) (s *ServerStore, e error) {
 	logger.Info(ctx, "Initializing template manager")
+
+	// Validate the build envd up front: a template-manager whose envd is
+	// unresolvable can only produce failed builds. On a build-only node,
+	// refuse to start — the deploy's health gate then surfaces a broken
+	// /fc-envd mount or a misordered envd-version rollout before the node
+	// takes any build. On a node that also serves sandboxes, log loudly and
+	// keep running: each build still fails with the same error, but a
+	// build-only defect must never cost sandbox capacity. This validates the
+	// flag's value at startup; per-build resolution re-reads it, so a flag
+	// change after startup is still picked up (and re-validated) per build.
+	// Bound the validation: it runs before any listener is up and both calls
+	// can exec the envd binary, and the very defect this check exists to
+	// surface (a broken /fc-envd mount) can hang the exec on I/O instead of
+	// failing fast — an unbounded hang here would block the whole node, not
+	// just template builds.
+	envdCtx, envdCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer envdCancel()
+	envdTarget := featureFlags.StringFlag(ctx, featureflags.BuildEnvdVersion)
+	envdPath, envdErr := envd.ResolveBuildBinary(envdCtx, envdTarget, config.HostEnvdPath)
+	if envdErr == nil {
+		var envdVersion string
+		if envdVersion, envdErr = envd.GetEnvdVersion(envdCtx, envdPath); envdErr == nil {
+			logger.Info(ctx, fmt.Sprintf("Template builds will bake envd v%s", envdVersion),
+				zap.String("envd_path", envdPath))
+		}
+	}
+	if envdErr != nil {
+		if !cfg.GetServices(config).Has(cfg.Orchestrator) {
+			return nil, fmt.Errorf("envd for template builds is unresolvable: %w", envdErr)
+		}
+		logger.Error(ctx, "envd for template builds is unresolvable — every template build on this node will fail until it is fixed", zap.Error(envdErr))
+		telemetry.ReportCriticalError(ctx, "envd for template builds is unresolvable", envdErr)
+	}
 
 	closers := make([]closeable, 0)
 	defer func() {
@@ -110,7 +148,6 @@ func New(
 		sandboxFactory,
 		templatePersistence,
 		buildPersistence,
-		artifactsRegistry,
 		dockerhubRepository,
 		proxy,
 		sandboxFactory.Sandboxes,
@@ -121,6 +158,7 @@ func New(
 
 	store := &ServerStore{
 		logger:            logger,
+		info:              info,
 		builder:           builder,
 		buildCache:        buildCache,
 		buildLogger:       buildLogger,

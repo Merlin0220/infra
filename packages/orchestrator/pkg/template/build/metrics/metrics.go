@@ -31,6 +31,17 @@ const (
 	BuildResultInternalError BuildResultType = "internal_error"
 )
 
+// BuildResultAttributeKey is the span attribute that carries the same value as
+// the `result` label on template_build_result_total, so a trace can be filtered
+// by classification (e.g. TraceQL `{ span.build.result = "internal_error" }`)
+// without relying on which span happened to get an Error status.
+const BuildResultAttributeKey = attribute.Key("build.result")
+
+// BuildResultAttribute returns the build.result span attribute for resultType.
+func BuildResultAttribute(resultType BuildResultType) attribute.KeyValue {
+	return BuildResultAttributeKey.String(string(resultType))
+}
+
 // BuildMetrics contains all metrics related to template building
 type BuildMetrics struct {
 	// Duration histograms
@@ -91,19 +102,21 @@ func NewBuildMetrics(meterProvider metric.MeterProvider) (*BuildMetrics, error) 
 }
 
 // RecordBuildDuration records the total build duration
-func (m *BuildMetrics) RecordBuildDuration(ctx context.Context, duration time.Duration, success bool) {
+func (m *BuildMetrics) RecordBuildDuration(ctx context.Context, teamID string, duration time.Duration, success bool) {
 	attrs := []attribute.KeyValue{
 		attribute.Bool("success", success),
+		telemetry.WithTeamID(teamID),
 	}
 	m.BuildDurationHistogram.Record(ctx, duration.Milliseconds(), metric.WithAttributes(attrs...))
 }
 
 // RecordPhaseDuration records the duration of a build phase
-func (m *BuildMetrics) RecordPhaseDuration(ctx context.Context, duration time.Duration, phase Phase, stepType string, cached bool) {
+func (m *BuildMetrics) RecordPhaseDuration(ctx context.Context, teamID string, duration time.Duration, phase Phase, stepType string, cached bool) {
 	attrs := []attribute.KeyValue{
 		attribute.String("phase", string(phase)),
 		attribute.String("step_type", stepType),
 		attribute.Bool("cached", cached),
+		telemetry.WithTeamID(teamID),
 	}
 	m.BuildPhaseDurationHistogram.Record(ctx, duration.Milliseconds(), metric.WithAttributes(attrs...))
 }
@@ -111,23 +124,24 @@ func (m *BuildMetrics) RecordPhaseDuration(ctx context.Context, duration time.Du
 // RecordBuildResult records the result of a build (success, user_error, or internal_error)
 func (m *BuildMetrics) RecordBuildResult(ctx context.Context, teamID string, resultType BuildResultType) {
 	attrs := []attribute.KeyValue{
-		telemetry.WithTeamID(teamID),
 		attribute.String("result", string(resultType)),
+		telemetry.WithTeamID(teamID),
 	}
 	m.BuildResultCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // RecordCacheResult records the result of a cache lookup (hit or miss)
-func (m *BuildMetrics) RecordCacheResult(ctx context.Context, phase Phase, stepType string, hit bool) {
+func (m *BuildMetrics) RecordCacheResult(ctx context.Context, teamID string, phase Phase, stepType string, hit bool) {
 	attrs := []attribute.KeyValue{
 		attribute.String("phase", string(phase)),
 		attribute.String("step_type", stepType),
 		attribute.Bool("hit", hit),
+		telemetry.WithTeamID(teamID),
 	}
 	m.BuildCacheResultCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // RecordRootfsSize records the rootfs size
-func (m *BuildMetrics) RecordRootfsSize(ctx context.Context, size int64) {
-	m.BuildRootfsSizeHistogram.Record(ctx, size)
+func (m *BuildMetrics) RecordRootfsSize(ctx context.Context, teamID string, size int64) {
+	m.BuildRootfsSizeHistogram.Record(ctx, size, metric.WithAttributes(telemetry.WithTeamID(teamID)))
 }

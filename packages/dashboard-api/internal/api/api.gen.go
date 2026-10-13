@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -35,6 +36,39 @@ func (e BuildStatus) Valid() bool {
 	case Failed:
 		return true
 	case Success:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ErrorCode.
+const (
+	ClusterAssignmentAlreadyAssigned    ErrorCode = "cluster_assignment_already_assigned"
+	ClusterAssignmentClusterNotFound    ErrorCode = "cluster_assignment_cluster_not_found"
+	ClusterAssignmentInvalid            ErrorCode = "cluster_assignment_invalid"
+	ClusterAssignmentProjectNotFound    ErrorCode = "cluster_assignment_project_not_found"
+	ClusterAssignmentRequiresEnterprise ErrorCode = "cluster_assignment_requires_enterprise"
+	ClusterRegistrationConflict         ErrorCode = "cluster_registration_conflict"
+	ClusterRegistrationInvalid          ErrorCode = "cluster_registration_invalid"
+)
+
+// Valid indicates whether the value is a known member of the ErrorCode enum.
+func (e ErrorCode) Valid() bool {
+	switch e {
+	case ClusterAssignmentAlreadyAssigned:
+		return true
+	case ClusterAssignmentClusterNotFound:
+		return true
+	case ClusterAssignmentInvalid:
+		return true
+	case ClusterAssignmentProjectNotFound:
+		return true
+	case ClusterAssignmentRequiresEnterprise:
+		return true
+	case ClusterRegistrationConflict:
+		return true
+	case ClusterRegistrationInvalid:
 		return true
 	default:
 		return false
@@ -137,11 +171,6 @@ func (e GetTemplatesTemplateIDTagsGroupsParamsSort) Valid() bool {
 	}
 }
 
-// AddTeamMemberRequest defines model for AddTeamMemberRequest.
-type AddTeamMemberRequest struct {
-	Email openapi_types.Email `json:"email"`
-}
-
 // AdminAuthProviderProfile defines model for AdminAuthProviderProfile.
 type AdminAuthProviderProfile struct {
 	// Email Email address from the configured auth provider.
@@ -166,29 +195,28 @@ type AdminAuthProviderProfilesResponse struct {
 	Profiles []AdminAuthProviderProfile `json:"profiles"`
 }
 
-// AdminAuthProviderUserBootstrapRequest defines model for AdminAuthProviderUserBootstrapRequest.
-type AdminAuthProviderUserBootstrapRequest struct {
-	OidcIssuer      string              `json:"oidc_issuer"`
-	OidcUserEmail   openapi_types.Email `json:"oidc_user_email"`
-	OidcUserId      string              `json:"oidc_user_id"`
-	OidcUserName    *string             `json:"oidc_user_name,omitempty"`
-	SignupIp        *string             `json:"signup_ip,omitempty"`
-	SignupUserAgent *string             `json:"signup_user_agent,omitempty"`
-}
-
 // AdminClusterCreateRequest defines model for AdminClusterCreateRequest.
 type AdminClusterCreateRequest struct {
-	AuthOrgId          *string `json:"auth_org_id,omitempty"`
-	Endpoint           string  `json:"endpoint"`
-	EndpointTls        bool    `json:"endpoint_tls"`
-	Name               string  `json:"name"`
-	SandboxProxyDomain *string `json:"sandbox_proxy_domain,omitempty"`
-	Token              string  `json:"token"`
+	AuthOrgId *string `json:"auth_org_id,omitempty"`
+
+	// ClusterId Optional stable identifier for idempotent creation. Reuse succeeds only when the immutable configuration is identical.
+	ClusterId          *openapi_types.UUID `json:"cluster_id,omitempty"`
+	Endpoint           string              `json:"endpoint"`
+	EndpointTls        bool                `json:"endpoint_tls"`
+	Name               string              `json:"name"`
+	SandboxProxyDomain *string             `json:"sandbox_proxy_domain,omitempty"`
+	Token              string              `json:"token"`
 }
 
 // AdminClusterCreateResponse defines model for AdminClusterCreateResponse.
 type AdminClusterCreateResponse struct {
 	ClusterId openapi_types.UUID `json:"cluster_id"`
+}
+
+// AdminTeamBlockRequest defines model for AdminTeamBlockRequest.
+type AdminTeamBlockRequest struct {
+	// Reason Shown to the team as the reason it is blocked.
+	Reason string `json:"reason"`
 }
 
 // AdminTeamBootstrapRequest defines model for AdminTeamBootstrapRequest.
@@ -198,11 +226,6 @@ type AdminTeamBootstrapRequest struct {
 
 	// Name Team name.
 	Name string `json:"name"`
-}
-
-// AdminTeamClusterAssignmentRequest defines model for AdminTeamClusterAssignmentRequest.
-type AdminTeamClusterAssignmentRequest struct {
-	ClusterId openapi_types.UUID `json:"cluster_id"`
 }
 
 // AdminTeamClusterAssignmentResponse defines model for AdminTeamClusterAssignmentResponse.
@@ -263,11 +286,6 @@ type BuildsStatusesResponse struct {
 // CPUCount CPU cores for the sandbox
 type CPUCount = int64
 
-// CreateTeamRequest defines model for CreateTeamRequest.
-type CreateTeamRequest struct {
-	Name string `json:"name"`
-}
-
 // DefaultTemplate defines model for DefaultTemplate.
 type DefaultTemplate struct {
 	Aliases         []DefaultTemplateAlias `json:"aliases"`
@@ -302,9 +320,15 @@ type Error struct {
 	// Code Error code.
 	Code int32 `json:"code"`
 
+	// ErrorCode Stable machine-readable reason for an API error. New codes may be added as other errors adopt this contract. Clients must handle absent or unknown codes without interpreting the human-readable message.
+	ErrorCode *ErrorCode `json:"error_code,omitempty"`
+
 	// Message Error message.
 	Message string `json:"message"`
 }
+
+// ErrorCode Stable machine-readable reason for an API error. New codes may be added as other errors adopt this contract. Clients must handle absent or unknown codes without interpreting the human-readable message.
+type ErrorCode string
 
 // HealthResponse defines model for HealthResponse.
 type HealthResponse struct {
@@ -348,8 +372,24 @@ type ListedBuild struct {
 	TemplateId string `json:"templateId"`
 }
 
+// ManagementClusterRegistrationRequest defines model for ManagementClusterRegistrationRequest.
+type ManagementClusterRegistrationRequest struct {
+	AuthOrgId          *string `json:"auth_org_id,omitempty"`
+	Endpoint           string  `json:"endpoint"`
+	EndpointTls        bool    `json:"endpoint_tls"`
+	Name               string  `json:"name"`
+	SandboxProxyDomain *string `json:"sandbox_proxy_domain,omitempty"`
+	Token              string  `json:"token"`
+}
+
+// ManagementDecidedAt When the caller decided this revision, in RFC 3339. Stored with the revision and used to measure how long the decision took to apply here. Omit it when the caller does not know; the delivery is then counted as origin unknown rather than as zero lag.
+type ManagementDecidedAt = time.Time
+
 // ManagementProject defines model for ManagementProject.
 type ManagementProject struct {
+	// ClusterId Cluster assignment to synchronize. Omission preserves the existing assignment.
+	ClusterId *openapi_types.UUID `json:"cluster_id,omitempty"`
+
 	// Email Contact address recorded on the project.
 	Email string             `json:"email"`
 	Id    openapi_types.UUID `json:"id"`
@@ -359,33 +399,70 @@ type ManagementProject struct {
 	Slug string `json:"slug"`
 }
 
+// ManagementProjectBlockRequest Desired project block state. A newer revision replaces the state, including any intervening manual block or unblock.
+type ManagementProjectBlockRequest struct {
+	// Blocked Whether the project is refused billable work.
+	Blocked bool `json:"blocked"`
+
+	// DecidedAt When the caller decided this revision, in RFC 3339. Stored with the revision and used to measure how long the decision took to apply here. Omit it when the caller does not know; the delivery is then counted as origin unknown rather than as zero lag.
+	DecidedAt *ManagementDecidedAt `json:"decided_at,omitempty"`
+
+	// Reason Reason included in blocked-request errors. Cleared when blocked is false.
+	Reason *string `json:"reason,omitempty"`
+
+	// Revision Monotonic per-project revision. Older or duplicate revisions succeed without changing stored state.
+	Revision int64 `json:"revision"`
+}
+
 // ManagementProjectLimits A project's effective limits, already resolved by the caller. Every field is absolute: this side stores what it is given and performs no arithmetic of its own.
 //
 // The minimums below track the CHECK constraints on tiers, which is the contract for what a limit may be. project_limits stores the same values under looser constraints on purpose — it is a push target, and a floor that only rejects the impossible keeps a future decision about what is allowed a change to this schema rather than a migration.
+//
+// `max_disk_size_mb` and `max_free_disk_size_mb` are one ceiling under two names, and either name alone carries it. A caller that sends both must send them equal; a caller that sends neither is refused. Sending both is what a caller does while receivers older than the second name are still running.
 type ManagementProjectLimits struct {
+	// ApiTeamRpsList Requests per second a project may make to each list endpoint. Zero disables the limit.
+	ApiTeamRpsList           int64 `json:"api_team_rps_list"`
 	ConcurrentSandboxes      int32 `json:"concurrent_sandboxes"`
 	ConcurrentTemplateBuilds int32 `json:"concurrent_template_builds"`
 
-	// DefaultFreeDiskSizeMb Free rootfs allowance. Must not exceed max_disk_size_mb; the two are stored together and rejected as a pair if they disagree.
+	// DecidedAt When the caller decided this revision, in RFC 3339. Stored with the revision and used to measure how long the decision took to apply here. Omit it when the caller does not know; the delivery is then counted as origin unknown rather than as zero lag.
+	DecidedAt *ManagementDecidedAt `json:"decided_at,omitempty"`
+
+	// DefaultFreeDiskSizeMb The default free-space growth target when a template build request omits one. May sit anywhere at or below the maximum free-space growth target, and usually sits well below it; a delivery whose default exceeds the maximum is rejected.
 	DefaultFreeDiskSizeMb int64 `json:"default_free_disk_size_mb"`
 	DiskMb                int64 `json:"disk_mb"`
 	EventsTtlDays         int32 `json:"events_ttl_days"`
-	MaxDiskSizeMb         int64 `json:"max_disk_size_mb"`
-	MaxRamMb              int64 `json:"max_ram_mb"`
-	MaxSandboxLengthHours int32 `json:"max_sandbox_length_hours"`
-	MaxVcpu               int32 `json:"max_vcpu"`
+
+	// MaxDiskSizeMb The same ceiling as max_free_disk_size_mb, under the name it was first published with. Kept until every deployed sender and receiver speaks the other name.
+	MaxDiskSizeMb *int64 `json:"max_disk_size_mb,omitempty"`
+
+	// MaxFreeDiskSizeMb The most a template build may request as its free-space growth target.
+	MaxFreeDiskSizeMb     *int64 `json:"max_free_disk_size_mb,omitempty"`
+	MaxRamMb              int64  `json:"max_ram_mb"`
+	MaxSandboxLengthHours int32  `json:"max_sandbox_length_hours"`
+	MaxVcpu               int32  `json:"max_vcpu"`
 
 	// Revision The caller's version of this answer, raised whenever the limits it resolved for the project change. Delivery is over a network, so two pushes can be in flight at once and arrive in either order: this side stores the revision it accepted and drops a delivery at or below it, which is what keeps a delayed retry from putting the project back on limits it has already left.
 	//
 	// Comparable only against earlier revisions for the same project.
 	Revision int64 `json:"revision"`
+	union    json.RawMessage
 }
+
+// ManagementProjectLimits0 defines model for ManagementProjectLimits.0.
+type ManagementProjectLimits0 = interface{}
+
+// ManagementProjectLimits1 defines model for ManagementProjectLimits.1.
+type ManagementProjectLimits1 = interface{}
 
 // ManagementProjectMemberApplyRequest defines model for ManagementProjectMemberApplyRequest.
 type ManagementProjectMemberApplyRequest struct {
 	Identities *[]ManagementProjectMemberIdentity `json:"identities,omitempty"`
-	Present    bool                               `json:"present"`
-	Revision   int64                              `json:"revision"`
+
+	// IsDefault Whether this membership is the user's default team. Omitted requests from older sources remain non-default.
+	IsDefault *bool `json:"is_default,omitempty"`
+	Present   bool  `json:"present"`
+	Revision  int64 `json:"revision"`
 }
 
 // ManagementProjectMemberIdentity defines model for ManagementProjectMemberIdentity.
@@ -394,10 +471,13 @@ type ManagementProjectMemberIdentity struct {
 	Subject string `json:"subject"`
 }
 
-// ManagementProjectUpsertRequest The properties of a project this side stores. Every one is synchronized by the caller and sent on every push, so a reconcile is a complete statement of the project rather than a patch.
+// ManagementProjectUpsertRequest The properties of a project this side stores. Name, slug and email are synchronized on every push. The optional cluster assignment is preserved when omitted.
 //
 // A project's tier is not among them. It is assigned once, at creation, from this side's own default, and no push moves it — limits arrive separately and in full through upsertProjectLimits, which takes precedence over the tier anyway.
 type ManagementProjectUpsertRequest struct {
+	// ClusterId Cluster assignment to synchronize. Omission preserves the existing assignment.
+	ClusterId *openapi_types.UUID `json:"cluster_id,omitempty"`
+
 	// Email Contact address recorded on the project.
 	Email string `json:"email"`
 	Name  string `json:"name"`
@@ -443,6 +523,14 @@ type SandboxRecord struct {
 
 	// TemplateID Identifier of the template from which is the sandbox created
 	TemplateID string `json:"templateID"`
+}
+
+// TeamLimitsResponse defines model for TeamLimitsResponse.
+type TeamLimitsResponse struct {
+	Limits UserTeamLimits `json:"limits"`
+
+	// Tier The team's raw tier identifier, exactly as stored (not normalized to a catalog plan).
+	Tier string `json:"tier"`
 }
 
 // TeamMember defines model for TeamMember.
@@ -614,49 +702,15 @@ type TemplateTagsCountResponse struct {
 	Total int64 `json:"total"`
 }
 
-// UpdateTeamRequest defines model for UpdateTeamRequest.
-type UpdateTeamRequest struct {
-	Name              *string `json:"name,omitempty"`
-	ProfilePictureUrl *string `json:"profilePictureUrl,omitempty"`
-}
-
-// UpdateTeamResponse defines model for UpdateTeamResponse.
-type UpdateTeamResponse struct {
-	Id                openapi_types.UUID `json:"id"`
-	Name              string             `json:"name"`
-	ProfilePictureUrl *string            `json:"profilePictureUrl,omitempty"`
-}
-
-// UserTeam defines model for UserTeam.
-type UserTeam struct {
-	BlockedReason     *string            `json:"blockedReason"`
-	CreatedAt         time.Time          `json:"createdAt"`
-	Email             string             `json:"email"`
-	Id                openapi_types.UUID `json:"id"`
-	IsBanned          bool               `json:"isBanned"`
-	IsBlocked         bool               `json:"isBlocked"`
-	IsDefault         bool               `json:"isDefault"`
-	Limits            UserTeamLimits     `json:"limits"`
-	Name              string             `json:"name"`
-	ProfilePictureUrl *string            `json:"profilePictureUrl"`
-	Slug              string             `json:"slug"`
-	Tier              string             `json:"tier"`
-}
-
 // UserTeamLimits defines model for UserTeamLimits.
 type UserTeamLimits struct {
-	ConcurrentSandboxes      int32 `json:"concurrentSandboxes"`
-	ConcurrentTemplateBuilds int32 `json:"concurrentTemplateBuilds"`
-	DiskMb                   int32 `json:"diskMb"`
-	EventsTtlDays            int32 `json:"eventsTtlDays"`
+	ConcurrentSandboxes      int64 `json:"concurrentSandboxes"`
+	ConcurrentTemplateBuilds int64 `json:"concurrentTemplateBuilds"`
+	DiskMb                   int64 `json:"diskMb"`
+	EventsTtlDays            int64 `json:"eventsTtlDays"`
 	MaxLengthHours           int64 `json:"maxLengthHours"`
-	MaxRamMb                 int32 `json:"maxRamMb"`
-	MaxVcpu                  int32 `json:"maxVcpu"`
-}
-
-// UserTeamsResponse defines model for UserTeamsResponse.
-type UserTeamsResponse struct {
-	Teams []UserTeam `json:"teams"`
+	MaxRamMb                 int64 `json:"maxRamMb"`
+	MaxVcpu                  int64 `json:"maxVcpu"`
 }
 
 // BuildId defines model for build_id.
@@ -764,9 +818,6 @@ type N500 = Error
 // N501 defines model for 501.
 type N501 = Error
 
-// N502 defines model for 502.
-type N502 = Error
-
 // GetBuildsParams defines parameters for GetBuilds.
 type GetBuildsParams struct {
 	// BuildIdOrTemplate Optional filter by build identifier, template identifier, or template alias.
@@ -855,10 +906,12 @@ type GetTemplatesTemplateIDTagsTagAssignmentsParams struct {
 type PostAdminClustersJSONRequestBody = AdminClusterCreateRequest
 
 // PostAdminTeamsBootstrapJSONRequestBody defines body for PostAdminTeamsBootstrap for application/json ContentType.
+//
+// Deprecated: this type has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 type PostAdminTeamsBootstrapJSONRequestBody = AdminTeamBootstrapRequest
 
-// PutAdminTeamsTeamIDClusterJSONRequestBody defines body for PutAdminTeamsTeamIDCluster for application/json ContentType.
-type PutAdminTeamsTeamIDClusterJSONRequestBody = AdminTeamClusterAssignmentRequest
+// PutAdminTeamsTeamIDBlockJSONRequestBody defines body for PutAdminTeamsTeamIDBlock for application/json ContentType.
+type PutAdminTeamsTeamIDBlockJSONRequestBody = AdminTeamBlockRequest
 
 // PostAdminUserProfilesByEmailJSONRequestBody defines body for PostAdminUserProfilesByEmail for application/json ContentType.
 type PostAdminUserProfilesByEmailJSONRequestBody = AdminAuthProviderProfilesLookupEmailRequest
@@ -866,20 +919,14 @@ type PostAdminUserProfilesByEmailJSONRequestBody = AdminAuthProviderProfilesLook
 // PostAdminUserProfilesResolveJSONRequestBody defines body for PostAdminUserProfilesResolve for application/json ContentType.
 type PostAdminUserProfilesResolveJSONRequestBody = AdminAuthProviderProfilesResolveRequest
 
-// PostAdminUsersBootstrapJSONRequestBody defines body for PostAdminUsersBootstrap for application/json ContentType.
-type PostAdminUsersBootstrapJSONRequestBody = AdminAuthProviderUserBootstrapRequest
-
-// PostTeamsJSONRequestBody defines body for PostTeams for application/json ContentType.
-type PostTeamsJSONRequestBody = CreateTeamRequest
-
-// PatchTeamsTeamIDJSONRequestBody defines body for PatchTeamsTeamID for application/json ContentType.
-type PatchTeamsTeamIDJSONRequestBody = UpdateTeamRequest
-
-// PostTeamsTeamIDMembersJSONRequestBody defines body for PostTeamsTeamIDMembers for application/json ContentType.
-type PostTeamsTeamIDMembersJSONRequestBody = AddTeamMemberRequest
+// ManagementRegisterClusterJSONRequestBody defines body for ManagementRegisterCluster for application/json ContentType.
+type ManagementRegisterClusterJSONRequestBody = ManagementClusterRegistrationRequest
 
 // ManagementUpsertProjectJSONRequestBody defines body for ManagementUpsertProject for application/json ContentType.
 type ManagementUpsertProjectJSONRequestBody = ManagementProjectUpsertRequest
+
+// ManagementApplyProjectBlockJSONRequestBody defines body for ManagementApplyProjectBlock for application/json ContentType.
+type ManagementApplyProjectBlockJSONRequestBody = ManagementProjectBlockRequest
 
 // ManagementUpsertProjectLimitsJSONRequestBody defines body for ManagementUpsertProjectLimits for application/json ContentType.
 type ManagementUpsertProjectLimitsJSONRequestBody = ManagementProjectLimits
@@ -887,26 +934,279 @@ type ManagementUpsertProjectLimitsJSONRequestBody = ManagementProjectLimits
 // ManagementApplyProjectMemberJSONRequestBody defines body for ManagementApplyProjectMember for application/json ContentType.
 type ManagementApplyProjectMemberJSONRequestBody = ManagementProjectMemberApplyRequest
 
+// AsManagementProjectLimits0 returns the union data inside the ManagementProjectLimits as a ManagementProjectLimits0
+func (t ManagementProjectLimits) AsManagementProjectLimits0() (ManagementProjectLimits0, error) {
+	var body ManagementProjectLimits0
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromManagementProjectLimits0 overwrites any union data inside the ManagementProjectLimits as the provided ManagementProjectLimits0
+func (t *ManagementProjectLimits) FromManagementProjectLimits0(v ManagementProjectLimits0) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeManagementProjectLimits0 performs a merge with any union data inside the ManagementProjectLimits, using the provided ManagementProjectLimits0
+func (t *ManagementProjectLimits) MergeManagementProjectLimits0(v ManagementProjectLimits0) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsManagementProjectLimits1 returns the union data inside the ManagementProjectLimits as a ManagementProjectLimits1
+func (t ManagementProjectLimits) AsManagementProjectLimits1() (ManagementProjectLimits1, error) {
+	var body ManagementProjectLimits1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromManagementProjectLimits1 overwrites any union data inside the ManagementProjectLimits as the provided ManagementProjectLimits1
+func (t *ManagementProjectLimits) FromManagementProjectLimits1(v ManagementProjectLimits1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeManagementProjectLimits1 performs a merge with any union data inside the ManagementProjectLimits, using the provided ManagementProjectLimits1
+func (t *ManagementProjectLimits) MergeManagementProjectLimits1(v ManagementProjectLimits1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t ManagementProjectLimits) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	object := make(map[string]json.RawMessage)
+	if t.union != nil {
+		err = json.Unmarshal(b, &object)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	object["api_team_rps_list"], err = json.Marshal(t.ApiTeamRpsList)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'api_team_rps_list': %w", err)
+	}
+
+	object["concurrent_sandboxes"], err = json.Marshal(t.ConcurrentSandboxes)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'concurrent_sandboxes': %w", err)
+	}
+
+	object["concurrent_template_builds"], err = json.Marshal(t.ConcurrentTemplateBuilds)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'concurrent_template_builds': %w", err)
+	}
+
+	if t.DecidedAt != nil {
+		object["decided_at"], err = json.Marshal(t.DecidedAt)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'decided_at': %w", err)
+		}
+	}
+
+	object["default_free_disk_size_mb"], err = json.Marshal(t.DefaultFreeDiskSizeMb)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'default_free_disk_size_mb': %w", err)
+	}
+
+	object["disk_mb"], err = json.Marshal(t.DiskMb)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'disk_mb': %w", err)
+	}
+
+	object["events_ttl_days"], err = json.Marshal(t.EventsTtlDays)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'events_ttl_days': %w", err)
+	}
+
+	if t.MaxDiskSizeMb != nil {
+		object["max_disk_size_mb"], err = json.Marshal(t.MaxDiskSizeMb)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'max_disk_size_mb': %w", err)
+		}
+	}
+
+	if t.MaxFreeDiskSizeMb != nil {
+		object["max_free_disk_size_mb"], err = json.Marshal(t.MaxFreeDiskSizeMb)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'max_free_disk_size_mb': %w", err)
+		}
+	}
+
+	object["max_ram_mb"], err = json.Marshal(t.MaxRamMb)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'max_ram_mb': %w", err)
+	}
+
+	object["max_sandbox_length_hours"], err = json.Marshal(t.MaxSandboxLengthHours)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'max_sandbox_length_hours': %w", err)
+	}
+
+	object["max_vcpu"], err = json.Marshal(t.MaxVcpu)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'max_vcpu': %w", err)
+	}
+
+	object["revision"], err = json.Marshal(t.Revision)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'revision': %w", err)
+	}
+
+	b, err = json.Marshal(object)
+	return b, err
+}
+
+func (t *ManagementProjectLimits) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	if err != nil {
+		return err
+	}
+	object := make(map[string]json.RawMessage)
+	err = json.Unmarshal(b, &object)
+	if err != nil {
+		return err
+	}
+
+	if raw, found := object["api_team_rps_list"]; found {
+		err = json.Unmarshal(raw, &t.ApiTeamRpsList)
+		if err != nil {
+			return fmt.Errorf("error reading 'api_team_rps_list': %w", err)
+		}
+	}
+
+	if raw, found := object["concurrent_sandboxes"]; found {
+		err = json.Unmarshal(raw, &t.ConcurrentSandboxes)
+		if err != nil {
+			return fmt.Errorf("error reading 'concurrent_sandboxes': %w", err)
+		}
+	}
+
+	if raw, found := object["concurrent_template_builds"]; found {
+		err = json.Unmarshal(raw, &t.ConcurrentTemplateBuilds)
+		if err != nil {
+			return fmt.Errorf("error reading 'concurrent_template_builds': %w", err)
+		}
+	}
+
+	if raw, found := object["decided_at"]; found {
+		err = json.Unmarshal(raw, &t.DecidedAt)
+		if err != nil {
+			return fmt.Errorf("error reading 'decided_at': %w", err)
+		}
+	}
+
+	if raw, found := object["default_free_disk_size_mb"]; found {
+		err = json.Unmarshal(raw, &t.DefaultFreeDiskSizeMb)
+		if err != nil {
+			return fmt.Errorf("error reading 'default_free_disk_size_mb': %w", err)
+		}
+	}
+
+	if raw, found := object["disk_mb"]; found {
+		err = json.Unmarshal(raw, &t.DiskMb)
+		if err != nil {
+			return fmt.Errorf("error reading 'disk_mb': %w", err)
+		}
+	}
+
+	if raw, found := object["events_ttl_days"]; found {
+		err = json.Unmarshal(raw, &t.EventsTtlDays)
+		if err != nil {
+			return fmt.Errorf("error reading 'events_ttl_days': %w", err)
+		}
+	}
+
+	if raw, found := object["max_disk_size_mb"]; found {
+		err = json.Unmarshal(raw, &t.MaxDiskSizeMb)
+		if err != nil {
+			return fmt.Errorf("error reading 'max_disk_size_mb': %w", err)
+		}
+	}
+
+	if raw, found := object["max_free_disk_size_mb"]; found {
+		err = json.Unmarshal(raw, &t.MaxFreeDiskSizeMb)
+		if err != nil {
+			return fmt.Errorf("error reading 'max_free_disk_size_mb': %w", err)
+		}
+	}
+
+	if raw, found := object["max_ram_mb"]; found {
+		err = json.Unmarshal(raw, &t.MaxRamMb)
+		if err != nil {
+			return fmt.Errorf("error reading 'max_ram_mb': %w", err)
+		}
+	}
+
+	if raw, found := object["max_sandbox_length_hours"]; found {
+		err = json.Unmarshal(raw, &t.MaxSandboxLengthHours)
+		if err != nil {
+			return fmt.Errorf("error reading 'max_sandbox_length_hours': %w", err)
+		}
+	}
+
+	if raw, found := object["max_vcpu"]; found {
+		err = json.Unmarshal(raw, &t.MaxVcpu)
+		if err != nil {
+			return fmt.Errorf("error reading 'max_vcpu': %w", err)
+		}
+	}
+
+	if raw, found := object["revision"]; found {
+		err = json.Unmarshal(raw, &t.Revision)
+		if err != nil {
+			return fmt.Errorf("error reading 'revision': %w", err)
+		}
+	}
+
+	return err
+}
+
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
 	// PostAdminClusters Create a cluster
 	// (POST /admin/clusters)
 	PostAdminClusters(c *gin.Context)
-	// DeleteAdminClustersClusterID Delete an unreferenced cluster
+	// DeleteAdminClustersClusterID Delete a cluster and its environments
 	// (DELETE /admin/clusters/{clusterID})
 	DeleteAdminClustersClusterID(c *gin.Context, clusterID ClusterID)
-	// PostAdminTeamsBootstrap Bootstrap team
+	// PostAdminTeamsBootstrap Bootstrap team (retired)
 	// (POST /admin/teams/bootstrap)
+	//
+	// Deprecated: this operation has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	PostAdminTeamsBootstrap(c *gin.Context)
+	// DeleteAdminTeamsTeamIDBan Unban a team
+	// (DELETE /admin/teams/{teamID}/ban)
+	DeleteAdminTeamsTeamIDBan(c *gin.Context, teamID TeamID)
+	// PutAdminTeamsTeamIDBan Ban a team
+	// (PUT /admin/teams/{teamID}/ban)
+	PutAdminTeamsTeamIDBan(c *gin.Context, teamID TeamID)
+	// DeleteAdminTeamsTeamIDBlock Unblock a team
+	// (DELETE /admin/teams/{teamID}/block)
+	DeleteAdminTeamsTeamIDBlock(c *gin.Context, teamID TeamID)
+	// PutAdminTeamsTeamIDBlock Block a team
+	// (PUT /admin/teams/{teamID}/block)
+	PutAdminTeamsTeamIDBlock(c *gin.Context, teamID TeamID)
 	// GetAdminTeamsTeamIDCluster Get a team's assigned cluster
 	// (GET /admin/teams/{teamID}/cluster)
 	GetAdminTeamsTeamIDCluster(c *gin.Context, teamID TeamID)
-	// PutAdminTeamsTeamIDCluster Assign a cluster to a team
-	// (PUT /admin/teams/{teamID}/cluster)
-	PutAdminTeamsTeamIDCluster(c *gin.Context, teamID TeamID)
-	// DeleteAdminTeamsTeamIDClusterClusterID Detach a cluster from a team
-	// (DELETE /admin/teams/{teamID}/cluster/{clusterID})
-	DeleteAdminTeamsTeamIDClusterClusterID(c *gin.Context, teamID TeamID, clusterID ClusterID)
 	// PostAdminUserProfilesByEmail Lookup user profiles by email
 	// (POST /admin/user-profiles/by-email)
 	PostAdminUserProfilesByEmail(c *gin.Context)
@@ -916,12 +1216,6 @@ type ServerInterface interface {
 	// GetAdminUserProfilesUserId User profile
 	// (GET /admin/user-profiles/{userId})
 	GetAdminUserProfilesUserId(c *gin.Context, userId UserId)
-	// PostAdminUsersBootstrap Bootstrap auth provider user
-	// (POST /admin/users/bootstrap)
-	PostAdminUsersBootstrap(c *gin.Context)
-	// DeleteAdminUsersUserId Delete user
-	// (DELETE /admin/users/{userId})
-	DeleteAdminUsersUserId(c *gin.Context, userId UserId)
 	// GetBuilds List team builds
 	// (GET /builds)
 	GetBuilds(c *gin.Context, params GetBuildsParams)
@@ -937,27 +1231,15 @@ type ServerInterface interface {
 	// GetSandboxesSandboxIDRecord Sandbox record
 	// (GET /sandboxes/{sandboxID}/record)
 	GetSandboxesSandboxIDRecord(c *gin.Context, sandboxID SandboxID)
-	// GetTeams List user teams
-	// (GET /teams)
-	GetTeams(c *gin.Context)
-	// PostTeams Create team
-	// (POST /teams)
-	PostTeams(c *gin.Context)
 	// GetTeamsResolve Resolve team identity
 	// (GET /teams/resolve)
 	GetTeamsResolve(c *gin.Context, params GetTeamsResolveParams)
-	// PatchTeamsTeamID Update team
-	// (PATCH /teams/{teamID})
-	PatchTeamsTeamID(c *gin.Context, teamID TeamID)
+	// GetTeamsTeamIDLimits Get team limits
+	// (GET /teams/{teamID}/limits)
+	GetTeamsTeamIDLimits(c *gin.Context, teamID TeamID)
 	// GetTeamsTeamIDMembers List team members
 	// (GET /teams/{teamID}/members)
 	GetTeamsTeamIDMembers(c *gin.Context, teamID TeamID)
-	// PostTeamsTeamIDMembers Add team member
-	// (POST /teams/{teamID}/members)
-	PostTeamsTeamIDMembers(c *gin.Context, teamID TeamID)
-	// DeleteTeamsTeamIDMembersUserId Remove team member
-	// (DELETE /teams/{teamID}/members/{userId})
-	DeleteTeamsTeamIDMembersUserId(c *gin.Context, teamID TeamID, userId UserId)
 	// GetTeamsTeamIDStatus Get team access status
 	// (GET /teams/{teamID}/status)
 	GetTeamsTeamIDStatus(c *gin.Context, teamID TeamID)
@@ -982,21 +1264,36 @@ type ServerInterface interface {
 	// GetTemplatesTemplateIDTagsTagAssignments List ready assignments for a single template tag
 	// (GET /templates/{templateID}/tags/{tag}/assignments)
 	GetTemplatesTemplateIDTagsTagAssignments(c *gin.Context, templateID TemplateID, tag TagPath, params GetTemplatesTemplateIDTagsTagAssignmentsParams)
+	// ManagementDeleteCluster Delete a cluster and its environments (v1).
+	// (DELETE /v1/management/clusters/{clusterID})
+	ManagementDeleteCluster(c *gin.Context, clusterID ClusterID)
+	// ManagementRegisterCluster Register a cluster (v1).
+	// (PUT /v1/management/clusters/{clusterID})
+	ManagementRegisterCluster(c *gin.Context, clusterID ClusterID)
+	// ManagementClusterDestroyReadiness Check cluster destroy readiness
+	// (GET /v1/management/clusters/{clusterID}/destroy-readiness)
+	ManagementClusterDestroyReadiness(c *gin.Context, clusterID ClusterID)
 	// ManagementDeleteProject Delete a project and its control-plane state (v1).
 	// (DELETE /v1/management/projects/{projectID})
 	ManagementDeleteProject(c *gin.Context, projectID ProjectID)
 	// ManagementUpsertProject Create or reconcile a project (v1).
 	// (PUT /v1/management/projects/{projectID})
 	ManagementUpsertProject(c *gin.Context, projectID ProjectID)
+	// ManagementApplyProjectBlock Apply a project's block state (v1).
+	// (PUT /v1/management/projects/{projectID}/block)
+	ManagementApplyProjectBlock(c *gin.Context, projectID ProjectID)
+	// ManagementDetachProjectCluster Detach a cluster assignment from a project (v1).
+	// (DELETE /v1/management/projects/{projectID}/cluster/{clusterID})
+	ManagementDetachProjectCluster(c *gin.Context, projectID ProjectID, clusterID ClusterID)
+	// ManagementAssignProjectCluster Assign a cluster to a project (v1).
+	// (PUT /v1/management/projects/{projectID}/cluster/{clusterID})
+	ManagementAssignProjectCluster(c *gin.Context, projectID ProjectID, clusterID ClusterID)
 	// ManagementUpsertProjectLimits Reconcile effective limits for a project (v1).
 	// (PUT /v1/management/projects/{projectID}/limits)
 	ManagementUpsertProjectLimits(c *gin.Context, projectID ProjectID)
 	// ManagementApplyProjectMember Apply one versioned project member projection (v1).
 	// (PUT /v1/management/projects/{projectID}/members/{userID})
 	ManagementApplyProjectMember(c *gin.Context, projectID ProjectID, userID UserID)
-	// ManagementPurgeUserAccessTokens Revoke a deleted User's access tokens (v1).
-	// (DELETE /v1/management/users/{userID}/access-tokens)
-	ManagementPurgeUserAccessTokens(c *gin.Context, userID UserID)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -1059,6 +1356,106 @@ func (siw *ServerInterfaceWrapper) PostAdminTeamsBootstrap(c *gin.Context) {
 	siw.Handler.PostAdminTeamsBootstrap(c)
 }
 
+// DeleteAdminTeamsTeamIDBan operation middleware
+func (siw *ServerInterfaceWrapper) DeleteAdminTeamsTeamIDBan(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "teamID" -------------
+	var teamID TeamID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "teamID", c.Param("teamID"), &teamID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter teamID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.DeleteAdminTeamsTeamIDBan(c, teamID)
+}
+
+// PutAdminTeamsTeamIDBan operation middleware
+func (siw *ServerInterfaceWrapper) PutAdminTeamsTeamIDBan(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "teamID" -------------
+	var teamID TeamID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "teamID", c.Param("teamID"), &teamID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter teamID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.PutAdminTeamsTeamIDBan(c, teamID)
+}
+
+// DeleteAdminTeamsTeamIDBlock operation middleware
+func (siw *ServerInterfaceWrapper) DeleteAdminTeamsTeamIDBlock(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "teamID" -------------
+	var teamID TeamID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "teamID", c.Param("teamID"), &teamID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter teamID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.DeleteAdminTeamsTeamIDBlock(c, teamID)
+}
+
+// PutAdminTeamsTeamIDBlock operation middleware
+func (siw *ServerInterfaceWrapper) PutAdminTeamsTeamIDBlock(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "teamID" -------------
+	var teamID TeamID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "teamID", c.Param("teamID"), &teamID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter teamID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.PutAdminTeamsTeamIDBlock(c, teamID)
+}
+
 // GetAdminTeamsTeamIDCluster operation middleware
 func (siw *ServerInterfaceWrapper) GetAdminTeamsTeamIDCluster(c *gin.Context) {
 
@@ -1082,65 +1479,6 @@ func (siw *ServerInterfaceWrapper) GetAdminTeamsTeamIDCluster(c *gin.Context) {
 	}
 
 	siw.Handler.GetAdminTeamsTeamIDCluster(c, teamID)
-}
-
-// PutAdminTeamsTeamIDCluster operation middleware
-func (siw *ServerInterfaceWrapper) PutAdminTeamsTeamIDCluster(c *gin.Context) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "teamID" -------------
-	var teamID TeamID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "teamID", c.Param("teamID"), &teamID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter teamID: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.PutAdminTeamsTeamIDCluster(c, teamID)
-}
-
-// DeleteAdminTeamsTeamIDClusterClusterID operation middleware
-func (siw *ServerInterfaceWrapper) DeleteAdminTeamsTeamIDClusterClusterID(c *gin.Context) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "teamID" -------------
-	var teamID TeamID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "teamID", c.Param("teamID"), &teamID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter teamID: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	// ------------- Path parameter "clusterID" -------------
-	var clusterID ClusterID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "clusterID", c.Param("clusterID"), &clusterID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter clusterID: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.DeleteAdminTeamsTeamIDClusterClusterID(c, teamID, clusterID)
 }
 
 // PostAdminUserProfilesByEmail operation middleware
@@ -1192,44 +1530,6 @@ func (siw *ServerInterfaceWrapper) GetAdminUserProfilesUserId(c *gin.Context) {
 	}
 
 	siw.Handler.GetAdminUserProfilesUserId(c, userId)
-}
-
-// PostAdminUsersBootstrap operation middleware
-func (siw *ServerInterfaceWrapper) PostAdminUsersBootstrap(c *gin.Context) {
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.PostAdminUsersBootstrap(c)
-}
-
-// DeleteAdminUsersUserId operation middleware
-func (siw *ServerInterfaceWrapper) DeleteAdminUsersUserId(c *gin.Context) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "userId" -------------
-	var userId UserId
-
-	err = runtime.BindStyledParameterWithOptions("simple", "userId", c.Param("userId"), &userId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter userId: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.DeleteAdminUsersUserId(c, userId)
 }
 
 // GetBuilds operation middleware
@@ -1373,32 +1673,6 @@ func (siw *ServerInterfaceWrapper) GetSandboxesSandboxIDRecord(c *gin.Context) {
 	siw.Handler.GetSandboxesSandboxIDRecord(c, sandboxID)
 }
 
-// GetTeams operation middleware
-func (siw *ServerInterfaceWrapper) GetTeams(c *gin.Context) {
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.GetTeams(c)
-}
-
-// PostTeams operation middleware
-func (siw *ServerInterfaceWrapper) PostTeams(c *gin.Context) {
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.PostTeams(c)
-}
-
 // GetTeamsResolve operation middleware
 func (siw *ServerInterfaceWrapper) GetTeamsResolve(c *gin.Context) {
 
@@ -1426,8 +1700,8 @@ func (siw *ServerInterfaceWrapper) GetTeamsResolve(c *gin.Context) {
 	siw.Handler.GetTeamsResolve(c, params)
 }
 
-// PatchTeamsTeamID operation middleware
-func (siw *ServerInterfaceWrapper) PatchTeamsTeamID(c *gin.Context) {
+// GetTeamsTeamIDLimits operation middleware
+func (siw *ServerInterfaceWrapper) GetTeamsTeamIDLimits(c *gin.Context) {
 
 	var err error
 	_ = err
@@ -1448,7 +1722,7 @@ func (siw *ServerInterfaceWrapper) PatchTeamsTeamID(c *gin.Context) {
 		}
 	}
 
-	siw.Handler.PatchTeamsTeamID(c, teamID)
+	siw.Handler.GetTeamsTeamIDLimits(c, teamID)
 }
 
 // GetTeamsTeamIDMembers operation middleware
@@ -1474,65 +1748,6 @@ func (siw *ServerInterfaceWrapper) GetTeamsTeamIDMembers(c *gin.Context) {
 	}
 
 	siw.Handler.GetTeamsTeamIDMembers(c, teamID)
-}
-
-// PostTeamsTeamIDMembers operation middleware
-func (siw *ServerInterfaceWrapper) PostTeamsTeamIDMembers(c *gin.Context) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "teamID" -------------
-	var teamID TeamID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "teamID", c.Param("teamID"), &teamID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter teamID: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.PostTeamsTeamIDMembers(c, teamID)
-}
-
-// DeleteTeamsTeamIDMembersUserId operation middleware
-func (siw *ServerInterfaceWrapper) DeleteTeamsTeamIDMembersUserId(c *gin.Context) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "teamID" -------------
-	var teamID TeamID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "teamID", c.Param("teamID"), &teamID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter teamID: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	// ------------- Path parameter "userId" -------------
-	var userId UserId
-
-	err = runtime.BindStyledParameterWithOptions("simple", "userId", c.Param("userId"), &userId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter userId: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.DeleteTeamsTeamIDMembersUserId(c, teamID, userId)
 }
 
 // GetTeamsTeamIDStatus operation middleware
@@ -1839,6 +2054,81 @@ func (siw *ServerInterfaceWrapper) GetTemplatesTemplateIDTagsTagAssignments(c *g
 	siw.Handler.GetTemplatesTemplateIDTagsTagAssignments(c, templateID, tag, params)
 }
 
+// ManagementDeleteCluster operation middleware
+func (siw *ServerInterfaceWrapper) ManagementDeleteCluster(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "clusterID" -------------
+	var clusterID ClusterID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "clusterID", c.Param("clusterID"), &clusterID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter clusterID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.ManagementDeleteCluster(c, clusterID)
+}
+
+// ManagementRegisterCluster operation middleware
+func (siw *ServerInterfaceWrapper) ManagementRegisterCluster(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "clusterID" -------------
+	var clusterID ClusterID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "clusterID", c.Param("clusterID"), &clusterID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter clusterID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.ManagementRegisterCluster(c, clusterID)
+}
+
+// ManagementClusterDestroyReadiness operation middleware
+func (siw *ServerInterfaceWrapper) ManagementClusterDestroyReadiness(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "clusterID" -------------
+	var clusterID ClusterID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "clusterID", c.Param("clusterID"), &clusterID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter clusterID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.ManagementClusterDestroyReadiness(c, clusterID)
+}
+
 // ManagementDeleteProject operation middleware
 func (siw *ServerInterfaceWrapper) ManagementDeleteProject(c *gin.Context) {
 
@@ -1887,6 +2177,99 @@ func (siw *ServerInterfaceWrapper) ManagementUpsertProject(c *gin.Context) {
 	}
 
 	siw.Handler.ManagementUpsertProject(c, projectID)
+}
+
+// ManagementApplyProjectBlock operation middleware
+func (siw *ServerInterfaceWrapper) ManagementApplyProjectBlock(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "projectID" -------------
+	var projectID ProjectID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "projectID", c.Param("projectID"), &projectID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter projectID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.ManagementApplyProjectBlock(c, projectID)
+}
+
+// ManagementDetachProjectCluster operation middleware
+func (siw *ServerInterfaceWrapper) ManagementDetachProjectCluster(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "projectID" -------------
+	var projectID ProjectID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "projectID", c.Param("projectID"), &projectID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter projectID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Path parameter "clusterID" -------------
+	var clusterID ClusterID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "clusterID", c.Param("clusterID"), &clusterID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter clusterID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.ManagementDetachProjectCluster(c, projectID, clusterID)
+}
+
+// ManagementAssignProjectCluster operation middleware
+func (siw *ServerInterfaceWrapper) ManagementAssignProjectCluster(c *gin.Context) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "projectID" -------------
+	var projectID ProjectID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "projectID", c.Param("projectID"), &projectID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter projectID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Path parameter "clusterID" -------------
+	var clusterID ClusterID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "clusterID", c.Param("clusterID"), &clusterID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter clusterID: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		middleware(c)
+		if c.IsAborted() {
+			return
+		}
+	}
+
+	siw.Handler.ManagementAssignProjectCluster(c, projectID, clusterID)
 }
 
 // ManagementUpsertProjectLimits operation middleware
@@ -1948,31 +2331,6 @@ func (siw *ServerInterfaceWrapper) ManagementApplyProjectMember(c *gin.Context) 
 	siw.Handler.ManagementApplyProjectMember(c, projectID, userID)
 }
 
-// ManagementPurgeUserAccessTokens operation middleware
-func (siw *ServerInterfaceWrapper) ManagementPurgeUserAccessTokens(c *gin.Context) {
-
-	var err error
-	_ = err
-
-	// ------------- Path parameter "userID" -------------
-	var userID UserID
-
-	err = runtime.BindStyledParameterWithOptions("simple", "userID", c.Param("userID"), &userID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
-	if err != nil {
-		siw.ErrorHandler(c, fmt.Errorf("Invalid format for parameter userID: %w", err), http.StatusBadRequest)
-		return
-	}
-
-	for _, middleware := range siw.HandlerMiddlewares {
-		middleware(c)
-		if c.IsAborted() {
-			return
-		}
-	}
-
-	siw.Handler.ManagementPurgeUserAccessTokens(c, userID)
-}
-
 // GinServerOptions provides options for the Gin server.
 type GinServerOptions struct {
 	BaseURL      string
@@ -2005,25 +2363,22 @@ func RegisterHandlersWithOptions(router gin.IRouter, si ServerInterface, options
 	router.GET(options.BaseURL+"/builds/statuses", wrapper.GetBuildsStatuses)
 	router.GET(options.BaseURL+"/builds/:build_id", wrapper.GetBuildsBuildId)
 	router.GET(options.BaseURL+"/sandboxes/:sandboxID/record", wrapper.GetSandboxesSandboxIDRecord)
-	router.GET(options.BaseURL+"/teams", wrapper.GetTeams)
-	router.POST(options.BaseURL+"/teams", wrapper.PostTeams)
-	router.POST(options.BaseURL+"/admin/users/bootstrap", wrapper.PostAdminUsersBootstrap)
 	router.POST(options.BaseURL+"/admin/teams/bootstrap", wrapper.PostAdminTeamsBootstrap)
 	router.POST(options.BaseURL+"/admin/clusters", wrapper.PostAdminClusters)
 	router.DELETE(options.BaseURL+"/admin/clusters/:clusterID", wrapper.DeleteAdminClustersClusterID)
+	router.GET(options.BaseURL+"/v1/management/clusters/:clusterID/destroy-readiness", wrapper.ManagementClusterDestroyReadiness)
 	router.GET(options.BaseURL+"/admin/teams/:teamID/cluster", wrapper.GetAdminTeamsTeamIDCluster)
-	router.PUT(options.BaseURL+"/admin/teams/:teamID/cluster", wrapper.PutAdminTeamsTeamIDCluster)
-	router.DELETE(options.BaseURL+"/admin/teams/:teamID/cluster/:clusterID", wrapper.DeleteAdminTeamsTeamIDClusterClusterID)
+	router.DELETE(options.BaseURL+"/admin/teams/:teamID/ban", wrapper.DeleteAdminTeamsTeamIDBan)
+	router.PUT(options.BaseURL+"/admin/teams/:teamID/ban", wrapper.PutAdminTeamsTeamIDBan)
+	router.DELETE(options.BaseURL+"/admin/teams/:teamID/block", wrapper.DeleteAdminTeamsTeamIDBlock)
+	router.PUT(options.BaseURL+"/admin/teams/:teamID/block", wrapper.PutAdminTeamsTeamIDBlock)
 	router.POST(options.BaseURL+"/admin/user-profiles/resolve", wrapper.PostAdminUserProfilesResolve)
 	router.POST(options.BaseURL+"/admin/user-profiles/by-email", wrapper.PostAdminUserProfilesByEmail)
 	router.GET(options.BaseURL+"/admin/user-profiles/:userId", wrapper.GetAdminUserProfilesUserId)
-	router.DELETE(options.BaseURL+"/admin/users/:userId", wrapper.DeleteAdminUsersUserId)
 	router.GET(options.BaseURL+"/teams/resolve", wrapper.GetTeamsResolve)
-	router.PATCH(options.BaseURL+"/teams/:teamID", wrapper.PatchTeamsTeamID)
 	router.GET(options.BaseURL+"/teams/:teamID/status", wrapper.GetTeamsTeamIDStatus)
+	router.GET(options.BaseURL+"/teams/:teamID/limits", wrapper.GetTeamsTeamIDLimits)
 	router.GET(options.BaseURL+"/teams/:teamID/members", wrapper.GetTeamsTeamIDMembers)
-	router.POST(options.BaseURL+"/teams/:teamID/members", wrapper.PostTeamsTeamIDMembers)
-	router.DELETE(options.BaseURL+"/teams/:teamID/members/:userId", wrapper.DeleteTeamsTeamIDMembersUserId)
 	router.GET(options.BaseURL+"/templates", wrapper.GetTemplates)
 	router.GET(options.BaseURL+"/templates/defaults", wrapper.GetTemplatesDefaults)
 	router.GET(options.BaseURL+"/templates/:templateID", wrapper.GetTemplatesTemplateID)
@@ -2034,8 +2389,12 @@ func RegisterHandlersWithOptions(router gin.IRouter, si ServerInterface, options
 	router.DELETE(options.BaseURL+"/v1/management/projects/:projectID", wrapper.ManagementDeleteProject)
 	router.PUT(options.BaseURL+"/v1/management/projects/:projectID", wrapper.ManagementUpsertProject)
 	router.PUT(options.BaseURL+"/v1/management/projects/:projectID/members/:userID", wrapper.ManagementApplyProjectMember)
-	router.DELETE(options.BaseURL+"/v1/management/users/:userID/access-tokens", wrapper.ManagementPurgeUserAccessTokens)
 	router.PUT(options.BaseURL+"/v1/management/projects/:projectID/limits", wrapper.ManagementUpsertProjectLimits)
+	router.PUT(options.BaseURL+"/v1/management/projects/:projectID/block", wrapper.ManagementApplyProjectBlock)
+	router.DELETE(options.BaseURL+"/v1/management/clusters/:clusterID", wrapper.ManagementDeleteCluster)
+	router.PUT(options.BaseURL+"/v1/management/clusters/:clusterID", wrapper.ManagementRegisterCluster)
+	router.DELETE(options.BaseURL+"/v1/management/projects/:projectID/cluster/:clusterID", wrapper.ManagementDetachProjectCluster)
+	router.PUT(options.BaseURL+"/v1/management/projects/:projectID/cluster/:clusterID", wrapper.ManagementAssignProjectCluster)
 }
 
 // Base64 encoded, compressed with deflate, json marshaled OpenAPI spec.
@@ -2043,141 +2402,163 @@ func RegisterHandlersWithOptions(router gin.IRouter, si ServerInterface, options
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

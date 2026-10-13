@@ -41,6 +41,9 @@ func dbNetworkConfigToAPI(network *dbtypes.SandboxNetworkConfig) *api.SandboxNet
 	if ingress := network.Ingress; ingress != nil {
 		result.AllowPublicTraffic = ingress.AllowPublicAccess
 		result.MaskRequestHost = ingress.MaskRequestHost
+		if ingress.HTTPSPorts != nil {
+			result.HttpsPorts = &ingress.HTTPSPorts
+		}
 	}
 
 	if egress := network.Egress; egress != nil {
@@ -83,6 +86,16 @@ func dbNetworkConfigToAPI(network *dbtypes.SandboxNetworkConfig) *api.SandboxNet
 			if egress.EgressProxyUsername != "" {
 				username := egress.EgressProxyUsername
 				proxyCfg.Username = &username
+			}
+			// The CA bundle is omitted too: the caller supplied it, and it is
+			// multi-kilobyte.
+			if t := egress.EgressProxyTLS; t != nil && t.Enabled {
+				tlsCfg := &api.SandboxEgressProxyTLSConfig{Enabled: true}
+				if t.ServerName != "" {
+					serverName := t.ServerName
+					tlsCfg.ServerName = &serverName
+				}
+				proxyCfg.Tls = tlsCfg
 			}
 			result.EgressProxy = proxyCfg
 		}

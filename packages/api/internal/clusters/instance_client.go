@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	grpcshared "github.com/e2b-dev/infra/packages/shared/pkg/grpc"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
@@ -36,6 +37,7 @@ func createClient(tel *telemetry.Client, auth *instanceAuthorization, endpoint s
 			otelgrpc.NewClientHandler(
 				otelgrpc.WithTracerProvider(tel.TracerProvider),
 				otelgrpc.WithMeterProvider(tel.MeterProvider),
+				grpcshared.WithSandboxClientMetricAttributes(),
 			),
 		),
 		grpc.WithKeepaliveParams(

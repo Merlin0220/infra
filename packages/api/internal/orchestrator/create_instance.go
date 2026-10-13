@@ -72,6 +72,10 @@ type SandboxMetadata struct {
 	// (explicit memory:false resume). Set only by the resume data fetchers;
 	// template creates and auto-resume never set it.
 	FilesystemBoot bool
+	// FilesystemOnlySnapshot marks a resume whose snapshot persists only the
+	// rootfs. Unlike FilesystemBoot it describes the stored artifact rather than
+	// the request, so every path that resumes such a snapshot sets it.
+	FilesystemOnlySnapshot bool
 }
 
 // iamToProto maps the sandbox workload identity configuration into the
@@ -138,6 +142,35 @@ func applyEgressProxy(dst *orchestrator.SandboxNetworkEgressConfig, src *types.S
 	dst.EgressProxyAddress = src.EgressProxyAddress
 	dst.EgressProxyUsername = src.EgressProxyUsername
 	dst.EgressProxyPassword = src.EgressProxyPassword
+
+	if t := src.EgressProxyTLS; t != nil && t.Enabled {
+		dst.EgressProxyTls = &orchestrator.SandboxNetworkEgressProxyTLS{
+			Enabled:    true,
+			ServerName: t.ServerName,
+			CaCert:     []byte(t.CACert),
+		}
+	}
+}
+
+// ApplyValidatedEgressProxy copies a validated BYOP config onto its stored
+// form. A nil src leaves dst untouched; on the PUT path that clears a proxy,
+// dst is already a fresh config carrying none.
+func ApplyValidatedEgressProxy(dst *types.SandboxNetworkEgressConfig, src *sandbox_network.EgressProxyConfig) {
+	if dst == nil || src == nil {
+		return
+	}
+
+	dst.EgressProxyAddress = src.Address
+	dst.EgressProxyUsername = src.Username
+	dst.EgressProxyPassword = src.Password
+
+	if t := src.TLS; t != nil && t.Enabled {
+		dst.EgressProxyTLS = &types.SandboxEgressProxyTLSConfig{
+			Enabled:    true,
+			ServerName: t.ServerName,
+			CACert:     t.CACert,
+		}
+	}
 }
 
 // buildNetworkConfig constructs the orchestrator network configuration from the input parameters
@@ -157,6 +190,7 @@ func buildNetworkConfig(network *types.SandboxNetworkConfig, allowInternetAccess
 
 	if network != nil && network.Ingress != nil {
 		orchNetwork.Ingress.MaskRequestHost = network.Ingress.MaskRequestHost
+		orchNetwork.Ingress.HttpsPorts = network.Ingress.HTTPSPorts
 	}
 
 	// Handle the case where internet access is explicitly disabled
@@ -235,8 +269,7 @@ func (o *Orchestrator) CreateSandbox(
 		if err != nil {
 			logger.L().Warn(ctx, "Error waiting for sandbox to start", zap.Error(err), logger.WithSandboxID(sandboxID))
 
-			var apiErr *api.APIError
-			if errors.As(err, &apiErr) {
+			if apiErr, ok := errors.AsType[*api.APIError](err); ok {
 				return sandbox.Sandbox{}, apiErr
 			}
 
@@ -358,9 +391,19 @@ func (o *Orchestrator) CreateSandbox(
 		sbxRequest.FilesystemBoot = new(true)
 	}
 
+	cpuRequirement := o.resolveCPURequirement(ctx, sandboxID, team, sbxData)
+	// Recorded before placement runs: a placement the pin starved is the case
+	// worth querying.
+	telemetry.SetAttributes(ctx, attribute.String("placement.cpu_model_pinned", cpuRequirement.PinnedModel))
+
+	hostIsolation := o.resolveHostIsolation(ctx, sandboxID, team, sbxData)
+
 	var node *nodemanager.Node
 
-	if isResume && sbxData.NodeID != nil {
+	// Only a resume is pinned to the node its snapshot was taken on; any other
+	// start from a snapshot (a fork) is placed like a new sandbox.
+	affinityRequested := isResume && sbxData.NodeID != nil
+	if affinityRequested {
 		telemetry.ReportEvent(ctx, "Placing sandbox on the node where the snapshot was taken")
 
 		clusterID := clusters.WithClusterFallback(team.ClusterID)
@@ -368,14 +411,34 @@ func (o *Orchestrator) CreateSandbox(
 		if node != nil && !node.CanAcceptNewRequests() {
 			node = nil
 		}
+		// Snapshot affinity skips the candidate filter below, and the origin node
+		// can drift off the snapshot's own side of the partition when a timed-out
+		// resume remaps it. Vetted here so it cannot outrank the partition.
+		if node != nil && !hostIsolation.Allows(node) {
+			node = nil
+		}
 	}
 
 	nodeClusterID := clusters.WithClusterFallback(team.ClusterID)
 	clusterNodes := o.GetClusterNodes(nodeClusterID)
 
+	if hostIsolation.Enabled() {
+		isolatedCandidates := hostIsolation.FilterNodes(clusterNodes)
+		// Recorded because the partition starving placement surfaces as an
+		// ordinary "no nodes available", which alone does not say the fence
+		// caused it.
+		telemetry.SetAttributes(ctx,
+			attribute.Bool("placement.host_isolation.isolated_origin", hostIsolation.IsolatedOrigin()),
+			attribute.Int("placement.host_isolation.nodes_before", len(clusterNodes)),
+			attribute.Int("placement.host_isolation.nodes_after", len(isolatedCandidates)),
+		)
+
+		clusterNodes = isolatedCandidates
+	}
+
 	allLabels, labelFilteringEnabled := o.generateRequiredNodeLabels(ctx, sandboxID, team, sbxData)
 
-	placed, err := placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, builds.ToMachineInfo(sbxData.Build), labelFilteringEnabled, allLabels)
+	placed, err := placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, cpuRequirement, labelFilteringEnabled, allLabels)
 	if err != nil {
 		if isResume && placed.TimedOut {
 			// Remap by the snapshot's own sandbox ID: when forking, the started
@@ -395,8 +458,9 @@ func (o *Orchestrator) CreateSandbox(
 	// The sandbox was created successfully
 	attributes := []attribute.KeyValue{
 		attribute.Bool("is_resume", isResume),
-		attribute.Bool("node_affinity_requested", sbxData.NodeID != nil),
-		attribute.Bool("node_affinity_success", sbxData.NodeID != nil && node.ID == *sbxData.NodeID),
+		attribute.Bool("node_affinity_requested", affinityRequested),
+		attribute.Bool("node_affinity_success", affinityRequested && node.ID == *sbxData.NodeID),
+		telemetry.WithTeamID(team.TeamID()),
 	}
 	o.createdSandboxesCounter.Add(ctx, 1, metric.WithAttributes(attributes...))
 
@@ -407,6 +471,18 @@ func (o *Orchestrator) CreateSandbox(
 	// Otherwise it could cause the instance to expire before user has a chance to use it
 	startTime = time.Now()
 	endTime = startTime.Add(timeout)
+
+	// The record carries the version the sandbox actually RUNS when the
+	// orchestrator echoes it: the declared build version resolved through the
+	// firecracker-versions flag at start and frozen for the sandbox's
+	// lifetime. Version-gated paths branch on resolvedFCVersion — a resolved
+	// version is exact, the declared fallback (old orchestrators) is only an
+	// approximation of the running binary.
+	recordFCVersion := placed.Response.GetResolvedFirecrackerVersion()
+	resolvedFCVersion := recordFCVersion != ""
+	if !resolvedFCVersion {
+		recordFCVersion = sbxData.Build.FirecrackerVersion
+	}
 
 	sbx = sandbox.NewSandbox(
 		sandboxID,
@@ -424,7 +500,7 @@ func (o *Orchestrator) CreateSandbox(
 		*sbxData.Build.TotalDiskSizeMb,
 		sbxData.Build.RamMb,
 		sbxData.Build.KernelVersion,
-		sbxData.Build.FirecrackerVersion,
+		recordFCVersion,
 		*sbxData.Build.EnvdVersion,
 		node.ID,
 		node.ClusterID,
@@ -440,6 +516,7 @@ func (o *Orchestrator) CreateSandbox(
 		nodemanager.ConvertOrchestratorMountsToDatabaseMounts(sbxData.VolumeMounts),
 		sbxData.Iam,
 	)
+	sbx.FirecrackerVersionResolved = resolvedFCVersion
 
 	// An orchestrator that predates the filesystem_boot field ignores it and
 	// memory-restores; only the echo proves the demand was honored. Kill the
@@ -547,7 +624,7 @@ func (o *Orchestrator) maybeRemapResumeOriginNode(ctx context.Context, sandboxID
 
 	// Drop the cached snapshot so the next resume reads the new origin node.
 	o.snapshotCache.Invalidate(wctx, sandboxID)
-	o.resumeOriginNodeRemapCounter.Add(wctx, 1)
+	o.resumeOriginNodeRemapCounter.Add(wctx, 1, metric.WithAttributes(telemetry.WithTeamID(team.TeamID())))
 
 	oldNodeID := ""
 	if originNodeID != nil {
@@ -559,6 +636,45 @@ func (o *Orchestrator) maybeRemapResumeOriginNode(ctx context.Context, sandboxID
 		zap.String("old_origin_node_id", oldNodeID),
 		zap.String("new_origin_node_id", newNode.ID),
 	)
+}
+
+// resolveCPURequirement builds the CPU constraint placement filters nodes with.
+//
+// A memory restore may move to the newer models IsCompatibleWith treats as
+// supersets. A filesystem-only snapshot is instead confined to one CPU model,
+// keeping the cold-boot resume on a single generation while that path is
+// unproven across them. FsOnlyResumeCPUModelFlag names the model, and empty
+// returns filesystem-only resumes to the shared rule.
+func (o *Orchestrator) resolveCPURequirement(ctx context.Context, sandboxID string, team *teamtypes.Team, sbxData SandboxMetadata) placement.CPURequirement {
+	requirement := placement.CPURequirement{Build: builds.ToMachineInfo(sbxData.Build)}
+
+	if !sbxData.FilesystemOnlySnapshot {
+		return requirement
+	}
+
+	requirement.PinnedModel = o.featureFlagsClient.StringFlag(ctx, featureflags.FsOnlyResumeCPUModelFlag,
+		featureflags.TeamContext(team.ID.String()),
+		featureflags.SandboxContext(sandboxID),
+		featureflags.ClusterContext(clusters.WithClusterFallback(team.ClusterID)),
+	)
+
+	return requirement
+}
+
+// resolveHostIsolation builds the host-partition constraint placement filters
+// candidates with. The origin is the build's cluster host: the node a template
+// build ran on, or — because a pause copies its origin node into the snapshot's
+// build row — the node a snapshot was taken on. A build with no recorded host
+// lands on the non-isolated side.
+func (o *Orchestrator) resolveHostIsolation(ctx context.Context, sandboxID string, team *teamtypes.Team, sbxData SandboxMetadata) placement.HostIsolation {
+	return placement.HostIsolation{
+		Hosts: featureflags.GetIsolatedSchedulingHosts(ctx, o.featureFlagsClient,
+			featureflags.TeamContext(team.ID.String()),
+			featureflags.SandboxContext(sandboxID),
+			featureflags.ClusterContext(clusters.WithClusterFallback(team.ClusterID)),
+		),
+		OriginHost: ut.FromPtr(sbxData.Build.ClusterNodeID),
+	}
 }
 
 func (o *Orchestrator) generateRequiredNodeLabels(ctx context.Context, sandboxID string, team *teamtypes.Team, sbxData SandboxMetadata) ([]string, bool) {

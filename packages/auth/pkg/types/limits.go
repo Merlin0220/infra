@@ -10,4 +10,10 @@ type TeamLimits struct {
 	DiskMb   int64
 
 	EventsTTLDays int64
+
+	DefaultFreeDiskSizeMb int64
+	MaxFreeDiskSizeMb     int64
+
+	APITeamRPSList   int64
+	APITeamRPSDelete int64
 }

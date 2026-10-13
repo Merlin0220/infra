@@ -32,9 +32,11 @@ type DirectProvider struct {
 	closed atomic.Bool
 
 	mmap *mmap.MMap
+
+	logger logger.Logger
 }
 
-func NewDirectProvider(ctx context.Context, rootfs block.ReadonlyDevice, path string) (Provider, error) {
+func NewDirectProvider(ctx context.Context, rootfs block.ReadonlyDevice, path string, lg logger.Logger) (Provider, error) {
 	blockSize := rootfs.BlockSize()
 
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
@@ -61,7 +63,8 @@ func NewDirectProvider(ctx context.Context, rootfs block.ReadonlyDevice, path st
 
 		finishedOperations: make(chan struct{}, 1),
 
-		mmap: &mm,
+		mmap:   &mm,
+		logger: lg,
 	}, nil
 }
 
@@ -84,7 +87,7 @@ func (o *DirectProvider) ExportDiff(
 	defer func() {
 		err := o.mmap.Unmap()
 		if err != nil {
-			logger.L().Error(ctx, "error unmapping mmap", zap.Error(err))
+			o.logger.Error(ctx, "error unmapping mmap", zap.Error(err))
 		}
 	}()
 
@@ -92,7 +95,7 @@ func (o *DirectProvider) ExportDiff(
 	go func() {
 		err := stopSandbox(ctx)
 		if err != nil {
-			logger.L().Error(ctx, "error stopping sandbox on cow export", zap.Error(err))
+			o.logger.Error(ctx, "error stopping sandbox on cow export", zap.Error(err))
 		}
 	}()
 
@@ -118,7 +121,7 @@ func (o *DirectProvider) PrepareExportDiff(_ context.Context, _ func(context.Con
 }
 
 func (o *DirectProvider) ExportDiffInPlace(_ context.Context, _ *os.File) (*header.DiffMetadata, error) {
-	return nil, fmt.Errorf("direct provider does not support in-place export")
+	return nil, errors.New("direct provider does not support in-place export")
 }
 
 func (o *DirectProvider) SwapForBackgroundSeal(_ context.Context) (*block.Cache, error) {

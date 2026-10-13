@@ -21,6 +21,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/userfaultfd"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
 )
@@ -73,7 +74,7 @@ func TestRunDeferredMemoryExport_FailureSparesSandbox(t *testing.T) {
 
 	// The runner's failure logs carry sandbox identity, so the test Sandbox
 	// needs Metadata for sbxlogger.
-	s := &Sandbox{Metadata: &Metadata{Runtime: RuntimeMetadata{SandboxID: "test-sbx"}}}
+	s := &Sandbox{Metadata: &Metadata{Runtime: sandboxtypes.RuntimeMetadata{SandboxID: "test-sbx"}}}
 	ce := &stubCoWExporter{}
 	diffPromise := utils.NewSetOnce[build.Diff]()
 	sealDone := utils.NewSetOnce[struct{}]()
@@ -97,7 +98,7 @@ func TestRunDeferredMemoryExport_FailureSparesSandbox(t *testing.T) {
 	// so the next pause proceeds and the pre-arm guard does not kill.
 	_, err = sealDone.Result()
 	require.NoError(t, err, "a failed capture must resolve the seal signal success, not latch")
-	require.NoError(t, s.waitForMemorySeal(context.Background()))
+	require.NoError(t, s.waitForMemorySeal(t.Context()))
 	require.NoError(t, s.EnsurePausable())
 }
 
@@ -265,7 +266,7 @@ func TestRunFPRResume(t *testing.T) {
 	t.Run("inline success", func(t *testing.T) {
 		t.Parallel()
 		deps, outcomes := mkDeps(func(context.Context) error { return nil }, func() uint64 { return 1 }, nil)
-		runFPRResume(context.Background(), deps)
+		runFPRResume(t.Context(), deps)
 		require.Equal(t, "inline", <-outcomes)
 	})
 
@@ -279,7 +280,7 @@ func TestRunFPRResume(t *testing.T) {
 
 			return nil
 		}, func() uint64 { return 1 }, nil)
-		runFPRResume(context.Background(), deps)
+		runFPRResume(t.Context(), deps)
 		require.Equal(t, "retry", <-outcomes)
 		require.Equal(t, int32(3), calls.Load())
 	})
@@ -299,7 +300,7 @@ func TestRunFPRResume(t *testing.T) {
 
 			return errors.New("still failing")
 		}, gen.Load, nil)
-		runFPRResume(context.Background(), deps)
+		runFPRResume(t.Context(), deps)
 		require.Equal(t, "fenced", <-outcomes)
 		require.Equal(t, int32(2), calls.Load(), "the stale retry must not touch FPR again after the fence moved")
 	})
@@ -309,7 +310,7 @@ func TestRunFPRResume(t *testing.T) {
 		exited := make(chan struct{})
 		close(exited)
 		deps, outcomes := mkDeps(func(context.Context) error { return errors.New("down") }, func() uint64 { return 1 }, exited)
-		runFPRResume(context.Background(), deps)
+		runFPRResume(t.Context(), deps)
 		require.Equal(t, "fc_exited", <-outcomes)
 	})
 
@@ -321,7 +322,7 @@ func TestRunFPRResume(t *testing.T) {
 
 			return errors.New("never")
 		}, func() uint64 { return 1 }, nil)
-		runFPRResume(context.Background(), deps)
+		runFPRResume(t.Context(), deps)
 		require.Equal(t, "abandoned", <-outcomes)
 		require.Equal(t, int32(5), calls.Load(), "one inline attempt plus four retries")
 	})

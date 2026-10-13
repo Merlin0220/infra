@@ -1,6 +1,6 @@
 -- name: CreateOrUpdateTemplate :one
 INSERT INTO "public"."envs"(id, team_id, created_by, updated_at, public, cluster_id, source)
-VALUES (@template_id, @team_id, @created_by, NOW(), FALSE, @cluster_id, 'template')
+VALUES (@template_id, @team_id, @created_by, NOW(), @public, @cluster_id, 'template')
 ON CONFLICT (id) DO UPDATE
 SET updated_at  = NOW(),
     build_count = envs.build_count + 1
@@ -32,8 +32,12 @@ WHERE build_id IN (SELECT id FROM invalidated);
 -- completes. The template-manager reports the versions it actually used via
 -- TemplateBuildMetadata, and FinishTemplateBuild overwrites these fields with
 -- the reported values.
+-- env_id and team_id are set here rather than left to the trigger on
+-- env_build_assignments, so the build is complete without it.
 INSERT INTO "public"."env_builds" (
     id,
+    env_id,
+    team_id,
     updated_at,
     status,
     ram_mb,
@@ -47,6 +51,8 @@ INSERT INTO "public"."env_builds" (
     version
 ) VALUES (
     @build_id,
+    sqlc.arg(template_id)::text,
+    (SELECT team_id FROM "public"."envs" WHERE id = sqlc.arg(template_id)::text),
     NOW(),
     @status,
     @ram_mb,

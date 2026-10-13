@@ -12,8 +12,10 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/units"
 )
 
@@ -170,7 +172,18 @@ func compressStream(ctx context.Context, in io.Reader, cfg CompressConfig, uploa
 	if err := uploader.Start(ctx); err != nil {
 		return nil, [32]byte{}, fmt.Errorf("start upload: %w", err)
 	}
-	defer uploader.Close()
+	// Close aborts the upload unless it was committed; the deferred error
+	// can't be returned, only logged.
+	defer func() {
+		if err := uploader.Close(); err != nil {
+			logger.L().Warn(ctx, "failed to abort multipart upload", zap.Error(err))
+		}
+	}()
+
+	compressors, err := newCompressorPool(cfg)
+	if err != nil {
+		return nil, [32]byte{}, err
+	}
 
 	// The read loop goroutine holds one slot for the duration of the stream;
 	// at least one additional slot is required for uploaders to make progress.
@@ -186,41 +199,12 @@ func compressStream(ctx context.Context, in io.Reader, cfg CompressConfig, uploa
 	work.Go(func() error {
 		defer close(q)
 
-		return readLoop(workCtx, in, cfg, hasher, q)
+		return readLoop(workCtx, in, cfg, hasher, q, compressors)
 	})
 
-	// Upload loop.
-	var frameSizes []FrameSize
-	var cOffset int64
-	var loopErr error
-	for p := range q {
-		if err := p.compress.Wait(); err != nil {
-			loopErr = fmt.Errorf("compress frames: %w", err)
-			cancel()
+	frameSizes, loopErr := uploadLoop(ctx, workCtx, cancel, q, work, uploader, sink)
 
-			break
-		}
-
-		var compressed [][]byte
-		for _, f := range p.frames {
-			frameSizes = append(frameSizes, FrameSize{U: int32(f.uncompressedSize), C: int32(len(f.compressed))})
-			compressed = append(compressed, f.compressed)
-			if sink != nil {
-				sink(ctx, cOffset, f.compressed)
-			}
-			cOffset += int64(len(f.compressed))
-		}
-
-		pi := p.index
-		work.Go(func() error {
-			return uploader.UploadPart(workCtx, pi, compressed...)
-		})
-	}
-
-	// Drain q so the read loop can exit and close it, then wait for all
-	// in-flight uploads to finish before the deferred uploader.Close().
-	for range q { //nolint:revive // intentional drain
-	}
+	// Wait for all in-flight uploads before the deferred uploader.Close().
 	workErr := work.Wait()
 
 	if err := errors.Join(loopErr, workErr); err != nil {
@@ -245,12 +229,43 @@ func compressStream(ctx context.Context, in io.Reader, cfg CompressConfig, uploa
 	return ft, sum256(hasher), nil
 }
 
-func readLoop(ctx context.Context, in io.Reader, cfg CompressConfig, hasher io.Writer, q chan<- *part) error {
-	compressors, err := newCompressorPool(cfg)
-	if err != nil {
-		return err
+func uploadLoop(ctx, uploadCtx context.Context, cancel context.CancelFunc, q <-chan *part, work *errgroup.Group, uploader partUploader, sink FrameSink) ([]FrameSize, error) {
+	var frameSizes []FrameSize
+	var cOffset int64
+	var loopErr error
+	for p := range q {
+		if err := p.compress.Wait(); err != nil {
+			loopErr = fmt.Errorf("compress frames: %w", err)
+			cancel()
+
+			break
+		}
+
+		var compressed [][]byte
+		for _, f := range p.frames {
+			frameSizes = append(frameSizes, FrameSize{U: int32(f.uncompressedSize), C: int32(len(f.compressed))})
+			compressed = append(compressed, f.compressed)
+			if sink != nil {
+				sink(ctx, cOffset, f.compressed)
+			}
+			cOffset += int64(len(f.compressed))
+		}
+
+		pi := p.index
+		work.Go(func() error {
+			return uploader.UploadPart(uploadCtx, pi, compressed...)
+		})
 	}
 
+	// Drain q so the read loop can exit and close it. The caller joins uploads
+	// before the deferred uploader.Close().
+	for range q { //nolint:revive // intentional drain
+	}
+
+	return frameSizes, loopErr
+}
+
+func readLoop(ctx context.Context, in io.Reader, cfg CompressConfig, hasher io.Writer, q chan<- *part, compressors *sync.Pool) error {
 	frameSize := cfg.FrameSize()
 	minPartSize := cfg.MinPartSize()
 	workers := max(cfg.FrameEncodeWorkers, 1)

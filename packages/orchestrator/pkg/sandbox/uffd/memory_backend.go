@@ -52,7 +52,7 @@ type MemoryBackend interface {
 	// Prefault returns whether this call installed the page (false on
 	// skipped/present/deferred nil-error paths); see Userfaultfd.Prefault.
 	Prefault(ctx context.Context, offset int64, data []byte) (installed bool, e error)
-	Start(ctx context.Context, sandboxId string) error
+	Start(ctx context.Context) error
 	Stop() error
 	Ready() chan struct{}
 	Exit() *utils.ErrorOnce
@@ -65,4 +65,10 @@ type MemoryBackend interface {
 	// Sampled at the envd-init boundary it yields the pages/bytes a guest
 	// needed to start.
 	ServeStats() userfaultfd.ServeSnapshot
+}
+
+// BalloonModeLabeler is implemented by backends whose serve metrics carry the
+// balloon's free-page mechanism once it has been read from Firecracker.
+type BalloonModeLabeler interface {
+	SetBalloonMode(mode userfaultfd.BalloonMode)
 }

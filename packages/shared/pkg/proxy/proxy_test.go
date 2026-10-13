@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"sync"
@@ -218,6 +219,71 @@ func TestProxyRoutesToTargetServer(t *testing.T) {
 	assert.Equal(t, uint64(1), proxy.TotalPoolConnections(), "proxy should have established one connection")
 }
 
+func TestProxyRoutesToHTTPSBackendWithSelfSignedCertificate(t *testing.T) {
+	t.Parallel()
+
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, err := w.Write([]byte("secure backend"))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(backend.Close)
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	proxy, port, err := newTestProxy(t, func(*http.Request) (*pool.Destination, error) {
+		return &pool.Destination{
+			Url:                   backendURL,
+			SandboxId:             "test-sandbox",
+			RequestLogger:         logger.NewNopLogger(),
+			ConnectionKey:         "https-backend",
+			InsecureSkipTLSVerify: true,
+		}, nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, proxy.Close()) })
+
+	resp, err := httpGet(t, fmt.Sprintf("http://127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "secure backend", string(body))
+}
+
+// The 502 is the point: the same backend that the sibling test reaches must be
+// unreachable without the flag.
+func TestProxyRejectsHTTPSBackendWithoutInsecureSkipTLSVerify(t *testing.T) {
+	t.Parallel()
+
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, err := w.Write([]byte("secure backend"))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(backend.Close)
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	proxy, port, err := newTestProxy(t, func(*http.Request) (*pool.Destination, error) {
+		return &pool.Destination{
+			Url:           backendURL,
+			SandboxId:     "test-sandbox",
+			RequestLogger: logger.NewNopLogger(),
+			ConnectionKey: "https-backend-verified",
+		}, nil
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, proxy.Close()) })
+
+	resp, err := httpGet(t, fmt.Sprintf("http://127.0.0.1:%d", port))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+}
+
 func TestProxyResumePermissionDeniedErrorTemplate(t *testing.T) {
 	t.Parallel()
 
@@ -273,7 +339,7 @@ func TestProxyResumePermissionDeniedErrorTemplate(t *testing.T) {
 
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		assert.Contains(t, string(body), "Unable to Resume Sandbox")
+		assert.Contains(t, string(body), "Unable to resume sandbox")
 		assert.Contains(t, string(body), "test-sandbox")
 	})
 }
@@ -333,7 +399,7 @@ func TestProxySandboxStillTransitioningErrorTemplate(t *testing.T) {
 
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		assert.Contains(t, string(body), "Sandbox Still Transitioning")
+		assert.Contains(t, string(body), "Sandbox still transitioning")
 		assert.Contains(t, string(body), "test-sandbox")
 	})
 }
@@ -395,7 +461,7 @@ func TestProxyInternalRouteErrorTemplate(t *testing.T) {
 
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		assert.Contains(t, string(body), "Endpoint Not Available")
+		assert.Contains(t, string(body), "Endpoint not available")
 		assert.Contains(t, string(body), "/init")
 		assert.NotContains(t, string(body), "test-sandbox")
 	})
@@ -454,7 +520,7 @@ func TestProxyTeamSandboxLimitError(t *testing.T) {
 
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		assert.Contains(t, string(body), "Sandbox Limit Reached")
+		assert.Contains(t, string(body), "Sandbox limit reached")
 		assert.Contains(t, string(body), "rate limit hit")
 	})
 }

@@ -3,22 +3,17 @@ package testutils
 import (
 	"context"
 	"database/sql"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // this allows goose to function
-	"github.com/pressly/goose/v3"
-	"github.com/pressly/goose/v3/database"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	dbmodule "github.com/e2b-dev/infra/packages/db"
 	db "github.com/e2b-dev/infra/packages/db/client"
 	authdb "github.com/e2b-dev/infra/packages/db/pkg/auth"
 	"github.com/e2b-dev/infra/packages/db/pkg/pool"
@@ -29,7 +24,7 @@ const (
 	// TrackingTable is goose's bookkeeping table for this database. Exported
 	// because migration tests step the schema through their own provider and
 	// must target the same table the harness migrated.
-	TrackingTable = "_migrations"
+	TrackingTable = dbmodule.TrackingTable
 
 	testPostgresImage = "postgres:18-alpine"
 	testDatabaseName  = "test_db"
@@ -61,6 +56,7 @@ func SetupDatabase(t *testing.T) *Database {
 		postgres.WithDatabase(testDatabaseName),
 		postgres.WithUsername(testUsername),
 		postgres.WithPassword(testPassword),
+		testcontainers.WithCmdArgs("-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
@@ -114,62 +110,24 @@ func SetupDatabase(t *testing.T) *Database {
 	}
 }
 
-func (db *Database) ApplyMigrations(t *testing.T, migrationDirs ...string) {
-	t.Helper()
-
-	db.applyGooseMigrations(t, migrationDirs...)
-}
-
 func (db *Database) ConnStr() string {
 	return db.connStr
 }
 
-func (db *Database) applyGooseMigrations(t *testing.T, migrationDirs ...string) {
+// runDatabaseMigrations applies the schema the way the migrator does, from the
+// copy embedded in the binary rather than a directory on disk: go test caches
+// a result by the inputs the binary observed, and a file outside the test's
+// own module is not one of them, so a schema edit read from a checkout would
+// leave dependent modules' cached passes standing.
+func runDatabaseMigrations(t *testing.T, connStr string) {
 	t.Helper()
 
-	cmd := exec.CommandContext(t.Context(), "git", "rev-parse", "--show-toplevel")
-	output, err := cmd.Output()
-	require.NoError(t, err, "Failed to find git root")
-	repoRoot := strings.TrimSpace(string(output))
-
-	sqlDB, err := sql.Open("pgx", db.connStr)
+	sqlDB, err := sql.Open("pgx", connStr)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		err := sqlDB.Close()
 		assert.NoError(t, err)
 	})
 
-	// A provider per directory, each carrying its own store, so nothing here
-	// depends on goose's package-level dialect and tracking-table globals. That
-	// is what the mutex this replaced was guarding: parallel tests raced on
-	// those globals, and the race detector caught it on ARM64.
-	store, err := database.NewStore(goose.DialectPostgres, TrackingTable)
-	require.NoError(t, err)
-
-	for _, migrationsDir := range migrationDirs {
-		// os.DirFS defers failure until the first read, which surfaces as "no
-		// migrations found" — a message that sends you looking for missing SQL
-		// rather than a missing directory.
-		dir := filepath.Join(repoRoot, migrationsDir)
-		require.DirExists(t, dir)
-
-		provider, err := goose.NewProvider(
-			"", // Has to be empty when using a custom store
-			sqlDB,
-			os.DirFS(dir),
-			goose.WithStore(store),
-		)
-		require.NoError(t, err)
-
-		_, err = provider.Up(t.Context())
-		require.NoError(t, err)
-	}
-}
-
-// runDatabaseMigrations executes all required database migrations
-func runDatabaseMigrations(t *testing.T, connStr string) {
-	t.Helper()
-
-	db := &Database{connStr: connStr}
-	db.ApplyMigrations(t, filepath.Join("packages", "db", "migrations"))
+	require.NoError(t, dbmodule.Migrate(t.Context(), sqlDB))
 }

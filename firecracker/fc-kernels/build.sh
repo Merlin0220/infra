@@ -8,6 +8,8 @@ set -euo pipefail
 #   ./build.sh <kernel_version> [arch]    # build a single version
 #
 # arch is one of: x86_64 (default), arm64 (kernel-style names).
+# A version may carry a flavour, 6.1.158-android: the upstream tag and the patches
+# come from its stem (6.1.158), the config and the output from the full name.
 # Output: builds/vmlinux-<version>/<output_arch>/vmlinux.bin where
 # <output_arch> is the Go/OCI name (amd64/arm64) used by the orchestrator.
 #
@@ -66,6 +68,11 @@ get_tag() {
   return 1
 }
 
+# The upstream version a pin is built from: 6.1.158 for 6.1.158-android.
+version_stem() {
+  echo "${1%%-*}"
+}
+
 # The salt Kconfig carries into the vmlinux as an ELF note, naming what the
 # binary was built from. It is a plain string symbol, so olddefconfig keeps
 # whatever the config it reads says: a config seeded from another version names
@@ -82,8 +89,12 @@ build_salt() {
     arm64) rpm_arch="aarch64" ;;
     *)     rpm_arch="$target_arch" ;;
   esac
-  # The distro is the tag's last dot-separated field: amzn2, amzn2023.
-  echo "${version}-${tag##*.}.${rpm_arch}"
+  # The distro field get_tag matched on, found by name rather than by position:
+  # its glob ends open, so this field is not always the tag's last. A tag
+  # without one is not one get_tag returns, so fail rather than salt with
+  # whatever happens to sit there.
+  [[ "$tag" =~ amzn2[0-9]* ]] || return 1
+  echo "${version}-${BASH_REMATCH[0]}.${rpm_arch}"
 }
 
 apply_patches() {
@@ -111,17 +122,22 @@ build_version() {
 
   cp "$SCRIPT_DIR/configs/${target_arch}/${version}.config" .config
 
-  local tag=""
+  local stem tag=""
+  stem="$(version_stem "$version")"
   # get_tag greps, so no match is a non-zero exit, not just empty output.
-  tag="$(get_tag "$version")" || true
+  tag="$(get_tag "$stem")" || true
   if [ -z "$tag" ]; then
     echo "No amzn tag for kernel version $version" >&2
     return 1
   fi
   echo "Checking out $tag for kernel version: $version"
   git checkout -f "$tag"
+  # A patch that adds files leaves them untracked; the next build's apply would refuse them.
+  git clean -fdq
 
-  apply_patches "$version"
+  apply_patches "$stem"
+  # A flavour may carry patches of its own, applied after its stem's.
+  [ "$version" = "$stem" ] || apply_patches "$version"
 
   local make_opts="" cross=""
   if [[ "$target_arch" == "arm64" ]]; then

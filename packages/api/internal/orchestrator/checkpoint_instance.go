@@ -4,16 +4,16 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/gogo/status"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 
 	"github.com/e2b-dev/infra/packages/api/internal/sandbox"
 	"github.com/e2b-dev/infra/packages/db/pkg/types"
-	"github.com/e2b-dev/infra/packages/db/queries"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/storageopts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
@@ -27,7 +27,16 @@ func (o *Orchestrator) CheckpointSandbox(ctx context.Context, teamID uuid.UUID, 
 	ctx, span := tracer.Start(ctx, "checkpoint-sandbox")
 	defer span.End()
 
-	sbx, alreadyDone, finishSnapshotting, err := o.sandboxStore.StartRemoving(ctx, teamID, sandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionSnapshot})
+	// Tracked from the start, like a pause: a checkpoint's work can outlive
+	// the request, and a drain that already stopped waiting must not admit one.
+	releaseWork, ok := o.TrackWork()
+	if !ok {
+		return ErrDraining
+	}
+	defer releaseWork()
+
+	transition, alreadyDone, finishSnapshotting, err := o.sandboxStore.StartRemoving(ctx, teamID, sandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionSnapshot})
+	sbx := transition.Sandbox
 	if err != nil {
 		return fmt.Errorf("failed to start snapshotting: %w", err)
 	}
@@ -61,16 +70,20 @@ func (o *Orchestrator) CheckpointSandbox(ctx context.Context, teamID uuid.UUID, 
 		return fmt.Errorf("node '%s' not found", sbx.NodeID)
 	}
 
-	upsertResult, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, false))
+	// A fork checkpoint is always a memory snapshot, but the source may hold a
+	// filesystem-only build from an earlier memory:false snapshot: that kind
+	// must survive until this build is ready, or a refused checkpoint would
+	// leave the row claiming memory for a build that has none.
+	currentKind, upsertResult, err := o.upsertSnapshotKeepingKind(ctx, sbx, node)
 	if err != nil {
-		return fmt.Errorf("error upserting snapshot: %w", err)
+		return err
 	}
 
 	// Checkpoint pauses the sandbox, snapshots it, and resumes it on the
 	// orchestrator with the same ExecutionID. Once the pause has started, the
 	// orchestrator stops the old sandbox itself on error; RemoveSandbox is
 	// still needed to clean up API-side state (store, routing, analytics).
-	client, childCtx := node.GetClient(ctx)
+	client, childCtx := node.GetSandboxClient(ctx, sbx.TeamID.String())
 	_, err = client.Sandbox.Checkpoint(childCtx, &orchestrator.SandboxCheckpointRequest{
 		SandboxId: sbx.SandboxID,
 		BuildId:   upsertResult.BuildID.String(),
@@ -93,6 +106,7 @@ func (o *Orchestrator) CheckpointSandbox(ctx context.Context, teamID uuid.UUID, 
 
 				return fmt.Errorf("checkpoint rejected: %w", err)
 			case codes.ResourceExhausted:
+				logger.L().Warn(ctx, "Checkpoint refused by the node", logger.WithSandboxID(sandboxID), zap.String("node_message", st.Message()))
 				finish(nil)
 
 				return PauseQueueExhaustedError{}
@@ -127,14 +141,7 @@ func (o *Orchestrator) CheckpointSandbox(ctx context.Context, teamID uuid.UUID, 
 		return fmt.Errorf("checkpoint failed: %w", err)
 	}
 
-	now := time.Now()
-	err = o.sqlcDB.UpdateEnvBuildStatus(ctx, queries.UpdateEnvBuildStatusParams{
-		Status:     types.BuildStatusSuccess,
-		FinishedAt: &now,
-		Reason:     types.BuildReason{},
-		BuildID:    upsertResult.BuildID,
-	})
-	if err != nil {
+	if err := o.finishSnapshotBuildWithKind(ctx, upsertResult.BuildID, sandboxID, currentKind, false, types.BuildStatusSuccess); err != nil {
 		return fmt.Errorf("error updating build status: %w", err)
 	}
 

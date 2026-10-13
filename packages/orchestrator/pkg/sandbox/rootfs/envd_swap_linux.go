@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +77,32 @@ var ErrOfflineSwapUnrecoverable = errors.New("offline envd swap failed and the o
 // can tell "we declined this rootfs" from "the swap broke".
 var ErrEnvdTooLarge = errors.New("rootfs envd is too large to swap offline")
 
+// ErrEnvdMissing marks a rootfs whose /usr/bin/envd is absent at the pre-swap
+// size check — debugfs `stat` reports no such file (and, like every failed
+// scripted command, exits 0). Recoverable: nothing was touched, so the guest
+// boots its own envd. Its own sentinel so a ramp can tell a genuinely envd-less
+// rootfs from a stat that could not be read at all.
+var ErrEnvdMissing = errors.New("rootfs has no /usr/bin/envd to swap")
+
+// ErrStatUnparseable marks a debugfs `stat` that exited without a parseable Size
+// header and was not a recognisable "file not found" — e.g. a filesystem debugfs
+// could not open at all, which also exits 0 and so lands here rather than as a
+// run error. A property of the rootfs, not a swap malfunction; recoverable at the
+// pre-swap check. Deliberately NOT classified by matching debugfs's message text:
+// an e2fsprogs wording change is itself a failure mode worth catching, so keying
+// on those strings would break silently exactly when it is needed.
+var ErrStatUnparseable = errors.New("debugfs stat output has no parseable size")
+
+// ErrSwapSourceMissing marks the one step whose ENOENT means the binary to install
+// is gone: staging the target into the jail-readable directory. It exists because
+// the caller has to tell that apart from every other ENOENT this function can
+// produce -- a vanished TMPDIR, an unwritable backup target, a stage directory
+// pulled out from under it -- all of which are host faults that must page someone,
+// while a retired source is a benign deferral. errors.Is(err, fs.ErrNotExist) on
+// the returned error cannot make that distinction, since nothing was written to
+// the rootfs in either case.
+var ErrSwapSourceMissing = errors.New("envd binary to install is no longer on disk")
+
 // SwapResult reports what the swap observed about the rootfs, for telemetry the
 // caller emits. It is returned on every path, including failures, and its zero
 // value means "the swap did not get far enough to tell".
@@ -100,9 +127,12 @@ type SwapResult struct {
 
 // SwapEnvdBinary replaces /usr/bin/envd inside an unmounted ext4 rootfs device
 // with the binary at srcPath, entirely in userspace via debugfs (libext2fs) —
-// never a host-kernel mount of the tenant image. Intended to run in the reboot
-// PreBootFn, before Firecracker boots, so a filesystem-only snapshot cold-boots
-// onto a newer envd. The device must not be mounted or written concurrently.
+// never a host-kernel mount of the tenant image. stageRoot must be the same
+// host-backed path in the pod and host mount namespaces because the jailed
+// debugfs unit bind-mounts the staged files by their absolute path. Intended to
+// run in the reboot PreBootFn, before Firecracker boots, so a filesystem-only
+// snapshot cold-boots onto a newer envd. The device must not be mounted or
+// written concurrently.
 //
 // The swap is transactional against the "never brick a sandbox" guarantee:
 // debugfs runs a script of commands and exits 0 even if an individual command
@@ -126,18 +156,21 @@ type SwapResult struct {
 // give it EnvdSwapBudget. Steps 4-5 decide the outcome and run on their own budgets,
 // so a spent ctx cannot make the rootfs state unknowable and fail an otherwise fine
 // boot.
-func SwapEnvdBinary(ctx context.Context, devicePath, srcPath string) (SwapResult, error) {
+func SwapEnvdBinary(ctx context.Context, devicePath, srcPath, stageRoot string) (SwapResult, error) {
 	ctx, span := tracer.Start(ctx, "envd-binary-swap", trace.WithAttributes(
 		attribute.String("device", devicePath),
 		attribute.String("src", srcPath),
 	))
 	defer span.End()
+	if !filepath.IsAbs(stageRoot) {
+		return SwapResult{}, fmt.Errorf("envd swap stage root must be absolute: %q", stageRoot)
+	}
 
 	// Stage the new binary and the debugfs command/dump files in a private
 	// directory bound into the jail. The target's real home (/fc-envd) is a
 	// gcsfuse mount that need not propagate into the unit's private mount
 	// namespace, so copy it onto local disk first.
-	stage, err := os.MkdirTemp("", "envd-swap-*")
+	stage, err := os.MkdirTemp(stageRoot, ".envd-swap-")
 	if err != nil {
 		return SwapResult{}, fmt.Errorf("create swap stage dir: %w", err)
 	}
@@ -175,6 +208,15 @@ func swapEnvd(ctx context.Context, dbg swapIO, srcPath string) (res SwapResult, 
 	stage := dbg.stageDir
 	stagedNew := filepath.Join(stage, "envd.new")
 	if err := copyFile(srcPath, stagedNew, 0o755); err != nil {
+		// A missing SOURCE is named, so the caller can treat a retired binary as a
+		// deferral without also swallowing the host faults that raise ENOENT here.
+		// Keyed on the source's own stat rather than on the copy's error, because
+		// the destination is inside a directory this function just created and its
+		// ENOENT means something quite different.
+		if _, serr := os.Stat(srcPath); errors.Is(serr, fs.ErrNotExist) {
+			return res, fmt.Errorf("%w: %q: %w", ErrSwapSourceMissing, srcPath, err)
+		}
+
 		return res, fmt.Errorf("stage target envd %q: %w", srcPath, err)
 	}
 	// The jailed debugfs runs as an unprivileged DynamicUser with no
@@ -215,9 +257,9 @@ func swapEnvd(ctx context.Context, dbg swapIO, srcPath string) (res SwapResult, 
 	if err := createJailWritable(origPath); err != nil {
 		return res, fmt.Errorf("pre-create backup target: %w", err)
 	}
-	if out, derr := dbg.run(ctx, "backup",
+	if _, derr := dbg.run(ctx, "backup",
 		fmt.Sprintf("dump %s %s\n", guestEnvdPath, origPath), false); derr != nil {
-		return res, fmt.Errorf("back up original envd: %w (output: %q)", derr, string(out))
+		return res, fmt.Errorf("back up original envd: %w", derr)
 	}
 	if fi, serr := os.Stat(origPath); serr != nil || fi.Size() == 0 {
 		// No original to fall back to — refuse rather than risk an unrecoverable
@@ -243,10 +285,10 @@ func swapEnvd(ctx context.Context, dbg swapIO, srcPath string) (res SwapResult, 
 	// on-disk state. The decision below reads the actual rootfs and acts on that.
 	swapScript := fmt.Sprintf("rm %s\nwrite %s %s\nsif %s mode 0100755\n",
 		guestEnvdPath, stagedNew, guestEnvdPath, guestEnvdPath)
-	swapOut, swapErr := dbg.run(ctx, "swap", swapScript, true)
+	_, swapErr := dbg.run(ctx, "swap", swapScript, true)
 	swapCtx := "debugfs exited cleanly"
 	if swapErr != nil {
-		swapCtx = fmt.Sprintf("debugfs errored: %v (output %q)", swapErr, string(swapOut))
+		swapCtx = fmt.Sprintf("debugfs errored: %v", swapErr)
 	}
 
 	// 4. Decide from the ACTUAL rootfs state, not the exit code — in ONE read. There
@@ -308,7 +350,7 @@ func rollbackEnvd(ctx context.Context, dbg swapIO, origPath string) error {
 	// RuntimeMaxSec firing after the restore already landed — says nothing about
 	// what is on disk. Only the read-back below decides, so a restore that succeeded
 	// under a dying process is not reported as an unrecoverable failure.
-	out, rbErr := dbg.run(writeCtx, "rollback", script, true)
+	_, rbErr := dbg.run(writeCtx, "rollback", script, true)
 	cancelWrite()
 
 	origSHA, err := fileSHA256(origPath)
@@ -326,8 +368,8 @@ func rollbackEnvd(ctx context.Context, dbg swapIO, origPath string) error {
 
 	if classifyEnvdState(st.presence, st.content) != envdSwapApplied {
 		if rbErr != nil {
-			return fmt.Errorf("restored envd is %s (restore debugfs errored: %w, output %q)",
-				st.describe(), rbErr, string(out))
+			return fmt.Errorf("restored envd is %s (restore debugfs errored: %w)",
+				st.describe(), rbErr)
 		}
 
 		return fmt.Errorf("restored envd is %s", st.describe())
@@ -479,7 +521,7 @@ func readEnvdState(ctx context.Context, dbg swapIO, phase, wantSHA, origSHA stri
 		fmt.Sprintf("stat %s\n", guestEnvdPath), false)
 	switch {
 	case err != nil:
-		st.presence, st.statErr = presenceUnknown, fmt.Errorf("%w (output: %q)", err, string(out))
+		st.presence, st.statErr = presenceUnknown, err
 
 		return st
 	case envdAbsent(string(out)):
@@ -538,7 +580,14 @@ func statEnvdSize(ctx context.Context, dbg swapIO) (int64, error) {
 	out, err := dbg.run(ctx, "size-stat",
 		fmt.Sprintf("stat %s\n", guestEnvdPath), false)
 	if err != nil {
-		return 0, fmt.Errorf("stat for size check: %w (output: %q)", err, string(out))
+		return 0, fmt.Errorf("stat for size check: %w", err)
+	}
+	// debugfs exits 0 for a missing file (see envdAbsent), so this is the only
+	// place the absent case can be told apart from an unparseable stat. Consult
+	// envdAbsent — already load-bearing for the never-brick decision — rather than
+	// let a missing envd surface as ErrStatUnparseable.
+	if envdAbsent(string(out)) {
+		return 0, ErrEnvdMissing
 	}
 
 	return parseEnvdSize(string(out))
@@ -548,11 +597,14 @@ func statEnvdSize(ctx context.Context, dbg swapIO) (int64, error) {
 func parseEnvdSize(statOut string) (int64, error) {
 	m := debugfsSizeRe.FindStringSubmatch(statOut)
 	if m == nil {
-		return 0, fmt.Errorf("no Size field in debugfs stat output (%q)", statOut)
+		return 0, ErrStatUnparseable
 	}
 	size, err := strconv.ParseInt(m[1], 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("parse size %q: %w", m[1], err)
+		// Only overflow can reach here (the capture is \d+). Return the sentinel
+		// with no wrapped detail: both m[1] and strconv's own error text quote the
+		// tenant-influenced digits, which must not reach the reboot logger.
+		return 0, ErrStatUnparseable
 	}
 
 	return size, nil
@@ -591,9 +643,9 @@ func dumpSHA256(ctx context.Context, dbg swapIO, phase string) (string, error) {
 	if err := createJailWritable(out); err != nil {
 		return "", fmt.Errorf("pre-create dump target: %w", err)
 	}
-	if o, err := dbg.run(ctx, phase,
+	if _, err := dbg.run(ctx, phase,
 		fmt.Sprintf("dump %s %s\n", guestEnvdPath, out), false); err != nil {
-		return "", fmt.Errorf("dump %s: %w (output: %q)", guestEnvdPath, err, string(o))
+		return "", fmt.Errorf("dump %s: %w", guestEnvdPath, err)
 	}
 	fi, err := os.Stat(out)
 	if err != nil {
@@ -666,6 +718,14 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // command file, and dump outputs) is bind-mounted read-write at its host path so
 // `write`/`-f` sources and `dump` targets resolve unchanged. phase names the
 // transient unit and script file so sequential invocations don't collide.
+//
+// On a run failure it returns a *debugfsRunError carrying only structural facts
+// (phase, exit code, output length) — never the output bytes, which are
+// tenant-influenced (a crafted rootfs shapes them) and reach shared telemetry via
+// the reboot logger. The returned bytes are still debugfs's own stdout+stderr,
+// parsed locally by callers for the swap's decisions, but no caller folds them
+// into a propagated error: the error already carries the diagnosis by
+// construction, which is why appending the raw output is neither needed nor done.
 func runDebugfs(ctx context.Context, devicePath, stageDir, phase, script string, writable bool) ([]byte, error) {
 	if !nbdDevicePath.MatchString(devicePath) {
 		return nil, fmt.Errorf("refusing to run debugfs on unexpected device path %q", devicePath)
@@ -683,59 +743,12 @@ func runDebugfs(ctx context.Context, devicePath, stageDir, phase, script string,
 
 	unit := "envd-swap-" + phase + "-" + filepath.Base(devicePath)
 
-	args := []string{
-		"--wait", "--pipe", "--collect", "--quiet",
-		"--unit=" + unit,
-		fmt.Sprintf("--property=RuntimeMaxSec=%d", int(EnvdSwapTimeout.Seconds())),
-		"--property=KillSignal=SIGKILL",
-		"--property=TimeoutStopSec=10s",
-		"--property=DynamicUser=yes",
-		"--property=SupplementaryGroups=disk",
-		"--property=ProtectProc=invisible",
-		"--property=ProcSubset=pid",
-		"--property=PrivateNetwork=yes",
-		"--property=PrivateIPC=yes",
-		"--property=ProtectHome=yes",
-		"--property=NoNewPrivileges=yes",
-		"--property=CapabilityBoundingSet=",
-		"--property=AmbientCapabilities=",
-		"--property=RestrictNamespaces=yes",
-		"--property=SystemCallFilter=@system-service",
-		// debugfs rewrites inode fields inside the image via libext2fs, not via
-		// host chown/setuid or resource syscalls, so subtract those from the
-		// @system-service allow-list rather than leave them reachable.
-		"--property=SystemCallFilter=~@privileged @resources",
-		"--property=SystemCallArchitectures=native",
-		"--property=RestrictAddressFamilies=AF_UNIX",
-		"--property=LockPersonality=yes",
-		"--property=ProtectClock=yes",
-		"--property=ProtectKernelTunables=yes",
-		"--property=ProtectKernelModules=yes",
-		"--property=ProtectKernelLogs=yes",
-		"--property=ProtectControlGroups=yes",
-		"--property=ProtectHostname=yes",
-		"--property=RestrictRealtime=yes",
-		// debugfs does not JIT; deny writable+executable mappings.
-		"--property=MemoryDenyWriteExecute=yes",
-		// PrivateNetwork already isolates the network; make the intent explicit.
-		"--property=IPAddressDeny=any",
-		"--property=Environment=",
-		// Empty root: loader, libraries, target device, and the staged directory
-		// (read-write, for dump outputs) are all that's visible.
-		"--property=TemporaryFileSystem=/",
-		"--property=BindReadOnlyPaths=/usr",
-		"--property=BindReadOnlyPaths=/usr/lib64:/lib64",
-		"--property=BindReadOnlyPaths=/usr/lib:/lib",
-		"--property=BindReadOnlyPaths=/usr/bin:/bin",
-		"--property=BindReadOnlyPaths=/usr/sbin:/sbin",
-		"--property=BindPaths=" + stageDir,
-		"--property=MountAPIVFS=yes",
-		"--property=PrivateDevices=yes",
-		fmt.Sprintf("--property=DeviceAllow=%s rw", devicePath),
-		"--property=BindPaths=" + devicePath,
+	// The staging directory is bind-mounted read-write so `write`/`-f` sources
+	// and `dump` targets resolve unchanged inside the empty jail root.
+	args := append(jailProperties(unit, EnvdSwapTimeout, devicePath, stageDir),
 		"--",
 		"/usr/sbin/debugfs",
-	}
+	)
 	if writable {
 		args = append(args, "-w")
 	}
@@ -753,8 +766,58 @@ func runDebugfs(ctx context.Context, devicePath, stageDir, phase, script string,
 	defer stopCancel()
 	_ = exec.CommandContext(stopCtx, "systemctl", "stop", "--quiet", unit+".service").Run()
 
-	return out.Bytes(), err
+	if err != nil {
+		return out.Bytes(), newDebugfsRunError(phase, err, len(out.Bytes()))
+	}
+
+	return out.Bytes(), nil
 }
+
+// newDebugfsRunError maps a cmd.Run() failure to the typed error. It takes the
+// output LENGTH, not the bytes, so the tenant-influenced output cannot be folded
+// in even here — the invariant holds by the signature. Extracted from runDebugfs
+// so the err → (exitCode, cause) mapping is unit-testable without systemd.
+func newDebugfsRunError(phase string, err error, outputLen int) *debugfsRunError {
+	re := &debugfsRunError{phase: phase, exitCode: -1, outputLen: outputLen}
+	var ee *exec.ExitError
+	// ExitCode() is -1 when the process was killed by a signal (a ctx/budget
+	// SIGKILL, or RuntimeMaxSec) — not a real exit, so keep the "did not complete"
+	// shape and carry the reason as cause rather than a bare -1.
+	if errors.As(err, &ee) && ee.ExitCode() >= 0 {
+		re.exitCode = ee.ExitCode()
+	} else {
+		re.cause = err
+	}
+
+	return re
+}
+
+// debugfsRunError is what runDebugfs returns when the jailed process fails to run
+// to a clean exit. It carries only structural facts — phase, exit code, and the
+// number of bytes debugfs wrote — never the output itself, which is
+// tenant-influenced and flows into shared telemetry. cause holds the underlying
+// os/exec error (host-generated: a timeout, a failure to start) when the process
+// did not exit normally; exitCode is -1 in that case.
+type debugfsRunError struct {
+	phase     string
+	exitCode  int
+	outputLen int
+	cause     error
+}
+
+func (e *debugfsRunError) Error() string {
+	if e.exitCode < 0 {
+		if e.cause != nil {
+			return fmt.Sprintf("debugfs %s did not complete: %v (%d bytes output withheld)", e.phase, e.cause, e.outputLen)
+		}
+
+		return fmt.Sprintf("debugfs %s did not complete (%d bytes output withheld)", e.phase, e.outputLen)
+	}
+
+	return fmt.Sprintf("debugfs %s exited %d (%d bytes output withheld)", e.phase, e.exitCode, e.outputLen)
+}
+
+func (e *debugfsRunError) Unwrap() error { return e.cause }
 
 // cappedBuffer accumulates writes up to limit bytes and silently discards the
 // rest, while always reporting a full write so the child process is never blocked

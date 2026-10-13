@@ -13,14 +13,16 @@ import (
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	"github.com/e2b-dev/infra/packages/api/internal/clusters"
+	grpcshared "github.com/e2b-dev/infra/packages/shared/pkg/grpc"
 	orchestratorinfo "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
 )
 
 var OrchestratorToApiNodeStateMapper = map[orchestratorinfo.ServiceInfoStatus]api.NodeStatus{
-	orchestratorinfo.ServiceInfoStatus_Healthy:   api.NodeStatusReady,
-	orchestratorinfo.ServiceInfoStatus_Draining:  api.NodeStatusDraining,
-	orchestratorinfo.ServiceInfoStatus_Unhealthy: api.NodeStatusUnhealthy,
-	orchestratorinfo.ServiceInfoStatus_Standby:   api.NodeStatusStandby,
+	orchestratorinfo.ServiceInfoStatus_Healthy:      api.NodeStatusReady,
+	orchestratorinfo.ServiceInfoStatus_Draining:     api.NodeStatusDraining,
+	orchestratorinfo.ServiceInfoStatus_Unhealthy:    api.NodeStatusUnhealthy,
+	orchestratorinfo.ServiceInfoStatus_Standby:      api.NodeStatusStandby,
+	orchestratorinfo.ServiceInfoStatus_ShuttingDown: api.NodeStatusShuttingDown,
 }
 
 func NewClient(tracerProvider trace.TracerProvider, meterProvider metric.MeterProvider, host string) (*clusters.GRPCClient, error) {
@@ -30,6 +32,7 @@ func NewClient(tracerProvider trace.TracerProvider, meterProvider metric.MeterPr
 			otelgrpc.NewClientHandler(
 				otelgrpc.WithTracerProvider(tracerProvider),
 				otelgrpc.WithMeterProvider(meterProvider),
+				grpcshared.WithSandboxClientMetricAttributes(),
 			),
 		),
 		grpc.WithKeepaliveParams(

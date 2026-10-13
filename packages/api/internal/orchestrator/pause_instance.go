@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/gogo/status"
 	"github.com/google/uuid"
@@ -23,17 +22,18 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
-type PauseQueueExhaustedError struct{}
-
-func (PauseQueueExhaustedError) Error() string {
-	return "The pause queue is exhausted"
-}
+// Defined in the sandbox package so the evictor can classify it without an
+// import cycle.
+type PauseQueueExhaustedError = sandbox.PauseQueueExhaustedError
 
 func (o *Orchestrator) pauseSandbox(ctx context.Context, node *nodemanager.Node, sbx sandbox.Sandbox, filesystemOnly bool) error {
 	ctx, span := tracer.Start(ctx, "pause-sandbox")
 	defer span.End()
 
-	result, err := o.throttledUpsertSnapshot(ctx, buildUpsertSnapshotParams(sbx, node, filesystemOnly))
+	// The requested kind is recorded only once the pause has succeeded: a pause
+	// the node refuses leaves the sandbox running on its previous build, whose
+	// kind the row must keep describing.
+	currentKind, result, err := o.upsertSnapshotKeepingKind(ctx, sbx, node)
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error inserting snapshot for env", err)
 
@@ -56,26 +56,22 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, node *nodemanager.Node,
 	)
 
 	err = snapshotInstance(ctx, node, sbx, result.TemplateID, result.BuildID.String(), filesystemOnly)
-	if errors.Is(err, PauseQueueExhaustedError{}) {
-		telemetry.ReportCriticalError(ctx, "pause queue exhausted", err)
+	if err != nil {
+		// The build is already committed, and nothing reaps one left non-terminal.
+		o.failSnapshotBuild(ctx, result.BuildID, err)
 
-		return PauseQueueExhaustedError{}
-	}
+		if errors.Is(err, PauseQueueExhaustedError{}) {
+			telemetry.ReportEvent(ctx, "pause refused retryably", telemetry.WithSandboxID(sbx.SandboxID))
 
-	if err != nil && !errors.Is(err, PauseQueueExhaustedError{}) {
+			return PauseQueueExhaustedError{}
+		}
+
 		telemetry.ReportCriticalError(ctx, "error pausing sandbox", err)
 
 		return fmt.Errorf("error pausing sandbox: %w", err)
 	}
 
-	now := time.Now()
-	err = o.sqlcDB.UpdateEnvBuildStatus(ctx, queries.UpdateEnvBuildStatusParams{
-		Status:     types.BuildStatusSuccess,
-		FinishedAt: &now,
-		Reason:     types.BuildReason{},
-		BuildID:    result.BuildID,
-	})
-	if err != nil {
+	if err := o.finishSnapshotBuildWithKind(ctx, result.BuildID, sbx.SandboxID, currentKind, filesystemOnly, types.BuildStatusSuccess); err != nil {
 		telemetry.ReportCriticalError(ctx, "error pausing sandbox", err)
 
 		return fmt.Errorf("error pausing sandbox: %w", err)
@@ -90,7 +86,7 @@ func snapshotInstance(ctx context.Context, node *nodemanager.Node, sbx sandbox.S
 	childCtx, childSpan := tracer.Start(ctx, "snapshot-instance")
 	defer childSpan.End()
 
-	client, childCtx := node.GetSandboxDeleteCtx(childCtx, sbx.SandboxID, sbx.ExecutionID)
+	client, childCtx := node.GetSandboxClient(childCtx, sbx.TeamID.String())
 	_, err := client.Sandbox.Pause(
 		childCtx, &orchestrator.SandboxPauseRequest{
 			SandboxId:      sbx.SandboxID,
@@ -112,6 +108,8 @@ func snapshotInstance(ctx context.Context, node *nodemanager.Node, sbx sandbox.S
 	}
 
 	if st.Code() == codes.ResourceExhausted {
+		logger.L().Warn(ctx, "Pause refused by the node", logger.WithSandboxID(sbx.SandboxID), zap.String("node_message", st.Message()))
+
 		return PauseQueueExhaustedError{}
 	}
 

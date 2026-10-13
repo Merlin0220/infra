@@ -79,6 +79,12 @@ func (f *LocalDiffFile) CloseToDiff(
 	}
 
 	if size.Size() == 0 {
+		// NoDiff carries no path and nothing registers this file in the DiffStore,
+		// so this is the last chance to reclaim it.
+		if rmErr := os.Remove(f.cachePath); rmErr != nil && !os.IsNotExist(rmErr) {
+			return nil, fmt.Errorf("failed to remove empty diff file: %w", rmErr)
+		}
+
 		return &NoDiff{}, nil
 	}
 
@@ -134,7 +140,13 @@ func (b *localDiff) ReadAt(_ context.Context, p []byte, off int64, _ *storage.Fr
 }
 
 func (b *localDiff) Slice(_ context.Context, off, length int64, _ *storage.FrameTable) ([]byte, error) {
-	return b.cache.Slice(off, length)
+	out := make([]byte, length)
+	n, err := b.cache.ReadAt(out, off)
+	if err != nil {
+		return nil, err
+	}
+
+	return out[:n], nil
 }
 
 func (b *localDiff) Size(_ context.Context) (int64, error) {

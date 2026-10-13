@@ -2,8 +2,8 @@ name: "Unit Tests"
 description: |
   Runs the unit test shard for one infra package, including the host setup
   that the package needs (bindfs for envd, NBD/hugepages/uffd for the
-  orchestrator). Always writes coverage.txt and junit.xml into the package
-  directory; callers decide whether to upload them.
+  orchestrator). Writes coverage.txt into the package directory when coverage
+  is enabled; coverage is opt-in and no CI workflow currently enables it.
 
   The workspace root must have this repository's layout. The logic lives in
   a composite action (instead of inline in pr-tests.yml) so that other
@@ -25,6 +25,10 @@ inputs:
     description: "Run with the race detector (roughly doubles runtime; raises the go test timeout to 40m)"
     required: false
     default: "false"
+  coverage:
+    description: "Write coverage.txt (set/atomic covermode picked by go test); enable when the caller uploads it"
+    required: false
+    default: "false"
 
 runs:
   using: "composite"
@@ -36,6 +40,22 @@ runs:
           go.work
           ${{ inputs.package }}/go.mod
           ${{ inputs.package }}/go.sum
+
+    - name: Use the Docker Hub mirror
+      uses: ./.github/actions/docker-hub-mirror
+
+    # The image checks that callers run after this action (make test-image)
+    # pull their base images through BuildKit, which ignores the testcontainers
+    # prefix. This builder, made the default for the rest of the job, pulls
+    # Docker Hub bases from the mirror; those builds pass --load, so their
+    # images still reach the local daemon for docker run.
+    - name: Set up a BuildKit builder that uses the Docker Hub mirror
+      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      with:
+        driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+        buildkitd-config-inline: |
+          [registry."docker.io"]
+            mirrors = ["mirror.gcr.io"]
 
     - name: Reap orphaned Testcontainers from previous runs
       shell: bash
@@ -87,23 +107,42 @@ runs:
         sudo udevadm control --reload-rules
         sudo udevadm trigger
 
+    # Prefixed so the pins cannot shadow variables such as GO in the
+    # Makefiles the tests run.
+    - name: Parse .tool-versions
+      uses: wistia/parse-tool-versions@32f568a4ffd4bfa7720ebf93f171597d1ebc979a # v2.1.1
+      with:
+        prefix: TOOL_VERSION_
+
+    # mise downloads the release binary pinned in .tool-versions rather than
+    # building it from source.
     - name: Install gotestsum
+      uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+      with:
+        version: ${{ env.TOOL_VERSION_MISE }}
+        install_args: gotestsum
+
+    # Put the binary itself on PATH, not just mise's shim: under sudo the shim
+    # would look for mise's installs in root's home.
+    - name: Add gotestsum to PATH
       shell: bash
-      run: go install gotest.tools/gotestsum@v1.13.0
+      run: dirname "$(mise which gotestsum)" >> "$GITHUB_PATH"
 
     # sudo strips PATH; pass it through so gotestsum/go resolve to the
-    # runner's toolchain instead of /usr/bin/go. Trap chowns reports back to
-    # the runner so uploads can read them even when tests fail.
+    # runner's toolchain instead of /usr/bin/go. Trap chowns the coverage
+    # profile back to the runner so callers can read it even when tests fail.
     - name: Run tests that require sudo
       if: inputs.sudo == 'true'
       shell: bash
       working-directory: ${{ inputs.package }}
       run: |
-        trap 'sudo chown "$(id -u):$(id -g)" coverage.txt junit.xml 2>/dev/null || true' EXIT
+        trap 'sudo chown "$(id -u):$(id -g)" coverage.txt 2>/dev/null || true' EXIT
         RACE=""; TEST_TIMEOUT=20m
         if [ "${{ inputs.race }}" = "true" ]; then RACE="-race"; TEST_TIMEOUT=40m; fi
-        sudo -E env "PATH=$PATH" gotestsum --junitfile=junit.xml --format=standard-verbose \
-          -- -timeout $TEST_TIMEOUT $RACE -coverprofile=coverage.txt -covermode=atomic ${{ inputs.test-path }}
+        COVER=""
+        if [ "${{ inputs.coverage }}" = "true" ]; then COVER="-coverprofile=coverage.txt"; fi
+        sudo -E env "PATH=$PATH" gotestsum --format=standard-verbose \
+          -- -timeout $TEST_TIMEOUT $RACE -parallel 16 $COVER ${{ inputs.test-path }}
 
     - name: Run tests
       if: inputs.sudo != 'true'
@@ -112,5 +151,7 @@ runs:
       run: |
         RACE=""; TEST_TIMEOUT=20m
         if [ "${{ inputs.race }}" = "true" ]; then RACE="-race"; TEST_TIMEOUT=40m; fi
-        gotestsum --junitfile=junit.xml --format=standard-verbose \
-          -- -timeout $TEST_TIMEOUT $RACE -coverprofile=coverage.txt -covermode=atomic ${{ inputs.test-path }}
+        COVER=""
+        if [ "${{ inputs.coverage }}" = "true" ]; then COVER="-coverprofile=coverage.txt"; fi
+        gotestsum --format=standard-verbose \
+          -- -timeout $TEST_TIMEOUT $RACE -parallel 16 $COVER ${{ inputs.test-path }}

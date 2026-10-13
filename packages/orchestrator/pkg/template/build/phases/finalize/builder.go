@@ -26,6 +26,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/sandboxtools"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/storage/cache"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
@@ -131,6 +132,23 @@ func (ppb *PostProcessingBuilder) Layer(
 	if len(ppb.Config.CmdlineArgs) > 0 {
 		result.CmdlineArgs = maps.Clone(ppb.Config.CmdlineArgs)
 	}
+	// The balloon this build's VM was configured with, for the same reason and
+	// with the same unconditional assignment.
+	result.Balloon = &metadata.Balloon{Reporting: ppb.Config.FreePageReporting, Hinting: ppb.Config.FreePageHinting}
+
+	// Overwritten even when nil, so an inherited template cannot stand as this build's.
+	// Cloned so stored metadata cannot be reached through the build config.
+	result.CPUTemplate = nil
+	result.BuildCPUTemplate = nil
+	if ppb.Config.CPUTemplate != nil && !ppb.Config.CPUTemplate.IsEmpty() {
+		tmpl := ppb.Config.CPUTemplate.Clone()
+		buildTmpl := ppb.Config.CPUTemplate.Clone()
+		result.CPUTemplate = &tmpl
+		result.BuildCPUTemplate = &buildTmpl
+	}
+
+	// Build always boots a fresh VM of this size, while the source layer may be a cached one of another.
+	result = result.WithVcpuCount(ppb.Config.VCpuCount)
 
 	return phases.LayerResult{
 		Metadata: result,
@@ -160,9 +178,9 @@ func (ppb *PostProcessingBuilder) Build(
 		return phases.LayerResult{}, fmt.Errorf("error checking build version: %w", err)
 	}
 	if !ok {
-		// For older builds, always use "user" as the default user
+		// For older builds, always use the template default user
 		// and do not set a default workdir (defaults to the user homedir).
-		defaultUser = new("user")
+		defaultUser = new(consts.TemplateDefaultUser)
 		defaultWorkdir = nil
 	}
 

@@ -19,7 +19,7 @@ func TestWorkloadFreezer_FreezeHoldBlocksUnfreeze(t *testing.T) {
 
 	f := NewWorkloadFreezer(NewNoopManager())
 
-	release, _, err := f.FreezeHold(t.Context(), 0)
+	release, _, err := f.FreezeHold(t.Context(), FreezeOptions{MaxWait: 0})
 	require.NoError(t, err)
 
 	unfrozen := make(chan struct{})
@@ -57,6 +57,8 @@ type fakeFreezeManager struct {
 	freezeErr map[ProcessType]error
 	frozenErr map[ProcessType]error
 	readOrder []ProcessType
+	// unfreezeErr fails the thaw of a cgroup, leaving it frozen: a dirty thaw.
+	unfreezeErr map[ProcessType]error
 }
 
 func newFakeFreezeManager() *fakeFreezeManager {
@@ -86,6 +88,9 @@ func (m *fakeFreezeManager) Freeze(pt ProcessType) error {
 func (m *fakeFreezeManager) Unfreeze(pt ProcessType) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.unfreezeErr[pt]; err != nil {
+		return err
+	}
 	m.frozen[pt] = false
 
 	return nil
@@ -114,7 +119,7 @@ func TestFreeze_ReadsBackEveryCgroupFrozen(t *testing.T) {
 	t.Parallel()
 	f := NewWorkloadFreezer(newFakeFreezeManager())
 
-	res, err := f.Freeze(t.Context(), time.Second)
+	res, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: time.Second})
 	require.NoError(t, err)
 	assert.Equal(t, len(WorkloadProcessTypes), res.Requested)
 	assert.Equal(t, len(WorkloadProcessTypes), res.Frozen)
@@ -135,7 +140,7 @@ func TestFreeze_UnobservableIsNeitherAwaitedNorCountedNotFrozen(t *testing.T) {
 	// A budget far larger than the test's patience: if the wait were entered at all, the
 	// elapsed assertion below would catch it.
 	start := time.Now()
-	res, err := f.Freeze(t.Context(), 10*time.Second)
+	res, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: 10 * time.Second})
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
@@ -158,7 +163,7 @@ func TestFreeze_ReportsNotFrozenRatherThanFailing(t *testing.T) {
 	mgr.frozenAt[WorkloadProcessTypes[0]] = 1 << 30
 	f := NewWorkloadFreezer(mgr)
 
-	res, err := f.Freeze(t.Context(), 20*time.Millisecond)
+	res, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: 20 * time.Millisecond})
 	require.NoError(t, err, "a workload that will not stop is reported, not an error")
 	assert.Equal(t, 1, res.NotFrozen)
 	assert.Equal(t, len(WorkloadProcessTypes)-1, res.Frozen)
@@ -177,7 +182,7 @@ func TestFreeze_WaitIsBoundedBySlowestNotSum(t *testing.T) {
 	}
 	f := NewWorkloadFreezer(mgr)
 
-	res, err := f.Freeze(t.Context(), 5*time.Second)
+	res, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: 5 * time.Second})
 
 	require.NoError(t, err)
 	require.True(t, res.AllFrozen())
@@ -204,12 +209,16 @@ func TestFreeze_WaitIsBoundedBySlowestNotSum(t *testing.T) {
 	}
 }
 
-// TestFreeze_UnreadableStateIsCountedFailedNotAwaited covers the read-error arm of the
-// wait. A cgroup removed mid-sweep reports ENOENT and a threaded one rejects the read, so
-// this is expected rather than exceptional: the error is surfaced, but the result survives
-// alongside it, the cgroup is counted failed rather than notFrozen -- the two say different
-// things to the pause path -- and it is dropped from the poll set instead of waiting out a
-// budget on a state that can never be read. The remaining cgroup is still awaited normally.
+// TestFreeze_UnreadableStateIsCountedFailedNotAwaited covers the read-error arm of the wait
+// for a cgroup that is STILL THERE and merely unreadable -- deliberately not one that went
+// away, which is counted Vanished and covered separately. The distinction is why the fixture
+// injects an opaque error rather than an errno: a real ENOENT or ENODEV here would be a
+// vanish, and this test is about the other class.
+//
+// Expected rather than exceptional: the error is surfaced, but the result survives alongside
+// it, the cgroup is counted failed rather than notFrozen -- the two say different things to
+// the pause path -- and it is dropped from the poll set instead of waiting out a budget on a
+// state that can never be read. The remaining cgroup is still awaited normally.
 func TestFreeze_UnreadableStateIsCountedFailedNotAwaited(t *testing.T) {
 	t.Parallel()
 
@@ -218,7 +227,7 @@ func TestFreeze_UnreadableStateIsCountedFailedNotAwaited(t *testing.T) {
 	f := NewWorkloadFreezer(mgr)
 
 	start := time.Now()
-	res, err := f.Freeze(t.Context(), 10*time.Second)
+	res, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: 10 * time.Second})
 	elapsed := time.Since(start)
 
 	require.Error(t, err, "the failure is surfaced, as it is for a rejected write")
@@ -234,12 +243,13 @@ func TestFreeze_UnreadableStateIsCountedFailedNotAwaited(t *testing.T) {
 func TestFreeze_CountsWriteFailuresWithoutAborting(t *testing.T) {
 	t.Parallel()
 	mgr := newFakeFreezeManager()
-	// A threaded cgroup rejects cgroup.freeze; that is expected, not exceptional, and
-	// must not stop the sweep reaching the remaining cgroups.
+	// A write the kernel refuses is expected, not exceptional, and must not stop the sweep
+	// reaching the remaining cgroups. An opaque error on purpose: a vanish errno would be
+	// tolerated rather than counted, which is a different arm.
 	mgr.freezeErr[WorkloadProcessTypes[0]] = errors.New("invalid argument")
 	f := NewWorkloadFreezer(mgr)
 
-	res, err := f.Freeze(t.Context(), time.Second)
+	res, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: time.Second})
 	require.Error(t, err, "the failure is surfaced")
 	assert.Equal(t, 1, res.Failed)
 	assert.Equal(t, len(WorkloadProcessTypes)-1, res.Requested)
@@ -252,7 +262,7 @@ func TestFreeze_ZeroBudgetSkipsTheWait(t *testing.T) {
 	mgr := newFakeFreezeManager()
 	f := NewWorkloadFreezer(mgr)
 
-	res, err := f.Freeze(t.Context(), 0)
+	res, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: 0})
 	require.NoError(t, err)
 	assert.Equal(t, len(WorkloadProcessTypes), res.Requested)
 	assert.Zero(t, res.Frozen, "no budget means the state was never read")
@@ -283,7 +293,7 @@ func TestFreeze_CancellationStopsThePollAndReleasesTheLock(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, err := f.Freeze(ctx, 10*time.Second)
+	_, err := f.Freeze(ctx, FreezeOptions{MaxWait: 10 * time.Second})
 	elapsed := time.Since(start)
 
 	require.NoError(t, err, "cancellation is not a freeze failure: the writes still landed")
@@ -302,4 +312,173 @@ func TestFreeze_CancellationStopsThePollAndReleasesTheLock(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Unfreeze blocked: the freeze lock was still held after cancellation")
 	}
+}
+
+// TestFreezeOptions_MaxCgroupsIsClampedAtTheThawCap: the sweep must never be allowed to cover more
+// cgroups than a thaw can reach. That is the drift DefaultThawMaxCgroups forbids, reached by raising
+// this knob rather than lowering that constant -- and this one is an int flag, tunable without a
+// deploy, so the mistake is a typo rather than a code change. Its consequence is the worst one this
+// design has: a workload frozen for the life of the sandbox, with a backstop that re-walks the same
+// truncated prefix forever and can never reach what was frozen beyond it.
+func TestFreezeOptions_MaxCgroupsIsClampedAtTheThawCap(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		set  int
+		want int
+	}{
+		{"zero means the default", 0, DefaultFreezeMaxCgroups},
+		{"negative means the default", -1, DefaultFreezeMaxCgroups},
+		{"an ordinary raise is honoured", 4096, 4096},
+		{"the thaw cap itself is allowed", DefaultThawMaxCgroups, DefaultThawMaxCgroups},
+		{"past the thaw cap is clamped", DefaultThawMaxCgroups + 1, DefaultThawMaxCgroups},
+		{"a fat-fingered flag is clamped", 163840, DefaultThawMaxCgroups},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tc.want, FreezeOptions{MaxCgroups: tc.set}.maxCgroups())
+		})
+	}
+}
+
+// The freeze generation moves on every freeze -- Freeze, and FreezeHold, which the live
+// upgrade's handover takes -- and on nothing else: no thaw, no read and no ResumeFrozen.
+func TestWorkloadFreezer_FreezeGenerationAdvancesOnFreezesOnly(t *testing.T) {
+	t.Parallel()
+
+	f := NewWorkloadFreezer(newFakeFreezeManager())
+	ctx := t.Context()
+	gen := f.FreezeGeneration(ctx)
+
+	_, err := f.Freeze(ctx, FreezeOptions{MaxWait: time.Second})
+	require.NoError(t, err)
+	assert.Equal(t, gen+1, f.FreezeGeneration(ctx), "Freeze advances it")
+
+	release, _, err := f.FreezeHold(ctx, FreezeOptions{MaxWait: time.Second})
+	require.NoError(t, err)
+	release()
+	assert.Equal(t, gen+2, f.FreezeGeneration(ctx), "FreezeHold advances it")
+
+	require.NoError(t, f.Unfreeze(ctx))
+	_, err = f.UnfreezeReporting(ctx, DefaultThawMaxCgroups)
+	require.NoError(t, err)
+	_, matched, _, err := f.ThawIfGeneration(ctx, gen+2, nil)
+	require.NoError(t, err)
+	assert.True(t, matched)
+	_, matched, _, err = f.ThawIfGeneration(ctx, gen, nil)
+	require.NoError(t, err)
+	assert.False(t, matched)
+	f.ResumeFrozen(ctx)
+	assert.Equal(t, gen+2, f.FreezeGeneration(ctx), "thaws, reads and ResumeFrozen leave it alone")
+}
+
+// ThawIfGeneration thaws only for the current generation; a stale one runs nothing, not even
+// afterThaw, and reports the generation it found.
+func TestWorkloadFreezer_ThawIfGenerationThawsOnlyTheCurrentGeneration(t *testing.T) {
+	t.Parallel()
+
+	mgr := newFakeFreezeManager()
+	f := NewWorkloadFreezer(mgr)
+	ctx := t.Context()
+	entered := f.FreezeGeneration(ctx)
+	_, err := f.Freeze(ctx, FreezeOptions{MaxWait: time.Second})
+	require.NoError(t, err)
+
+	ran := false
+	current, matched, _, err := f.ThawIfGeneration(ctx, entered, func() { ran = true })
+	require.NoError(t, err)
+	assert.False(t, matched, "a generation a freeze overtook must not thaw")
+	assert.Equal(t, entered+1, current)
+	assert.False(t, ran, "nothing runs on a mismatch")
+	assert.True(t, mgr.frozen[ProcessTypeUser], "the freeze stands")
+
+	_, matched, _, err = f.ThawIfGeneration(ctx, current, func() { ran = true })
+	require.NoError(t, err)
+	assert.True(t, matched)
+	assert.True(t, ran)
+	assert.False(t, mgr.frozen[ProcessTypeUser], "the current generation thaws")
+}
+
+// afterThaw runs after the thaw and before the freeze lock is released, so whatever it records
+// cannot be zeroed by a freeze landing between the thaw and the record.
+func TestWorkloadFreezer_ThawIfGenerationRunsAfterThawUnderTheLock(t *testing.T) {
+	t.Parallel()
+
+	mgr := newFakeFreezeManager()
+	f := NewWorkloadFreezer(mgr)
+	_, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: time.Second})
+	require.NoError(t, err)
+
+	var ran, held, frozen bool
+	_, matched, _, err := f.ThawIfGeneration(t.Context(), f.FreezeGeneration(t.Context()), func() {
+		ran = true
+		frozen = mgr.frozen[ProcessTypeUser]
+		held = !f.lock.TryAcquire(1)
+		if !held {
+			f.lock.Release(1)
+		}
+	})
+	require.NoError(t, err)
+	require.True(t, matched)
+	require.True(t, ran)
+	assert.False(t, frozen, "afterThaw runs after the thaw")
+	assert.True(t, held, "afterThaw runs before the lock is released")
+}
+
+// The conditional thaw keeps the watchdog's rules: a clean thaw disarms it, a dirty one leaves
+// it armed to retry, and a withheld one leaves it armed for the freeze that voided the thaw.
+func TestWorkloadFreezer_ThawIfGenerationKeepsTheWatchdogRules(t *testing.T) {
+	t.Parallel()
+
+	armed := func(f *WorkloadFreezer) bool {
+		f.watchdogMu.Lock()
+		defer f.watchdogMu.Unlock()
+
+		return f.watchdog != nil
+	}
+	freeze := func(t *testing.T, mgr *fakeFreezeManager) *WorkloadFreezer {
+		t.Helper()
+
+		f := NewWorkloadFreezer(mgr)
+		f.SetThawWatchdog(time.Hour, func(ThawResult, error) {})
+		_, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: time.Second})
+		require.NoError(t, err)
+		require.True(t, armed(f), "the freeze arms the watchdog")
+
+		return f
+	}
+
+	t.Run("clean", func(t *testing.T) {
+		t.Parallel()
+
+		f := freeze(t, newFakeFreezeManager())
+		_, matched, _, err := f.ThawIfGeneration(t.Context(), f.FreezeGeneration(t.Context()), nil)
+		require.NoError(t, err)
+		require.True(t, matched)
+		assert.False(t, armed(f))
+	})
+
+	t.Run("dirty", func(t *testing.T) {
+		t.Parallel()
+
+		mgr := newFakeFreezeManager()
+		mgr.unfreezeErr = map[ProcessType]error{ProcessTypeUser: errors.New("EBUSY")}
+		f := freeze(t, mgr)
+		_, matched, _, err := f.ThawIfGeneration(t.Context(), f.FreezeGeneration(t.Context()), nil)
+		require.Error(t, err)
+		require.True(t, matched)
+		assert.True(t, armed(f))
+	})
+
+	t.Run("withheld", func(t *testing.T) {
+		t.Parallel()
+
+		f := freeze(t, newFakeFreezeManager())
+		_, matched, _, err := f.ThawIfGeneration(t.Context(), f.FreezeGeneration(t.Context())-1, nil)
+		require.NoError(t, err)
+		require.False(t, matched)
+		assert.True(t, armed(f))
+	})
 }

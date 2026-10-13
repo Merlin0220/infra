@@ -1,7 +1,7 @@
 package storage
 
 // Shared testcontainer scaffolding for the storage server-backed tests
-// (MinIO / fake-gcs-server). Split out from #3113 so the GCS server tests and
+// (RustFS / fake-gcs-server). Split out from #3113 so the GCS server tests and
 // the AWS server tests can share it.
 
 import (
@@ -26,7 +26,12 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-const minioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+// RustFS stands in for S3: MinIO no longer publishes container images.
+const (
+	s3EmulatorImage     = "rustfs/rustfs:1.0.1"
+	s3EmulatorAccessKey = "rustfsadmin"
+	s3EmulatorSecretKey = "rustfsadmin"
+)
 
 // s3TestBackend describes where the tests run: a real AWS bucket (endpoint
 // empty) or an S3-compatible container endpoint.
@@ -35,27 +40,30 @@ type s3TestBackend struct {
 	endpoint string
 }
 
-// startMinioBackend starts a per-test MinIO container and creates a bucket in
-// it (same pattern as redis_utils.SetupInstance — Docker required, torn down
-// via t.Cleanup). Also used by the GCS XML multipart tests, which run against
-// MinIO because it implements the S3/GCS XML multipart dialect.
-func startMinioBackend(t *testing.T) *s3TestBackend {
+// startS3Backend starts a per-test S3 emulator container and creates a bucket
+// in it (same pattern as redis_utils.SetupInstance — Docker required, torn
+// down via t.Cleanup). Also used by the GCS XML multipart tests, which run
+// against it because it implements the S3/GCS XML multipart dialect.
+func startS3Backend(t *testing.T) *s3TestBackend {
 	t.Helper()
 
 	container, err := testcontainers.GenericContainer(t.Context(), testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        minioImage,
-			Cmd:          []string{"server", "/data"},
+			Image: s3EmulatorImage,
+			Env: map[string]string{
+				"RUSTFS_ACCESS_KEY": s3EmulatorAccessKey,
+				"RUSTFS_SECRET_KEY": s3EmulatorSecretKey,
+			},
 			ExposedPorts: []string{"9000/tcp"},
-			WaitingFor:   wait.ForHTTP("/minio/health/live").WithPort("9000/tcp"),
+			WaitingFor:   wait.ForHTTP("/health").WithPort("9000/tcp"),
 		},
 		Started: true,
 	})
-	require.NoError(t, err, "start minio container")
+	require.NoError(t, err, "start s3 emulator container")
 
 	t.Cleanup(func() {
-		if err := container.Terminate(context.Background()); err != nil {
-			t.Logf("cleanup: failed to terminate minio container: %v", err)
+		if err := container.Terminate(context.WithoutCancel(t.Context())); err != nil {
+			t.Logf("cleanup: failed to terminate s3 emulator container: %v", err)
 		}
 	})
 
@@ -84,7 +92,7 @@ func (b *s3TestBackend) newClient(t *testing.T, httpClient *http.Client, optFns 
 
 	if b.endpoint != "" {
 		cfg := aws.Config{
-			Credentials: credentials.NewStaticCredentialsProvider("minioadmin", "minioadmin", ""),
+			Credentials: credentials.NewStaticCredentialsProvider(s3EmulatorAccessKey, s3EmulatorSecretKey, ""),
 			Region:      "us-east-1",
 		}
 		if httpClient != nil {

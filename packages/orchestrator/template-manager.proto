@@ -16,6 +16,8 @@ message InitLayerFileUploadRequest {
 message InitLayerFileUploadResponse{
   bool present = 1;
   optional string url = 2;
+  // Request headers the upload client must send on the PUT to `url`.
+  map<string, string> headers = 3;
 }
 
 message TemplateStep {
@@ -87,6 +89,10 @@ message TemplateConfig {
   optional FromImageRegistry fromImageRegistry = 15;
 
   string teamID = 16;
+
+  // Optional during the rolling upgrade. When absent, the template manager
+  // uses diskSizeMB as the post-build free-space target.
+  optional int32 freeDiskSizeMB = 17;
 }
 
 message TemplateCreateRequest {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -26,6 +27,22 @@ import (
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
+
+// resumeWaitOrchestrator is the slice of *orchestrator.Orchestrator the resume
+// handler consults before it commits to resuming: the record read and the
+// wait on an in-flight transition.
+type resumeWaitOrchestrator interface {
+	GetSandbox(ctx context.Context, teamID uuid.UUID, sandboxID string) (sandbox.Sandbox, error)
+	WaitForStateChange(ctx context.Context, teamID uuid.UUID, sandboxID string) error
+}
+
+func (a *APIStore) resumeBackend() resumeWaitOrchestrator {
+	if a.resumeBackendOverride != nil {
+		return a.resumeBackendOverride
+	}
+
+	return a.orchestrator
+}
 
 func (a *APIStore) PostSandboxesSandboxIDResume(c *gin.Context, sandboxID api.SandboxID) {
 	ctx := c.Request.Context()
@@ -66,7 +83,9 @@ func (a *APIStore) PostSandboxesSandboxIDResume(c *gin.Context, sandboxID api.Sa
 	}
 
 	teamID := teamInfo.Team.ID
-	sandboxData, err := a.orchestrator.GetSandbox(ctx, teamID, sandboxID)
+	backend := a.resumeBackend()
+
+	sandboxData, err := backend.GetSandbox(ctx, teamID, sandboxID)
 	if err == nil {
 		if sandboxData.TeamID != teamID {
 			logger.L().Debug(ctx, "Sandbox team mismatch on resume", logger.WithSandboxID(sandboxID), logger.WithTeamID(teamID.String()))
@@ -78,13 +97,25 @@ func (a *APIStore) PostSandboxesSandboxIDResume(c *gin.Context, sandboxID api.Sa
 		switch sandboxData.State {
 		case sandbox.StatePausing:
 			logger.L().Debug(ctx, "Waiting for sandbox to pause", logger.WithSandboxID(sandboxID))
-			err = a.orchestrator.WaitForStateChange(ctx, teamID, sandboxID)
+			err = backend.WaitForStateChange(ctx, teamID, sandboxID)
+			if errors.Is(err, sandbox.ErrTransitionRestored) {
+				a.sendAPIStoreError(c, http.StatusConflict, fmt.Sprintf("Sandbox %s is already running", sandboxID))
+
+				return
+			}
 			if err != nil {
 				telemetry.ReportCriticalError(ctx, "error waiting for sandbox to pause", err,
 					telemetry.WithSandboxID(sandboxID),
 					telemetry.WithTeamID(teamID.String()),
 				)
 				a.sendAPIStoreError(c, http.StatusInternalServerError, "Error waiting for sandbox to pause")
+
+				return
+			}
+			// The transition can complete before the wait looks: re-read, a
+			// refused-and-restored pause leaves the sandbox running.
+			if current, getErr := backend.GetSandbox(ctx, teamID, sandboxID); getErr == nil && current.State == sandbox.StateRunning {
+				a.sendAPIStoreError(c, http.StatusConflict, fmt.Sprintf("Sandbox %s is already running", sandboxID))
 
 				return
 			}
@@ -228,6 +259,13 @@ func setMemoryOverrideOutcome(c *gin.Context, memory *bool, createErr *api.APIEr
 	c.Set(metricMemoryOverride, outcome)
 }
 
+// snapshotIsFilesystemOnly reports whether the stored snapshot persists only
+// the rootfs. Rows written before the kind was recorded have a nil config and
+// are memory snapshots.
+func snapshotIsFilesystemOnly(snap queries.Snapshot) bool {
+	return snap.Config != nil && snap.Config.FilesystemOnly
+}
+
 // demandsFilesystemBoot reports whether the request explicitly demands a cold
 // boot that an in-flight start might not honor: memory:false on a snapshot not
 // already filesystem-only (an fs-only snapshot cold-boots on any start, so a
@@ -237,7 +275,7 @@ func demandsFilesystemBoot(memory *bool, snap queries.Snapshot) bool {
 		return false
 	}
 
-	return snap.Config == nil || !snap.Config.FilesystemOnly
+	return !snapshotIsFilesystemOnly(snap)
 }
 
 // resolveFilesystemBoot maps the request's optional memory field (default
@@ -249,7 +287,7 @@ func resolveFilesystemBoot(ctx context.Context, flags featureFlagsClient, memory
 		return false, nil
 	}
 
-	if snap.Config != nil && snap.Config.FilesystemOnly {
+	if snapshotIsFilesystemOnly(snap) {
 		return false, nil
 	}
 
@@ -353,6 +391,7 @@ func (a *APIStore) buildResumeSandboxDataFromSnapshot(snapshotSandboxID, sandbox
 			NodeID:                  &nodeID,
 			SnapshotSandboxID:       snapshotSandboxID,
 			FilesystemBoot:          filesystemBoot,
+			FilesystemOnlySnapshot:  snapshotIsFilesystemOnly(snap),
 		}, nil
 	}
 }

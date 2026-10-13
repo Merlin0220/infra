@@ -3,8 +3,10 @@
 package server
 
 import (
+	"errors"
 	"net"
 	"reflect"
+	"syscall"
 	"testing"
 	"time"
 
@@ -17,10 +19,12 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/service"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/id"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
@@ -58,7 +62,7 @@ func Test_server_List(t *testing.T) {
 						TemplateId: "template-id",
 					},
 					Metadata: &sandbox.Metadata{
-						Runtime: sandbox.RuntimeMetadata{
+						Runtime: sandboxtypes.RuntimeMetadata{
 							SandboxID:   listSandboxID,
 							TeamID:      listTeamID,
 							ExecutionID: listExecutionID,
@@ -128,7 +132,7 @@ func TestGetSandboxExecutionData(t *testing.T) {
 				Vcpu:  2,
 				RamMB: 512,
 			}),
-			Runtime: sandbox.RuntimeMetadata{
+			Runtime: sandboxtypes.RuntimeMetadata{
 				SandboxID: id.Generate(),
 			},
 		},
@@ -143,6 +147,44 @@ func TestGetSandboxExecutionData(t *testing.T) {
 	assert.Equal(t, int64(512), result["memory_mb"])
 	assert.IsType(t, int64(0), result["execution_time"])
 	assert.Positive(t, result["execution_time"].(int64))
+}
+
+func TestGetSandboxExecutionDataSurvivesCheckpointHandlerRebuild(t *testing.T) {
+	t.Parallel()
+
+	executionStartedAt := time.Now().Add(-7 * time.Hour)
+	handlerStartedAt := time.Now().Add(-13 * time.Second)
+
+	sbx := &sandbox.Sandbox{
+		Metadata: &sandbox.Metadata{
+			Config: sandbox.NewConfig(sandbox.Config{}),
+		},
+	}
+	sbx.SetExecutionStartedAt(executionStartedAt)
+	sbx.SetStartedAt(handlerStartedAt)
+
+	result := (&Server{}).getSandboxExecutionData(sbx)
+
+	assert.Equal(t, executionStartedAt.UTC().Format(time.RFC3339), result["started_at"])
+	assert.GreaterOrEqual(t, result["execution_time"].(int64), (7 * time.Hour).Milliseconds())
+}
+
+func TestGetSandboxExecutionDataKeepsReadinessStartOnFreshSandbox(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Now().Add(-5 * time.Minute)
+
+	sbx := &sandbox.Sandbox{
+		Metadata: &sandbox.Metadata{
+			Config: sandbox.NewConfig(sandbox.Config{}),
+		},
+	}
+	sbx.SetStartedAt(startedAt)
+	sbx.SetExecutionStartedAt(startedAt.Add(2 * time.Second))
+
+	result := (&Server{}).getSandboxExecutionData(sbx)
+
+	assert.Equal(t, startedAt.UTC().Format(time.RFC3339), result["started_at"])
 }
 
 func TestAddKillReason(t *testing.T) {
@@ -167,6 +209,55 @@ func TestAddKillReason(t *testing.T) {
 	})
 }
 
+func TestAddPauseMode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		filesystemOnly bool
+		want           string
+	}{
+		{"full snapshot", false, "full"},
+		{"filesystem-only snapshot", true, "filesystem"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			eventData := map[string]any{executionEventDataKey: map[string]any{}}
+			addPauseMode(eventData, tt.filesystemOnly)
+
+			assert.Equal(t, tt.want, eventData["pause_mode"])
+			assert.Contains(t, eventData, executionEventDataKey, "existing keys are kept")
+		})
+	}
+}
+
+func TestAddResumeMode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		filesystemBooted bool
+		want             string
+	}{
+		{"memory restored", false, "restore"},
+		{"cold-booted from the filesystem", true, "reboot"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			eventData := map[string]any{}
+			addResumeMode(eventData, tt.filesystemBooted)
+
+			assert.Equal(t, tt.want, eventData["resume_mode"])
+		})
+	}
+}
+
 func TestRecordSandboxKill(t *testing.T) {
 	t.Parallel()
 
@@ -175,8 +266,8 @@ func TestRecordSandboxKill(t *testing.T) {
 	counter, err := telemetry.GetCounter(meter, telemetry.OrchestratorSandboxKilledCounterName)
 	require.NoError(t, err)
 
-	recordSandboxKill(t.Context(), counter, "timeout")
-	recordSandboxKill(t.Context(), counter, "")
+	recordSandboxKill(t.Context(), counter, "team-1", "timeout")
+	recordSandboxKill(t.Context(), counter, "team-2", "")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -192,15 +283,80 @@ func TestRecordSandboxKill(t *testing.T) {
 			require.True(t, ok)
 
 			for _, dp := range sum.DataPoints {
-				v, ok := dp.Attributes.Value(attribute.Key("kill_reason"))
+				reason, ok := dp.Attributes.Value(attribute.Key("kill_reason"))
+				require.True(t, ok)
+				team, ok := dp.Attributes.Value(attribute.Key("team.id"))
+				require.True(t, ok)
+				got[team.AsString()+"/"+reason.AsString()] += dp.Value
+			}
+		}
+	}
+
+	assert.Equal(t, map[string]int64{"team-1/timeout": 1, "team-2/" + killReasonUnknown: 1}, got)
+}
+
+// The crash path runs for sandboxes that ended badly, including ones that
+// never got a process: an absent exit must not panic and must not be guessed.
+func TestRecordCrashWithoutFirecrackerProcess(t *testing.T) {
+	t.Parallel()
+
+	reader := sdkmetric.NewManualReader()
+	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("github.com/e2b-dev/infra/packages/orchestrator/pkg/server")
+	counter, err := telemetry.GetCounter(meter, telemetry.OrchestratorSandboxCrashedCounterName)
+	require.NoError(t, err)
+
+	s := &Server{sandboxCrashedCounter: counter}
+
+	require.NotPanics(t, func() {
+		s.recordCrash(t.Context(), &sandbox.Sandbox{Metadata: &sandbox.Metadata{}}, nil)
+	})
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	got := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != string(telemetry.OrchestratorSandboxCrashedCounterName) {
+				continue
+			}
+
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+
+			for _, dp := range sum.DataPoints {
+				v, ok := dp.Attributes.Value(attribute.Key("cause"))
 				require.True(t, ok)
 				got[v.AsString()] += dp.Value
 			}
 		}
 	}
 
-	assert.Equal(t, int64(1), got["timeout"])
-	assert.Equal(t, int64(1), got[killReasonUnknown])
+	assert.Equal(t, map[string]int64{string(fc.CrashCauseUnknown): 1}, got)
+}
+
+func TestIsCleanFirecrackerExit(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, isCleanFirecrackerExit(fc.CrashCauseCleanExit, nil))
+	assert.False(t, isCleanFirecrackerExit(fc.CrashCauseCleanExit, errors.New("uffd exited")),
+		"a clean exit that came with a wait error is still a crash")
+	assert.False(t, isCleanFirecrackerExit(fc.CrashCauseExternalSignal, nil))
+}
+
+func TestCrashCause(t *testing.T) {
+	t.Parallel()
+
+	handlerErr := errors.New("uffdio copy: cannot allocate memory")
+	ourSigterm := &fc.ExitInfo{Signaled: true, Signal: syscall.SIGTERM, SentByStop: true}
+	foreignSigkill := &fc.ExitInfo{Signaled: true, Signal: syscall.SIGKILL}
+
+	assert.Equal(t, fc.CrashCauseMemoryHandlerFailed, crashCause(ourSigterm, handlerErr),
+		"teardown stopping Firecracker after the memory handler failed is that failure")
+	assert.Equal(t, fc.CrashCauseRequestedSignal, crashCause(ourSigterm, nil),
+		"without a handler failure our signal points at a missing stop reason")
+	assert.Equal(t, fc.CrashCauseExternalSignal, crashCause(foreignSigkill, handlerErr),
+		"a foreign kill can take the handler down with it and stays external")
 }
 
 func TestRecordExecutionDuration(t *testing.T) {

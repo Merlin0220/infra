@@ -1,13 +1,21 @@
 package nodemanager
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	orchestratorinfo "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/servicediscovery"
 )
 
 func TestNodeCanAcceptNewRequests(t *testing.T) {
@@ -17,6 +25,7 @@ func TestNodeCanAcceptNewRequests(t *testing.T) {
 		api.NodeStatusReady:        true,
 		api.NodeStatusConnecting:   false,
 		api.NodeStatusDraining:     false,
+		api.NodeStatusShuttingDown: false,
 		api.NodeStatusStandby:      false,
 		api.NodeStatusUnhealthy:    false,
 		api.NodeStatus("nonsense"): false,
@@ -33,6 +42,15 @@ func TestNodeCanAcceptNewRequests(t *testing.T) {
 	}
 }
 
+func TestSendStatusChangeRejectsShuttingDown(t *testing.T) {
+	t.Parallel()
+
+	node := &Node{ID: "test-node"}
+	err := node.SendStatusChange(t.Context(), api.NodeStatusShuttingDown)
+	require.Equal(t, codes.FailedPrecondition, grpcstatus.Code(err))
+	require.Equal(t, "shutting_down can only be entered during process shutdown", grpcstatus.Convert(err).Message())
+}
+
 // Every status the orchestrator can report needs an api.NodeStatus counterpart.
 // Node construction and sync fall back to api.NodeStatusUnhealthy for statuses
 // they don't recognize, so a value added to the proto enum without a mapping
@@ -45,6 +63,14 @@ func TestOrchestratorToApiNodeStateMapperCoversEveryProtoStatus(t *testing.T) {
 
 	require.NotEmpty(t, orchestratorinfo.ServiceInfoStatus_name)
 
+	expectedWireValues := map[orchestratorinfo.ServiceInfoStatus]string{
+		orchestratorinfo.ServiceInfoStatus_Healthy:      "ready",
+		orchestratorinfo.ServiceInfoStatus_Draining:     "draining",
+		orchestratorinfo.ServiceInfoStatus_Unhealthy:    "unhealthy",
+		orchestratorinfo.ServiceInfoStatus_Standby:      "standby",
+		orchestratorinfo.ServiceInfoStatus_ShuttingDown: "shutting_down",
+	}
+
 	for value, name := range orchestratorinfo.ServiceInfoStatus_name {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -54,6 +80,9 @@ func TestOrchestratorToApiNodeStateMapperCoversEveryProtoStatus(t *testing.T) {
 			apiStatus, ok := OrchestratorToApiNodeStateMapper[orchStatus]
 			require.Truef(t, ok, "no api.NodeStatus mapped for orchestrator status %s", name)
 			assert.Truef(t, apiStatus.Valid(), "orchestrator status %s maps to %q, which is not a member of the api.NodeStatus enum", name, apiStatus)
+			expected, ok := expectedWireValues[orchStatus]
+			require.Truef(t, ok, "no expected wire value for orchestrator status %s", name)
+			assert.Equal(t, expected, string(apiStatus))
 		})
 	}
 }
@@ -96,4 +125,33 @@ func TestStatusMappersAreInverses(t *testing.T) {
 		_, ok := ApiNodeToOrchestratorStateMapper[api.NodeStatusConnecting]
 		assert.False(t, ok, "api.NodeStatusConnecting is derived locally and must not be sent to an orchestrator")
 	})
+}
+
+// The metric half of the tag is asserted in the orchestrator package. Both
+// emitters of this line need pinning: setStatus is the one the orchestrator's
+// own reported transitions go through, markUnhealthyLocal only the local
+// sync-failure path.
+//
+//nolint:paralleltest // ReplaceGlobals mutates process state
+func TestStatusChangeLogsTheDiscoveryBackend(t *testing.T) {
+	transitions := map[string]func(*Node, context.Context){
+		"reported by the orchestrator": func(n *Node, ctx context.Context) {
+			n.setStatus(ctx, api.NodeStatusDraining, time.Now())
+		},
+		"observed locally": func(n *Node, ctx context.Context) { n.markUnhealthyLocal(ctx) },
+	}
+
+	for name, transition := range transitions {
+		t.Run(name, func(t *testing.T) {
+			core, logs := observer.New(zapcore.InfoLevel)
+			t.Cleanup(logger.ReplaceGlobals(t.Context(), logger.NewTracedLoggerFromCore(core)))
+
+			node := &Node{ID: "node-1", Backend: servicediscovery.BackendKubernetes}
+			transition(node, t.Context())
+
+			entries := logs.FilterMessage("NodeID status changed").All()
+			require.Len(t, entries, 1)
+			assert.Equal(t, string(servicediscovery.BackendKubernetes), entries[0].ContextMap()["backend"])
+		})
+	}
 }

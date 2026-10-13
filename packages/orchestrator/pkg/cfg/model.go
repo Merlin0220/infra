@@ -15,13 +15,15 @@ import (
 	"github.com/willscott/go-nfs"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
 const DefaultBusyboxVersion = "1.36.1"
 
 type BuilderConfig struct {
-	DomainName             string `env:"DOMAIN_NAME"              envDefault:""`
+	featureflags.Config
+
 	FirecrackerVersionsDir string `env:"FIRECRACKER_VERSIONS_DIR" envDefault:"/fc-versions"`
 	BusyboxVersion         string `env:"BUSYBOX_VERSION"          envDefault:"1.36.1"`
 	HostBusyboxDir         string `env:"HOST_BUSYBOX_DIR"         envDefault:"/fc-busybox"`
@@ -83,6 +85,7 @@ type Config struct {
 	DisableStartupReclaim       bool              `env:"DISABLE_STARTUP_RECLAIM"`
 	ForceStop                   bool              `env:"FORCE_STOP"`
 	GRPCPort                    uint16            `env:"GRPC_PORT"                     envDefault:"5008"`
+	InstanceGroupName           string            `env:"INSTANCE_GROUP_NAME"`
 	LocalUploadBaseURL          string            `env:"LOCAL_UPLOAD_BASE_URL"`
 	NodeIP                      string            `env:"NODE_IP"                       envDefault:"localhost"`
 	NodeLabels                  []string          `env:"NODE_LABELS"                   envSeparator:","`
@@ -93,6 +96,8 @@ type Config struct {
 	NFSProxyRecordHandleCalls   bool              `env:"NFS_PROXY_RECORD_HANDLE_CALLS" envDefault:"false"`
 	NFSProxyRecordStatCalls     bool              `env:"NFS_PROXY_RECORD_STAT_CALLS"   envDefault:"false"`
 	NFSProxyLogLevel            nfs.LogLevel      `env:"NFS_PROXY_LOG_LEVEL"           envDefault:"info"`
+	NFSProxyHandleCacheLimit    int               `env:"NFS_PROXY_HANDLE_CACHE_LIMIT"  envDefault:"16384"`
+	NFSProxyDirVerifierLimit    int               `env:"NFS_PROXY_DIR_VERIFIER_LIMIT"  envDefault:"256"`
 	ProxyPort                   uint16            `env:"PROXY_PORT"                    envDefault:"5007"`
 	RedisClusterURL             string            `env:"REDIS_CLUSTER_URL"`
 	RedisTLSCABase64            string            `env:"REDIS_TLS_CA_BASE64"`

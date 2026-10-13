@@ -90,11 +90,17 @@ var uploadBytesView = sdkmetric.NewView(
 )
 
 func NewMeterProvider(metricsExporter sdkmetric.Exporter, metricExportPeriod time.Duration, res *resource.Resource, extraOption ...sdkmetric.Option) (*sdkmetric.MeterProvider, error) {
+	return newMeterProvider(metricsExporter, metricExportPeriod, res, nil, extraOption)
+}
+
+// newMeterProvider is NewMeterProvider with options for the periodic reader
+// it creates.
+func newMeterProvider(metricsExporter sdkmetric.Exporter, metricExportPeriod time.Duration, res *resource.Resource, readerOptions []sdkmetric.PeriodicReaderOption, extraOption []sdkmetric.Option) (*sdkmetric.MeterProvider, error) {
 	opts := []sdkmetric.Option{
 		sdkmetric.WithReader(
 			sdkmetric.NewPeriodicReader(
 				metricsExporter,
-				sdkmetric.WithInterval(metricExportPeriod),
+				append([]sdkmetric.PeriodicReaderOption{sdkmetric.WithInterval(metricExportPeriod)}, readerOptions...)...,
 			),
 		),
 		// Disable exemplars: they count 1:1 against the Mimir tenant items/s
@@ -109,6 +115,16 @@ func NewMeterProvider(metricsExporter sdkmetric.Exporter, metricExportPeriod tim
 
 	opts = append(opts, extraOption...)
 	opts = append(opts, sdkmetric.WithView(snapshotBytesView, uploadBytesView))
+	// Export these as explicit histograms so collectors can forward them to
+	// Prometheus without adding them to an exponential-conversion allowlist.
+	for _, name := range []HistogramType{NetworkSlotReturnDurationName, NetworkEgressRetirementDurationName} {
+		opts = append(opts, sdkmetric.WithView(sdkmetric.NewView(
+			sdkmetric.Instrument{Name: string(name), Kind: sdkmetric.InstrumentKindHistogram},
+			sdkmetric.Stream{Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+				Boundaries: []float64{0, 1, 10, 100, 500, 1000, 3000, 5000, 10000, 30000, 60000, 120000, 300000, 600000},
+			}},
+		)))
+	}
 
 	return sdkmetric.NewMeterProvider(opts...), nil
 }

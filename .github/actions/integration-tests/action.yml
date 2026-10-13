@@ -28,7 +28,7 @@ inputs:
     required: false
     default: ""
   dedup_mode:
-    description: "Memfile dedup mode"
+    description: "Memfile dedup mode; 'default' keeps the flag defaults (dedup disabled)"
     required: false
     default: "default"
   disable_memfd:
@@ -68,6 +68,9 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Use the Docker Hub mirror
+      uses: ./.github/actions/docker-hub-mirror
+
     # Kick off the database containers first: their image pulls and boots
     # run in the background and overlap with the package builds below.
     - name: Start Databases

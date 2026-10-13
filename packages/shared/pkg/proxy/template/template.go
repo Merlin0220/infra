@@ -2,15 +2,31 @@ package template
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/cors"
 )
 
 var browserRegex = regexp.MustCompile(`(?i)mozilla|chrome|safari|firefox|edge|opera|msie`)
+
+//go:embed browser_layout.html
+var browserLayoutHtml string
+
+// newBrowserPage parses a page into the shared browser layout. The page defines
+// the "title", "tone" and "body" blocks, and may define "actions".
+func newBrowserPage(name, page string) *template.Template {
+	layout := template.Must(template.New(name).
+		Funcs(template.FuncMap{"statusText": http.StatusText}).
+		Parse(browserLayoutHtml))
+
+	return template.Must(layout.Parse(page))
+}
 
 type jsonErrorMessage interface {
 	StatusCode() int
@@ -43,6 +59,11 @@ func (e *TemplatedError[T]) HandleError(
 	if e.vars.StatusCode() <= 0 {
 		return fmt.Errorf("invalid status code: %d", e.vars.StatusCode())
 	}
+
+	// These responses are synthesized by the proxy, so nobody upstream can mark
+	// them readable for browser JS; without this header a browser reports an
+	// opaque network error instead of the status and body.
+	cors.SetHeaders(w)
 
 	if wantsHtml(r) {
 		body, buildErr := e.buildHtml()

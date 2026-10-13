@@ -79,7 +79,7 @@ func TestUpgrade_RejectsUnexpectedBinary(t *testing.T) {
 
 	s := newHandoverTestService(t, &spyCgroupManager{})
 
-	err := s.Upgrade("/tmp/attacker-controlled", "0.6.11", nil, nil, nil)
+	err := s.Upgrade("/tmp/attacker-controlled", "0.6.11", nil, nil, nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refusing upgrade")
 }
@@ -183,6 +183,7 @@ func TestHandoverState_ProtoRoundTrip(t *testing.T) {
 		Forwards: []*upgrade.ForwardedPort{{
 			Key: "100-8080", Port: 8080, ListenerPid: 100, Family: 4, SocatPid: 555,
 		}},
+		HelperPids: []int32{777},
 	}
 
 	blob, err := proto.Marshal(orig)
@@ -207,6 +208,7 @@ func TestHandoverState_ProtoRoundTrip(t *testing.T) {
 	require.Len(t, got.GetForwards(), 1)
 	assert.Equal(t, "100-8080", got.GetForwards()[0].GetKey())
 	assert.Equal(t, int32(555), got.GetForwards()[0].GetSocatPid())
+	assert.Equal(t, []int32{777}, got.GetHelperPids())
 }
 
 // TestResumeFromHandover_RejectsNewerSchema is the §6.4 version gate: a blob
@@ -278,4 +280,31 @@ func TestFreezeWorkloadHold_ProceedsWhenFrozen(t *testing.T) {
 	t.Cleanup(release)
 
 	require.NoError(t, err)
+}
+
+// TestSchemaFor_StampsTheLowestVersionThatCarriesTheBlob: the schema a writer stamps is what
+// decides whether a PREVIOUS envd can read the blob, and the read happens post-execve, where a
+// refusal is not a graceful decline -- there is no old binary left, so the workload is never
+// re-adopted and the sandbox is torn down. Stamping the maximum unconditionally therefore traded
+// away every rollback, including the overwhelming majority of blobs that carry no
+// guest_frozen_cgroups at all and are byte-for-byte readable by the older reader.
+func TestSchemaFor_StampsTheLowestVersionThatCarriesTheBlob(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no guest-frozen cgroups reads as the base schema", func(t *testing.T) {
+		t.Parallel()
+
+		st := &upgrade.HandoverState{FromVer: "0.6.13", Mounts: []*upgrade.MountEntry{{Path: "/mnt/v"}}}
+		assert.Equal(t, uint32(handoverSchemaBase), schemaFor(st),
+			"nothing in this blob is newer than the base layout, so nothing should refuse it")
+	})
+
+	// The other direction has to hold just as firmly: a reader that predates the field would
+	// drop the record and then thaw cgroups the guest froze itself, so the stamp must refuse it.
+	t.Run("a carried record forces the newer schema", func(t *testing.T) {
+		t.Parallel()
+
+		st := &upgrade.HandoverState{FromVer: "0.6.13", GuestFrozenCgroups: []string{"customer/c1"}}
+		assert.Equal(t, uint32(handoverSchemaGuestFrozen), schemaFor(st))
+	})
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,6 +44,10 @@ const (
 
 	// disconnectTimeout should not be necessary if the disconnect is reliable
 	disconnectTimeout = 30 * time.Second
+
+	// deviceCloseWarnThreshold flags a stalled descriptor release: through a
+	// live data path the flush and close finish well under a second.
+	deviceCloseWarnThreshold = 5 * time.Second
 )
 
 var tracer = otel.Tracer("github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd")
@@ -62,6 +67,16 @@ var (
 		metric.WithUnit("{device}"),
 	))
 
+	nbdSlowCloseCounter = utils.Must(meter.Int64Counter("orchestrator.nbd.device.close.slow",
+		metric.WithDescription("NBD device descriptor releases slower than the watchdog threshold, tagged with the teardown step in progress when the watchdog fired. Close flushes writeback through the descriptor before releasing it, so a slow release is a teardown blocked behind commands the backend is not answering."),
+		metric.WithUnit("{close}"),
+	))
+
+	nbdCloseDuration = utils.Must(meter.Int64Histogram("orchestrator.nbd.device.close.duration",
+		metric.WithDescription("Time to flush writeback and close the NBD device descriptor during mount teardown. The stall watchdog warns past its threshold; this carries the full distribution."),
+		metric.WithUnit("ms"),
+	))
+
 	nbdFlushSuccess           = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "success")))
 	nbdFlushOpenFailure       = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "failure"), attribute.String("stage", "open")))
 	nbdFlushSyncFailure       = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "failure"), attribute.String("stage", "sync")))
@@ -72,6 +87,8 @@ type DirectPathMount struct {
 	cancelfn     context.CancelFunc
 	devicePool   *DevicePool
 	featureFlags *featureflags.Client
+
+	logger logger.Logger
 
 	Backend         block.Device
 	deviceIndex     uint32
@@ -91,6 +108,12 @@ type DirectPathMount struct {
 	// wait-for-connected poll. Only tests set it, to cancel the context inside
 	// the window where the kernel holds the device but Open has not returned it.
 	afterConnect func(deviceIndex uint32)
+
+	// Tests replace device operations without connecting a kernel NBD device.
+	// Production leaves these nil and uses the same disconnect and pool calls.
+	disconnectDeviceFn func(ctx context.Context, deviceIndex uint32) error
+	releaseDeviceFn    func(ctx context.Context, deviceIndex uint32) error
+	socketPairFn       func() ([2]int, error)
 
 	dispatchers []*Dispatch
 	socksClient []*os.File
@@ -112,12 +135,13 @@ func WithDeadconnTimeout(d time.Duration) MountOption {
 	return func(m *DirectPathMount) { m.deadconnTimeout = d }
 }
 
-func NewDirectPathMount(b block.Device, devicePool *DevicePool, featureFlags *featureflags.Client, opts ...MountOption) *DirectPathMount {
+func NewDirectPathMount(b block.Device, devicePool *DevicePool, featureFlags *featureflags.Client, lg logger.Logger, opts ...MountOption) *DirectPathMount {
 	m := &DirectPathMount{
 		Backend:         b,
 		blockSize:       4096,
 		devicePool:      devicePool,
 		featureFlags:    featureFlags,
+		logger:          lg,
 		socksClient:     make([]*os.File, 0),
 		socksServer:     make([]io.Closer, 0),
 		deviceIndex:     math.MaxUint32,
@@ -137,7 +161,12 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 	// otherwise invisible; both add up when this is opened once per measure/resize.
 	ctx, span := tracer.Start(ctx, "direct-path-mount-open")
 
-	ctx, d.cancelfn = context.WithCancel(ctx)
+	// The dispatchers take a context only Close cancels: they serve the
+	// writeback flush Close runs before that cancel, and a dispatcher bound
+	// to the caller's context returns at its next request - that flush's
+	// write - leaving the flush to the kernel's connection timeouts and EIO.
+	handlerCtx, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
+	d.cancelfn = cancelHandlers
 
 	defer func() {
 		// Set the device index to the one returned, correctly capture error values
@@ -148,7 +177,7 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 			span.SetStatus(codes.Error, err.Error())
 		}
 		span.End()
-		logger.L().Debug(ctx, "opening direct path mount", zap.Uint32("device_index", d.deviceIndex), zap.Error(err))
+		d.logger.Debug(ctx, "opening direct path mount", zap.Uint32("device_index", d.deviceIndex), zap.Error(err))
 	}()
 
 	telemetry.ReportEvent(ctx, "opening direct path mount")
@@ -179,7 +208,7 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 
 		for i := range connections {
 			// Create the socket pairs
-			sockPair, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+			sockPair, err := d.socketPair()
 			if err != nil {
 				closeErr := closeSocketPairs(d.socksClient, d.socksServer)
 				releaseErr := d.devicePool.ReleaseDevice(ctx, deviceIndex)
@@ -201,20 +230,20 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 			}
 			server.Close()
 
-			dispatch := NewDispatch(serverc, d.Backend, asyncWriteZeroes)
-			// Capture deviceIndex for the goroutine closure — it's reassigned on
-			// each retry iteration of the outer for-loop (not a range loop, so
-			// Go 1.22+ loop variable fix doesn't apply).
-			devIdx := deviceIndex
+			// Capture deviceIndex here — it's reassigned on each retry
+			// iteration of the outer for-loop (not a range loop, so Go 1.22+
+			// loop variable fix doesn't apply).
+			connLogger := d.logger.With(
+				zap.Uint32("device_index", deviceIndex),
+				zap.Int("socket_index", i),
+			)
+
+			dispatch := NewDispatch(serverc, d.Backend, asyncWriteZeroes, connLogger)
 			// Start reading commands on the socket and dispatching them to our provider
 			d.handlersWg.Go(func() {
-				handleErr := dispatch.Handle(ctx)
+				handleErr := dispatch.Handle(handlerCtx)
 				// The error is expected to happen if the nbd (socket connection) is closed
-				logger.L().Info(ctx, "closing handler for NBD commands",
-					zap.Error(handleErr),
-					zap.Uint32("device_index", devIdx),
-					zap.Int("socket_index", i),
-				)
+				connLogger.Info(handlerCtx, "closing handler for NBD commands", zap.Error(handleErr))
 			})
 
 			d.socksServer = append(d.socksServer, serverc)
@@ -244,19 +273,19 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 			break
 		}
 
-		logger.L().Error(ctx, "error opening NBD, retrying", zap.Error(connectErr), zap.Uint32("device_index", deviceIndex))
+		d.logger.Error(ctx, "error opening NBD, retrying", zap.Error(connectErr), zap.Uint32("device_index", deviceIndex))
 
 		// Sometimes (rare), there seems to be a BADF error here. Lets just retry for now...
 		// Close things down and try again...
 		err := closeSocketPairs(d.socksClient, d.socksServer)
 		if err != nil {
-			logger.L().Error(ctx, "error closing socket pairs on error opening NBD", zap.Error(err))
+			d.logger.Error(ctx, "error closing socket pairs on error opening NBD", zap.Error(err))
 		}
 
 		// Release the device back to the pool
 		err = d.devicePool.ReleaseDevice(ctx, deviceIndex)
 		if err != nil {
-			logger.L().Error(ctx, "error opening NBD, error releasing device", zap.Error(err), zap.Uint32("device_index", deviceIndex))
+			d.logger.Error(ctx, "error opening NBD, error releasing device", zap.Error(err), zap.Uint32("device_index", deviceIndex))
 		}
 
 		if strings.Contains(connectErr.Error(), "invalid argument") {
@@ -318,15 +347,17 @@ func (d *DirectPathMount) Open(ctx context.Context) (retDeviceIndex uint32, err 
 // cancels the handlers and drains the dispatchers before disconnecting, and
 // releases the slot with infinite retry. Close reads the index off the mount,
 // and Open's deferred assignment has not run yet, so set it first. The context
-// Close is given has to be detached, because Close cancels Open's as its first
-// step.
+// Close is given has to be detached: the wait_connected caller reaches here
+// only after Open's context ended, and on that context Close's disconnect
+// wait and slot release return at once, with the device still connected and
+// the slot still taken.
 func (d *DirectPathMount) closeConnected(ctx context.Context, deviceIndex uint32, stage string) error {
 	nbdUnwoundCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("stage", stage)))
 
 	// Warn, not Debug: this is rare, it means a device and a pool slot came within
 	// one branch of being stranded, and the build failure the caller reports does
 	// not name either of them.
-	logger.L().Warn(ctx, "tearing down a connected NBD device Open cannot return",
+	d.logger.Warn(ctx, "tearing down a connected NBD device Open cannot return",
 		zap.Uint32("device_index", deviceIndex),
 		zap.String("stage", stage),
 	)
@@ -375,10 +406,7 @@ func (d *DirectPathMount) Flush(ctx context.Context) error {
 		span.SetStatus(codes.Error, "NBD device writeback failed, backend is missing acknowledged writes")
 	}
 
-	// Invalidate even when the sync failed: the device index goes back to the
-	// pool either way, and leaving pages of a dead sandbox in the cache would
-	// outlive the error we are about to return.
-	invalidateErr := unix.IoctlSetInt(int(file.Fd()), unix.BLKFLSBUF, 0)
+	invalidateErr := invalidateDevice(file)
 
 	// One flush, one count, so the rate reads as a share of flushes. A lost
 	// writeback outranks a stale cache when both fail.
@@ -403,6 +431,14 @@ func (d *DirectPathMount) Flush(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// invalidateDevice drops the kernel's block-device cache for the device
+// behind file. Callers run it even when the preceding sync failed: the device
+// index goes back to the pool either way, and leaving pages of a dead sandbox
+// in the cache would outlive the error they are about to return.
+func invalidateDevice(file *os.File) error {
+	return unix.IoctlSetInt(int(file.Fd()), unix.BLKFLSBUF, 0)
+}
+
 func (d *DirectPathMount) Close(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "direct-path-mount-close")
 	defer span.End()
@@ -411,7 +447,77 @@ func (d *DirectPathMount) Close(ctx context.Context) error {
 
 	idx := d.deviceIndex
 
-	// First cancel the context, which will stop waiting on pending readAt/writeAt...
+	// Flush and release the descriptor while the dispatchers still
+	// serve the device: the kernel's last-close page-cache teardown waits on
+	// pages locked by any in-flight request - speculative readahead reads
+	// included, not only dirty writeback - and once the data path below is
+	// torn down those requests hang until the kernel gives the connection up
+	// (deadconnTimeout; ioTimeout + deadconnTimeout for commands already in
+	// flight). Closing here lets them complete through the live path instead.
+	// The explicit sync covers the second leg: acknowledged writes land
+	// before the descriptor goes away, without betting on this descriptor
+	// being the device's last opener - it is not whenever a udev probe holds
+	// the device open across Close.
+	//
+	// The intended contract: against a live but unanswering backend this
+	// flush holds the device, its pool slot, and the handlers for up to the
+	// kernel ceiling (ioTimeout + deadconnTimeout), ahead of the cancel below
+	// -- deliberately. Tearing down first was faster only by abandoning
+	// writes the kernel had already acknowledged to the guest.
+	//
+	// Each event marks a step that can block on the backend, so a stall in a
+	// trace is attributable to one step instead of one interval covering
+	// several. The watchdog fires while the stall is happening -- tagging the
+	// step in progress -- then accounts the total on return, so a stuck
+	// teardown is visible during the incident and not only after it.
+	if d.deviceFile != nil {
+		closeStart := time.Now()
+
+		var stage atomic.Value
+		stage.Store("sync")
+		watchdog := time.AfterFunc(deviceCloseWarnThreshold, func() {
+			nbdSlowCloseCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("stage", stage.Load().(string))))
+			d.logger.Warn(ctx, "NBD device descriptor close stalled",
+				zap.Duration("threshold", deviceCloseWarnThreshold),
+				zap.Uint32("device_index", idx),
+			)
+		})
+
+		telemetry.ReportEvent(ctx, "flushing NBD device writeback")
+		if syncErr := d.deviceFile.Sync(); syncErr != nil {
+			// Mark the span the way Flush does: the backend is missing writes
+			// the guest was told had landed. The error also returns below.
+			span.SetAttributes(attribute.Int64("nbd.device_index", int64(idx)))
+			span.RecordError(syncErr)
+			span.SetStatus(codes.Error, "NBD device writeback failed, backend is missing acknowledged writes")
+
+			errs = append(errs, fmt.Errorf("sync NBD device: %w", syncErr))
+		}
+
+		stage.Store("invalidate")
+		if invalidateErr := invalidateDevice(d.deviceFile); invalidateErr != nil {
+			errs = append(errs, fmt.Errorf("flush NBD device buffers: %w", invalidateErr))
+		}
+
+		stage.Store("descriptor_close")
+		telemetry.ReportEvent(ctx, "closing NBD device descriptor")
+		if err := d.deviceFile.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("error closing NBD device: %w", err))
+		}
+
+		if !watchdog.Stop() {
+			d.logger.Warn(ctx, "NBD device descriptor close finished after stalling",
+				zap.Duration("duration", time.Since(closeStart)),
+				zap.Uint32("device_index", idx),
+			)
+		}
+
+		nbdCloseDuration.Record(ctx, time.Since(closeStart).Milliseconds())
+
+		d.deviceFile = nil
+	}
+
+	// Cancel the context, which will stop waiting on pending readAt/writeAt...
 	telemetry.ReportEvent(ctx, "canceling context")
 	if d.cancelfn != nil {
 		d.cancelfn()
@@ -440,19 +546,9 @@ func (d *DirectPathMount) Close(ctx context.Context) error {
 		d.Drain()
 	}
 
-	// Release the descriptor Flush syncs before disconnecting, so nothing holds
-	// the block device open while the device goes back to the pool.
-	if d.deviceFile != nil {
-		if err := d.deviceFile.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("error closing NBD device: %w", err))
-		}
-
-		d.deviceFile = nil
-	}
-
 	// Disconnect NBD
 	if idx != math.MaxUint32 {
-		err := disconnectNBDWithTimeout(ctx, idx, disconnectTimeout)
+		err := d.disconnectDevice(ctx, idx)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("error disconnecting NBD: %w", err))
 		}
@@ -472,13 +568,37 @@ func (d *DirectPathMount) Close(ctx context.Context) error {
 	// Release the device back to the pool, retry if it is in use
 	if idx != math.MaxUint32 {
 		telemetry.ReportEvent(ctx, "releasing device to the pool")
-		err := d.devicePool.ReleaseDevice(ctx, idx, WithInfiniteRetry())
+		err := d.releaseDevice(ctx, idx)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("error releasing overlay device: %w", err))
 		}
 	}
 
 	return errors.Join(errs...)
+}
+
+func (d *DirectPathMount) socketPair() ([2]int, error) {
+	if d.socketPairFn != nil {
+		return d.socketPairFn()
+	}
+
+	return syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+}
+
+func (d *DirectPathMount) disconnectDevice(ctx context.Context, deviceIndex uint32) error {
+	if d.disconnectDeviceFn != nil {
+		return d.disconnectDeviceFn(ctx, deviceIndex)
+	}
+
+	return disconnectNBDWithTimeout(ctx, deviceIndex, disconnectTimeout)
+}
+
+func (d *DirectPathMount) releaseDevice(ctx context.Context, deviceIndex uint32) error {
+	if d.releaseDeviceFn != nil {
+		return d.releaseDeviceFn(ctx, deviceIndex)
+	}
+
+	return d.devicePool.ReleaseDevice(ctx, deviceIndex, WithInfiniteRetry(), WithLogger(d.logger))
 }
 
 func disconnectNBDWithTimeout(ctx context.Context, deviceIndex uint32, timeout time.Duration) error {

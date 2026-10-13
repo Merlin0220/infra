@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/e2b-dev/infra/packages/api/internal/api"
 	orchestratorinfo "github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator-info"
@@ -19,10 +21,11 @@ import (
 // orchestrator counterpart is. TestStatusMappersAreInverses pins this map
 // against OrchestratorToApiNodeStateMapper so the two cannot drift apart.
 var ApiNodeToOrchestratorStateMapper = map[api.NodeStatus]orchestratorinfo.ServiceInfoStatus{
-	api.NodeStatusReady:     orchestratorinfo.ServiceInfoStatus_Healthy,
-	api.NodeStatusDraining:  orchestratorinfo.ServiceInfoStatus_Draining,
-	api.NodeStatusUnhealthy: orchestratorinfo.ServiceInfoStatus_Unhealthy,
-	api.NodeStatusStandby:   orchestratorinfo.ServiceInfoStatus_Standby,
+	api.NodeStatusReady:        orchestratorinfo.ServiceInfoStatus_Healthy,
+	api.NodeStatusDraining:     orchestratorinfo.ServiceInfoStatus_Draining,
+	api.NodeStatusUnhealthy:    orchestratorinfo.ServiceInfoStatus_Unhealthy,
+	api.NodeStatusStandby:      orchestratorinfo.ServiceInfoStatus_Standby,
+	api.NodeStatusShuttingDown: orchestratorinfo.ServiceInfoStatus_ShuttingDown,
 }
 
 type StatusInfo struct {
@@ -65,7 +68,7 @@ func (n *Node) setStatus(ctx context.Context, status api.NodeStatus, changedAt t
 	defer n.mutex.Unlock()
 
 	if n.status.Status != status {
-		logger.L().Info(ctx, "NodeID status changed", logger.WithNodeID(n.ID), zap.String("status", string(status)))
+		logger.L().Info(ctx, "NodeID status changed", logger.WithNodeID(n.ID), zap.String("status", string(status)), zap.String("backend", n.Backend))
 	}
 
 	n.status = StatusInfo{Status: status, ChangedAt: changedAt}
@@ -82,7 +85,7 @@ func (n *Node) markUnhealthyLocal(ctx context.Context) {
 		return
 	}
 
-	logger.L().Info(ctx, "NodeID status changed", logger.WithNodeID(n.ID), zap.String("status", string(api.NodeStatusUnhealthy)))
+	logger.L().Info(ctx, "NodeID status changed", logger.WithNodeID(n.ID), zap.String("status", string(api.NodeStatusUnhealthy)), zap.String("backend", n.Backend))
 	n.status = StatusInfo{Status: api.NodeStatusUnhealthy, ChangedAt: time.Now()}
 }
 
@@ -135,6 +138,10 @@ func (n *Node) UnreachableSince() (time.Time, bool) {
 }
 
 func (n *Node) SendStatusChange(ctx context.Context, s api.NodeStatus) error {
+	if s == api.NodeStatusShuttingDown {
+		return grpcstatus.Error(codes.FailedPrecondition, "shutting_down can only be entered during process shutdown")
+	}
+
 	nodeStatus, ok := ApiNodeToOrchestratorStateMapper[s]
 	if !ok {
 		logger.L().Error(ctx, "Unknown service info status", zap.String("status", string(s)), logger.WithNodeID(n.ID))

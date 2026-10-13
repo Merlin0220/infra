@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc/cputemplate"
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/ioutils"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
@@ -62,6 +64,37 @@ type Context struct {
 	EnvVars map[string]string `json:"env_vars,omitempty"`
 }
 
+// EnvdDefaultUser reports the DefaultUser this template's build sent to envd's /init, and
+// whether the metadata can establish it at all.
+//
+// Only one recorded value can be established, and the reason is that determinacy here is a
+// property of the build's TEMPLATE VERSION while the metadata records a USER:
+//
+//   - finalize sends Context.User for a build at or above TemplateV2ReleaseVersion, and a
+//     flat ("user", nil) for anything below it, discarding whatever was recorded.
+//   - Context.User is written by three things at three different gates: the base phase
+//     stamps "root" unconditionally for every from-image build; the USER phase overwrites
+//     it with "user", gated on that same version; and a user-authored USER step overwrites
+//     it with any name at ANY version, because only the USER phase is gated and the step
+//     builders are appended unconditionally.
+//
+// So a recorded "app" is either a recent build whose /init received "app", or an older one
+// whose /init received "user" — and the build's template version is not carried in the
+// snapshot (Template.Version is the metadata FORMAT version). Same ambiguity for "root".
+// Only consts.TemplateDefaultUser is safe, because both branches send exactly that.
+//
+// No workdir is reported for the same reason and it is not an oversight: finalize sends
+// Context.WorkDir above the version gate and nil below it, so a recorded workdir is
+// unprovable by the same argument. Re-sending one would move the working directory of
+// every command that omits a cwd, on every start, for a template that never had it.
+func (t Template) EnvdDefaultUser() (user string, ok bool) {
+	if t.Context.User != consts.TemplateDefaultUser {
+		return "", false
+	}
+
+	return t.Context.User, true
+}
+
 func (c Context) WithUser(user string) Context {
 	c.User = user
 
@@ -110,8 +143,46 @@ func (p *MemoryPrefetchMapping) Count() int {
 	return len(p.Indices)
 }
 
+// PrefetchOrigin names the producer of a prefetch mapping, so a resume can
+// report where the mapping it replays came from.
+type PrefetchOrigin string
+
+const (
+	// PrefetchOriginBuild is the template builder's optimize phase, or the
+	// resume-build tool: recorded before the build is published.
+	PrefetchOriginBuild PrefetchOrigin = "build"
+	// PrefetchOriginCheckpoint is the resume-fresh checkpoint, which traces
+	// its own resume and embeds the mapping before the upload.
+	PrefetchOriginCheckpoint PrefetchOrigin = "checkpoint"
+	// PrefetchOriginHarvest is the throwaway resume after a pause or an
+	// in-place checkpoint, persisted after the build is published.
+	PrefetchOriginHarvest PrefetchOrigin = "harvest"
+)
+
 type Prefetch struct {
 	Memory *MemoryPrefetchMapping `json:"memory"`
+	// Origin is the producer of Memory. Empty on a mapping written before the
+	// field existed, which every reader treats like any other mapping.
+	Origin PrefetchOrigin `json:"origin,omitempty"`
+}
+
+// InitOrigin reports the origin of the init mapping p carries, "none" when
+// there is no mapping and "unknown" when the mapping predates origins.
+func (p *Prefetch) InitOrigin() string {
+	if p == nil || p.Memory.Count() == 0 {
+		return "none"
+	}
+	if p.Origin == "" {
+		return "unknown"
+	}
+
+	return string(p.Origin)
+}
+
+// Balloon is the balloon device configuration a template was built with.
+type Balloon struct {
+	Reporting bool `json:"reporting"`
+	Hinting   bool `json:"hinting"`
 }
 
 type Template struct {
@@ -141,6 +212,30 @@ type Template struct {
 	// It exists so the cold boot of a filesystem-only snapshot can re-apply the same command
 	// line; a memory resume restores a running kernel and never re-reads it.
 	CmdlineArgs map[string]string `json:"cmdline_args,omitempty"`
+
+	// Balloon records the free-page mechanisms this template's balloon was
+	// built with. It is lineage state like CmdlineArgs: chosen once at build,
+	// carried by the copy-constructors, and it is what lets a resume label its
+	// first faults before the VM starts. Nil is a template built before the
+	// field existed; the mode is then read from the device after start.
+	// Sandbox.Pause re-stamps it from device truth when that is known, so a
+	// cold-booted lineage (no balloon) does not inherit its template's.
+	Balloon *Balloon `json:"balloon,omitempty"`
+
+	// CPUTemplate is the CPU template this template's guest booted with. Nil is none. Stored
+	// parsed, since the flag can change after the build; a filesystem-only cold boot replays
+	// it. Top level like CmdlineArgs, so SameVersionTemplate carries it on every pause.
+	CPUTemplate *cputemplate.Template `json:"cpu_template,omitempty"`
+
+	// BuildCPUTemplate is the CPU template the build booted with. It never changes after the
+	// build, while CPUTemplate follows what the guest runs: a reboot override replaces
+	// CPUTemplate only, so clearing the override boots BuildCPUTemplate again.
+	BuildCPUTemplate *cputemplate.Template `json:"build_cpu_template,omitempty"`
+
+	// VcpuCount is how many vCPUs the VM in this snapshot has, which a resume limits the sandbox
+	// below without trusting the request. 0 is a legacy snapshot whose stored original count must
+	// arrive as max_vcpus (or vcpu when the allocation is unchanged).
+	VcpuCount int64 `json:"vcpu_count,omitempty"`
 
 	// FilesystemOnly marks a snapshot that persists only the filesystem (no
 	// memory snapshot); resuming it must cold-boot (reboot) from the rootfs. The
@@ -210,10 +305,8 @@ func V1TemplateVersion() Template {
 
 // BasedOn derives the metadata of a build that starts FROM another template.
 //
-// Deliberately does NOT carry CmdlineArgs. Unlike a pause, which continues one
-// lineage, this is a new build that resolves the guest kernel cmdline flag for its own
-// team — inheriting the parent's arguments would record arguments the child's kernel
-// never booted with, and a later filesystem-only cold boot would then apply them.
+// Deliberately does NOT carry CmdlineArgs, CPU templates or VcpuCount: a new build resolves its
+// own settings and cold-boots a VM at its own size, which Pause records in its snapshot.
 func (t Template) BasedOn(
 	ft FromTemplate,
 ) Template {
@@ -229,39 +322,68 @@ func (t Template) BasedOn(
 
 func (t Template) NewVersionTemplate(metadata TemplateMetadata) Template {
 	return Template{
-		Version:      CurrentVersion,
-		Template:     metadata,
-		Context:      t.Context,
-		Start:        t.Start,
-		FromTemplate: t.FromTemplate,
-		FromImage:    t.FromImage,
-		CmdlineArgs:  t.CmdlineArgs,
+		Version:          CurrentVersion,
+		Template:         metadata,
+		Context:          t.Context,
+		Start:            t.Start,
+		FromTemplate:     t.FromTemplate,
+		FromImage:        t.FromImage,
+		CmdlineArgs:      t.CmdlineArgs,
+		Balloon:          t.Balloon,
+		CPUTemplate:      t.CPUTemplate,
+		BuildCPUTemplate: t.BuildCPUTemplate,
+		VcpuCount:        t.VcpuCount,
 	}
 }
 
 func (t Template) SameVersionTemplate(metadata TemplateMetadata) Template {
 	return Template{
-		Version:      t.Version,
-		Template:     metadata,
-		Context:      t.Context,
-		Start:        t.Start,
-		FromTemplate: t.FromTemplate,
-		FromImage:    t.FromImage,
-		CmdlineArgs:  t.CmdlineArgs,
+		Version:          t.Version,
+		Template:         metadata,
+		Context:          t.Context,
+		Start:            t.Start,
+		FromTemplate:     t.FromTemplate,
+		FromImage:        t.FromImage,
+		CmdlineArgs:      t.CmdlineArgs,
+		Balloon:          t.Balloon,
+		CPUTemplate:      t.CPUTemplate,
+		BuildCPUTemplate: t.BuildCPUTemplate,
+		VcpuCount:        t.VcpuCount,
 	}
+}
+
+// WithBalloon returns a copy of the template stamped with the balloon
+// mechanisms the device actually runs.
+func (t Template) WithBalloon(reporting, hinting bool) Template {
+	t.Balloon = &Balloon{Reporting: reporting, Hinting: hinting}
+
+	return t
+}
+
+// WithVcpuCount returns a copy of the template stamped with the vCPUs the VM has. A V1 file keeps only
+// its version, so the count is lost there; lifting the version would change the rootfs path a memory
+// snapshot was taken with, so a V1 lineage stays unrecorded and resumes by the request's maximum.
+func (t Template) WithVcpuCount(vcpus int64) Template {
+	t.VcpuCount = vcpus
+
+	return t
 }
 
 // WithPrefetch returns a copy of the template with the given prefetch mapping.
 func (t Template) WithPrefetch(prefetch *Prefetch) Template {
 	return Template{
-		Version:      t.Version,
-		Template:     t.Template,
-		Context:      t.Context,
-		Start:        t.Start,
-		FromTemplate: t.FromTemplate,
-		FromImage:    t.FromImage,
-		Prefetch:     prefetch,
-		CmdlineArgs:  t.CmdlineArgs,
+		Version:          t.Version,
+		Template:         t.Template,
+		Context:          t.Context,
+		Start:            t.Start,
+		FromTemplate:     t.FromTemplate,
+		FromImage:        t.FromImage,
+		Prefetch:         prefetch,
+		CmdlineArgs:      t.CmdlineArgs,
+		Balloon:          t.Balloon,
+		CPUTemplate:      t.CPUTemplate,
+		BuildCPUTemplate: t.BuildCPUTemplate,
+		VcpuCount:        t.VcpuCount,
 	}
 }
 

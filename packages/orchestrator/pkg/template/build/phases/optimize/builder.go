@@ -128,7 +128,8 @@ func (pb *OptimizeBuilder) Build(
 
 	// Get the template from the finalize phase
 	// isSnapshot=false, isBuilding=true since we're in a build phase
-	localTemplate, err := pb.templateCache.GetTemplate(ctx, sourceLayer.Metadata.Template.BuildID, false, true)
+	localTemplate, releaseTemplate, err := pb.templateCache.GetTemplatePinned(ctx, sourceLayer.Metadata.Template.BuildID, false, true)
+	defer releaseTemplate()
 	if err != nil {
 		return phases.LayerResult{}, fmt.Errorf("failed to get template from cache: %w", err)
 	}
@@ -151,6 +152,7 @@ func (pb *OptimizeBuilder) Build(
 	// Update metadata with prefetch mapping
 	updatedMetadata := sourceLayer.Metadata.WithPrefetch(&metadata.Prefetch{
 		Memory: memoryPrefetchMapping,
+		Origin: metadata.PrefetchOriginBuild,
 	})
 
 	// Upload the updated metadata

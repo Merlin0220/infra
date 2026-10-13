@@ -1,10 +1,19 @@
 package cfg
 
-import "github.com/caarlos0/env/v11"
+import (
+	"errors"
+
+	"github.com/caarlos0/env/v11"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
+)
 
 type Config struct {
-	HealthPort uint16 `env:"HEALTH_PORT" envDefault:"3003"`
-	ProxyPort  uint16 `env:"PROXY_PORT"  envDefault:"3002"`
+	featureflags.Config
+
+	HealthPort            uint16 `env:"HEALTH_PORT"             envDefault:"3003"`
+	ProxyPort             uint16 `env:"PROXY_PORT"              envDefault:"3002"`
+	OrchestratorProxyPort uint16 `env:"ORCHESTRATOR_PROXY_PORT" envDefault:"5007"`
 
 	RedisURL         string `env:"REDIS_URL"`
 	RedisClusterURL  string `env:"REDIS_CLUSTER_URL"`
@@ -22,5 +31,13 @@ type Config struct {
 }
 
 func Parse() (Config, error) {
-	return env.ParseAsWithOptions[Config](env.Options{})
+	config, err := env.ParseAsWithOptions[Config](env.Options{})
+	if err != nil {
+		return Config{}, err
+	}
+	if config.OrchestratorProxyPort == 0 {
+		return Config{}, errors.New("ORCHESTRATOR_PROXY_PORT must be greater than zero")
+	}
+
+	return config, nil
 }

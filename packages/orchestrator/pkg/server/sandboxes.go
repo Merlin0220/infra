@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
+	"net/http"
 	"slices"
 	"time"
 
@@ -26,16 +28,21 @@ import (
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/envdbin"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/rootfs"
 	sbxtemplate "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/uffd/userfaultfd"
 	buildenvd "github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/envd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/events"
+	"github.com/e2b-dev/infra/packages/shared/pkg/fcversion"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/retry"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/utils"
@@ -72,8 +79,9 @@ const (
 	executionEventDataKey = "execution"
 
 	killReasonUnknown = "unknown"
-	// killReasonSealFailed: the pause-path kill of a sandbox whose latched
-	// in-place seal failure means it can never be validly persisted.
+	// killReasonSealFailed: the pause-path kill of a sandbox that can never be
+	// validly persisted again — a latched in-place seal failure, or a parent
+	// memfile dedup that failed for good.
 	killReasonSealFailed = "seal_failed"
 	// killReasonResumeFailed: the in-place resume after a checkpoint failed
 	// and the orchestrator tore the stuck-paused VM down (ErrSandboxLost).
@@ -82,7 +90,31 @@ const (
 	// so the resume failing is always the lethal step; the full chain is in
 	// the joined error.
 	killReasonResumeFailed = "resume_failed"
+	// killReasonThawFailed: the resume succeeded but the rootfs stayed frozen
+	// through every thaw attempt (ErrSandboxLost tagged ErrRootfsThawFailed),
+	// so the orchestrator tore down a guest that ran but could not write.
+	killReasonThawFailed = "thaw_failed"
+
+	// pause_mode on paused events: what the snapshot holds. The values are the
+	// SDK's snapshot mode, so a customer reads back the mode they passed.
+	pauseModeFull       = "full"
+	pauseModeFilesystem = "filesystem"
+	// resume_mode on resumed events: how the sandbox started, in the values of
+	// the SDK's onResume option.
+	resumeModeRestore = "restore"
+	resumeModeReboot  = "reboot"
 )
+
+// lostSandboxKillReason names the kill behind an ErrSandboxLost from the
+// in-place checkpoint: thaw_failed when the VM resumed but its rootfs stayed
+// frozen, resume_failed for every other lethal step.
+func lostSandboxKillReason(err error) string {
+	if errors.Is(err, sandbox.ErrRootfsThawFailed) {
+		return killReasonThawFailed
+	}
+
+	return killReasonResumeFailed
+}
 
 // filesystemBoot reports whether a snapshot resumes by cold-booting (rebooting)
 // from its rootfs instead of restoring memory: when the artifact has no memory
@@ -93,8 +125,51 @@ func filesystemBoot(meta metadata.Template, req *orchestrator.SandboxCreateReque
 	return meta.IsFilesystemOnly() || req.GetFilesystemBoot()
 }
 
+func validateColdBootVcpus(vcpu, maxVcpus, recordedVcpus int64) error {
+	// An explicit maximum replaces the snapshot's size; otherwise inherit it.
+	if maxVcpus == 0 {
+		maxVcpus = recordedVcpus
+	}
+	machineVcpus := max(vcpu, maxVcpus)
+	if !fc.ValidMachineVcpus(machineVcpus) {
+		return status.Errorf(codes.InvalidArgument, "cannot cold-boot a VM with %d vcpus on this host", machineVcpus)
+	}
+
+	return nil
+}
+
+// firecrackerSupports reports whether the sandbox's RUNNING Firecracker
+// carries a version-gated feature, per the given fcversion predicate. The
+// version is fixed at resume, so the answer cannot change under a running
+// sandbox. An unparsable version fails closed — version-gated features must
+// never engage on a build outside the release contract.
+func firecrackerSupports(ctx context.Context, sbx *sandbox.Sandbox, feature string, has func(*fcversion.Info) bool) bool {
+	version := sbx.Config.FirecrackerConfig.FirecrackerVersion
+	info, err := fcversion.New(version)
+	if err != nil {
+		sbxlogger.I(sbx).Warn(ctx, "unparsable firecracker version; refusing version-gated feature",
+			zap.String("firecracker_version", version), zap.String("feature", feature), zap.Error(err))
+
+		return false
+	}
+	if !has(&info) {
+		sbxlogger.I(sbx).Info(ctx, "firecracker release predates version-gated feature",
+			zap.String("firecracker_version", version), zap.String("feature", feature))
+
+		return false
+	}
+
+	return true
+}
+
 func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequest) (_ *orchestrator.SandboxCreateResponse, createErr error) {
-	// set max request timeout for this request
+	releaseWork := s.info.TrackWork()
+	defer releaseWork()
+
+	// set max request timeout for this request. The pre-boot journal replay runs
+	// within this budget (a successful replay is fast; the cancel-immune worst case
+	// is bounded well under it), so the orchestrator still times out before the
+	// caller does and a recovery overrun surfaces as a retryable per-node error.
 	ctx, cancel := context.WithTimeoutCause(ctx, requestTimeout, errors.New("request timed out"))
 	defer cancel()
 
@@ -103,6 +178,19 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	defer childSpan.End()
 
 	isResume := req.GetSandbox().GetSnapshot()
+	vcpu, maxVcpus := req.GetSandbox().GetVcpu(), req.GetSandbox().GetMaxVcpus()
+	if vcpu < 1 {
+		return nil, status.Errorf(codes.InvalidArgument, "vcpu %d must be at least 1", vcpu)
+	}
+	if vcpu > fc.MaxVcpus {
+		return nil, status.Errorf(codes.InvalidArgument, "vcpu %d is above the %d a VM can have", vcpu, fc.MaxVcpus)
+	}
+	if maxVcpus != 0 && maxVcpus < vcpu {
+		return nil, status.Errorf(codes.InvalidArgument, "vcpu %d must be 1..max_vcpus %d", vcpu, maxVcpus)
+	}
+	if maxVcpus > fc.MaxVcpus {
+		return nil, status.Errorf(codes.InvalidArgument, "max_vcpus %d is above the %d a VM can have", maxVcpus, fc.MaxVcpus)
+	}
 	// fsOnly reports the ARTIFACT kind (filesystem-only snapshot), mirroring the
 	// fs_only pause label, so the historical fs-only latency cohort stays pure.
 	// Combined with fs_boot_requested the population decomposes fully: the boot
@@ -112,6 +200,10 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	// filesystemBooted is the dispatch outcome (the reboot path ran); echoed in
 	// the response so a demanding caller can verify the demand was honored.
 	var filesystemBooted bool
+	// Paired with success on the metric below so a replayed-then-hung start
+	// (fs_recovery=replayed, success=false) is countable; neither signal shows it
+	// alone. Stays "none" when no recovery ran (memory resume, flag off).
+	fsRecovery := rootfs.RecoverOutcomeNone
 	createStart := time.Now()
 	// Set by maybeUpgradeEnvd below; labels the resume-latency histogram so the
 	// treated (upgraded) vs untreated cohorts can be compared during the rollout.
@@ -124,6 +216,8 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 				attribute.Bool("fs_boot_requested", req.GetFilesystemBoot()),
 				attribute.Bool("success", createErr == nil),
 				attribute.Bool("envd.upgraded", envdUpgraded),
+				attribute.String("fs_recovery", string(fsRecovery)),
+				telemetry.WithTeamID(req.GetSandbox().GetTeamId()),
 			),
 		)
 	}()
@@ -169,9 +263,18 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		}
 	}
 
-	maxRunningSandboxesPerNode := s.featureFlags.IntFlag(ctx, featureflags.MaxSandboxesPerNode)
+	reservation, err := s.sandboxFactory.Sandboxes.Reserve(req.GetSandbox().GetSandboxId())
+	if err != nil {
+		return nil, s.sandboxAlreadyRunning(ctx, req.GetSandbox().GetSandboxId(), req.GetSandbox().GetExecutionId(), err)
+	}
+	var rollback *sandbox.Cleanup
+	defer func() {
+		s.finishSandboxStart(ctx, reservation, rollback, createErr)
+	}()
 
-	runningSandboxes := s.sandboxFactory.Sandboxes.Count()
+	maxRunningSandboxesPerNode := s.info.MaxSandboxes.Load()
+
+	runningSandboxes := int64(s.sandboxFactory.Sandboxes.Count())
 	if runningSandboxes >= maxRunningSandboxesPerNode {
 		telemetry.ReportEvent(ctx, "max number of running sandboxes reached")
 
@@ -194,7 +297,14 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	}
 	defer s.startingSandboxes.Release(1)
 
-	template, err := s.templateCache.GetTemplate(
+	// Pinned: eviction Closes a template, which deletes its snapfile/metafile
+	// from disk, so a template backing a running sandbox must not be evictable.
+	// The pin is taken atomically with the lookup — taking it afterwards can
+	// race an eviction already in flight. Released either by the rollback below
+	// (if we never reach the lifecycle goroutine) or by that goroutine once the
+	// sandbox has closed; releaseTemplate is idempotent, so registering it on
+	// both paths still releases exactly one pin.
+	template, releaseTemplate, err := s.templateCache.GetTemplatePinned(
 		ctx,
 		req.GetSandbox().GetBuildId(),
 		req.GetSandbox().GetSnapshot(),
@@ -204,6 +314,13 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	if err != nil {
 		return nil, fmt.Errorf("failed to get template snapshot data: %w", err)
 	}
+
+	rollback = sandbox.NewCleanup()
+	rollback.AddNoContext(ctx, func() error {
+		releaseTemplate()
+
+		return nil
+	})
 
 	// Clone the network config to avoid modifying the original request
 	network := proto.CloneOf(req.GetSandbox().GetNetwork())
@@ -217,10 +334,11 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	config := sandbox.NewConfig(sandbox.Config{
 		BaseTemplateID: req.GetSandbox().GetBaseTemplateId(),
 
-		Vcpu:            req.GetSandbox().GetVcpu(),
-		RamMB:           req.GetSandbox().GetRamMb(),
-		TotalDiskSizeMB: req.GetSandbox().GetTotalDiskSizeMb(),
-		HugePages:       req.GetSandbox().GetHugePages(),
+		Vcpu:              req.GetSandbox().GetVcpu(),
+		ConfiguredVmVcpus: req.GetSandbox().GetMaxVcpus(),
+		RamMB:             req.GetSandbox().GetRamMb(),
+		TotalDiskSizeMB:   req.GetSandbox().GetTotalDiskSizeMb(),
+		HugePages:         req.GetSandbox().GetHugePages(),
 
 		Network: network,
 
@@ -242,13 +360,13 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		telemetry.WithFirecrackerVersion(config.FirecrackerConfig.FirecrackerVersion),
 	)
 
-	runtime := sandbox.RuntimeMetadata{
+	runtime := sandboxtypes.RuntimeMetadata{
 		TemplateID:  req.GetSandbox().GetTemplateId(),
 		SandboxID:   req.GetSandbox().GetSandboxId(),
 		ExecutionID: req.GetSandbox().GetExecutionId(),
 		TeamID:      req.GetSandbox().GetTeamId(),
 		BuildID:     req.GetSandbox().GetBuildId(),
-		SandboxType: sandbox.SandboxTypeSandbox,
+		SandboxType: sandboxtypes.SandboxTypeSandbox,
 	}
 
 	meta, err := template.Metadata()
@@ -258,6 +376,11 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 
 	fsOnly = meta.IsFilesystemOnly()
 	filesystemBooted = filesystemBoot(meta, req)
+	if filesystemBooted {
+		if err := validateColdBootVcpus(vcpu, maxVcpus, meta.VcpuCount); err != nil {
+			return nil, err
+		}
+	}
 
 	var sbx *sandbox.Sandbox
 	if filesystemBooted {
@@ -273,6 +396,7 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 			// auth window. Promoted below via markSandboxLive.
 			true,
 			req.GetFilesystemBoot(),
+			func(o rootfs.RecoverOutcome) { fsRecovery = o },
 		)
 	} else {
 		sbx, err = s.sandboxFactory.ResumeSandbox(
@@ -295,6 +419,16 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 
 			return nil, status.Errorf(codes.FailedPrecondition, "sandbox files for '%s' not found", req.GetSandbox().GetSandboxId())
 		}
+		if errors.Is(err, sandbox.ErrVcpuExceedsSnapshot) {
+			logger.L().Warn(ctx, "resume refused: vcpu exceeds snapshot", zap.Error(err),
+				zap.Int64("vcpu", vcpu),
+				zap.Int64("max_vcpus", maxVcpus),
+				logger.WithSandboxID(runtime.SandboxID),
+				logger.WithBuildID(runtime.BuildID),
+				logger.WithTemplateID(runtime.TemplateID))
+
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 
 		err = errors.Join(err, context.Cause(ctx))
 		telemetry.ReportCriticalError(ctx, "failed to create sandbox", err)
@@ -311,7 +445,8 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		return nil, status.Errorf(codes.Internal, "failed to create sandbox: %s", err)
 	}
 
-	s.setupSandboxLifecycle(ctx, sbx)
+	rollback.Add(ctx, func(ctx context.Context) error { return stopAndCloseSandbox(ctx, sbx) })
+	s.setupSandboxLifecycle(ctx, sbx, releaseTemplate)
 
 	// Resume-time envd live-upgrade. The API /resume maps to Create
 	// with snapshot=true, so this is the real resume path. Flag-driven,
@@ -321,14 +456,7 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		var upErr error
 		envdUpgraded, upErr = s.maybeUpgradeEnvd(ctx, sbx)
 		if upErr != nil {
-			// Only an unrecoverable post-execve failure (new envd left
-			// uninitialized) returns an error; fail the resume rather than hand
-			// back a bricked sandbox. MarkRunning is deferred until markSandboxLive
-			// below, so the sandbox is not yet in the live registry — MarkStopping
-			// is a no-op here and stopSandboxAsync does the physical teardown.
 			sbx.SetStopReason(sandbox.StopReasonKilled)
-			s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
-			s.stopSandboxAsync(context.WithoutCancel(ctx), sbx)
 
 			return nil, upErr
 		}
@@ -338,7 +466,11 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	// has run its post-/init and restored the access token — so the sandbox is
 	// never routable during the upgrade's sub-second pre-init auth window. Both
 	// the resume and reboot paths above defer this.
-	s.markSandboxLive(ctx, sbx)
+	if err := s.markSandboxLive(ctx, sbx, reservation); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to register sandbox: %s", err)
+	}
+	// Read off the start path; unknown here means the read has not landed yet.
+	childSpan.SetAttributes(attribute.String("balloon_mode", sbx.BalloonMode()))
 
 	// Read scheduling metadata after the sandbox resumed so the template's
 	// memfile/rootfs devices (and their headers) are resolved.
@@ -349,14 +481,16 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		schedulingMetadata = provider.SchedulingMetadata(ctx)
 	}
 
+	teamID, buildId, eventsTTLDays, eventData := s.prepareSandboxEventData(ctx, sbx)
+
 	eventType := events.SandboxCreatedEventPair
 	if req.GetSandbox().GetSnapshot() {
 		eventType = events.SandboxResumedEventPair
+		addResumeMode(eventData, filesystemBooted)
 	}
 
-	teamID, buildId, eventsTTLDays, eventData := s.prepareSandboxEventData(ctx, sbx)
-	go s.sbxEventsService.Publish(
-		context.WithoutCancel(ctx),
+	s.publishEventAsync(
+		ctx,
 		teamID,
 		events.SandboxEvent{
 			Version:   events.StructureVersionV2,
@@ -374,10 +508,17 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		},
 	)
 
+	sbx.SetExecutionStartedAt(time.Now())
+
 	return &orchestrator.SandboxCreateResponse{
 		ClientId:              s.info.ClientId,
 		SchedulingMetadata:    schedulingMetadata,
 		FilesystemBootApplied: filesystemBooted,
+		// The resolved Firecracker version the sandbox actually runs, frozen
+		// for its lifetime. The API stores it so a version-gated feature can
+		// key off the running binary exactly instead of re-resolving the
+		// flag, which drifts from this frozen value whenever the flag moves.
+		ResolvedFirecrackerVersion: resolvedFCVersion,
 	}, nil
 }
 
@@ -406,6 +547,9 @@ func createVolumeMountModelsFromAPI(volumeMounts []*orchestrator.SandboxVolumeMo
 }
 
 func (s *Server) Update(ctx context.Context, req *orchestrator.SandboxUpdateRequest) (*emptypb.Empty, error) {
+	releaseWork := s.info.TrackWork()
+	defer releaseWork()
+
 	ctx, childSpan := tracer.Start(ctx, "sandbox-update")
 	defer childSpan.End()
 
@@ -427,6 +571,7 @@ func (s *Server) Update(ctx context.Context, req *orchestrator.SandboxUpdateRequ
 		telemetry.WithFirecrackerVersion(sbx.Config.FirecrackerConfig.FirecrackerVersion),
 		telemetry.WithKernelVersion(sbx.Config.FirecrackerConfig.KernelVersion),
 		telemetry.WithEnvdVersion(sbx.Config.Envd.Version),
+		attribute.String("balloon_mode", sbx.BalloonMode()),
 	)
 
 	// Mirror the Create-side BYOP gates; defense-in-depth for direct gRPC
@@ -502,8 +647,8 @@ func (s *Server) Update(ctx context.Context, req *orchestrator.SandboxUpdateRequ
 				}
 			}
 
-			go s.sbxEventsService.Publish(
-				context.WithoutCancel(ctx),
+			s.publishEventAsync(
+				ctx,
 				teamID,
 				events.SandboxEvent{
 					Version:   events.StructureVersionV2,
@@ -525,10 +670,18 @@ func (s *Server) Update(ctx context.Context, req *orchestrator.SandboxUpdateRequ
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, mapSandboxUpdateError(err)
 	}
 
 	return &emptypb.Empty{}, nil
+}
+
+func mapSandboxUpdateError(err error) error {
+	if errors.Is(err, sandbox.ErrSandboxUpdateClosed) {
+		return status.Error(codes.NotFound, "sandbox is closing or closed")
+	}
+
+	return err
 }
 
 // transitionEgress moves the in-memory egress config (read per-connection by
@@ -598,7 +751,7 @@ func (s *Server) List(ctx context.Context, _ *emptypb.Empty) (*orchestrator.Sand
 
 		startedAt := sbx.GetStartedAt()
 		sandboxes = append(sandboxes, &orchestrator.RunningSandbox{
-			Config:      sbx.APIStoredConfig, //nolint:staticcheck // kept until every API instance reads the scalar fields below
+			Config:      sbx.APIStoredConfig,
 			ClientId:    s.info.ClientId,
 			StartTime:   timestamppb.New(startedAt),
 			EndTime:     timestamppb.New(sbx.GetEndAt()),
@@ -616,6 +769,9 @@ func (s *Server) List(ctx context.Context, _ *emptypb.Empty) (*orchestrator.Sand
 }
 
 func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteRequest) (*emptypb.Empty, error) {
+	releaseWork := s.info.TrackWork()
+	defer releaseWork()
+
 	ctx, cancel := context.WithTimeoutCause(ctxConn, requestTimeout, errors.New("request timed out"))
 	defer cancel()
 
@@ -640,6 +796,7 @@ func (s *Server) Delete(ctxConn context.Context, in *orchestrator.SandboxDeleteR
 		telemetry.WithFirecrackerVersion(sbx.Config.FirecrackerConfig.FirecrackerVersion),
 		telemetry.WithKernelVersion(sbx.Config.FirecrackerConfig.KernelVersion),
 		telemetry.WithEnvdVersion(sbx.Config.Envd.Version),
+		attribute.String("balloon_mode", sbx.BalloonMode()),
 	)
 
 	// Mark the sandbox as stopping so it is excluded from live queries (Get, Items,
@@ -692,9 +849,9 @@ func (s *Server) emitSandboxKilled(ctx context.Context, sbx *sandbox.Sandbox, ki
 	teamID, buildId, eventsTTLDays, eventData := s.prepareSandboxEventData(ctx, sbx)
 	eventData[executionEventDataKey] = s.getSandboxExecutionData(sbx)
 	addKillReason(eventData, killReason)
-	recordSandboxKill(ctx, s.sandboxKilledCounter, killReason)
-	go s.sbxEventsService.Publish(
-		context.WithoutCancel(ctx),
+	recordSandboxKill(ctx, s.sandboxKilledCounter, sbx.Runtime.TeamID, killReason)
+	s.publishEventAsync(
+		ctx,
 		teamID,
 		events.SandboxEvent{
 			Version:   events.StructureVersionV2,
@@ -723,13 +880,41 @@ func addKillReason(eventData map[string]any, killReason string) {
 	eventData["kill_reason"] = killReason
 }
 
+// addPauseMode records on paused events whether the snapshot is full (memory
+// and filesystem) or filesystem-only, whose resume cold-boots. Every paused
+// event carries the key, so its absence means the event predates it.
+func addPauseMode(eventData map[string]any, filesystemOnly bool) {
+	pauseMode := pauseModeFull
+	if filesystemOnly {
+		pauseMode = pauseModeFilesystem
+	}
+
+	eventData["pause_mode"] = pauseMode
+}
+
+// addResumeMode records on resumed events the boot path that actually ran:
+// restore when memory was restored, reboot when the sandbox cold-booted from
+// its filesystem, either because the snapshot has no memory or because the
+// resume asked to drop it.
+func addResumeMode(eventData map[string]any, filesystemBooted bool) {
+	resumeMode := resumeModeRestore
+	if filesystemBooted {
+		resumeMode = resumeModeReboot
+	}
+
+	eventData["resume_mode"] = resumeMode
+}
+
 // recordSandboxKill increments the kill counter with a bounded reason label.
-func recordSandboxKill(ctx context.Context, counter metric.Int64Counter, killReason string) {
+func recordSandboxKill(ctx context.Context, counter metric.Int64Counter, teamID, killReason string) {
 	if killReason == "" {
 		killReason = killReasonUnknown
 	}
 
-	counter.Add(ctx, 1, metric.WithAttributes(attribute.String("kill_reason", killReason)))
+	counter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("kill_reason", killReason),
+		telemetry.WithTeamID(teamID),
+	))
 }
 
 // recordExecutionDuration samples how long one sandbox execution ran, labeled
@@ -743,10 +928,87 @@ func (s *Server) recordExecutionDuration(ctx context.Context, sbx *sandbox.Sandb
 	}
 
 	s.sandboxExecutionDuration.Record(ctx, duration.Milliseconds(),
-		metric.WithAttributes(attribute.String("stop_reason", string(sbx.GetStopReason()))))
+		metric.WithAttributes(
+			attribute.String("stop_reason", string(sbx.GetStopReason())),
+			telemetry.WithTeamID(sbx.Runtime.TeamID),
+		))
+}
+
+// recordCrash reports an execution that ended with no stop reason. The cause
+// separates a guest that halted itself from a Firecracker somebody else
+// killed: both leave a nil wait error.
+func (s *Server) recordCrash(ctx context.Context, sbx *sandbox.Sandbox, waitErr error) {
+	exitInfo := sbx.FirecrackerExit()
+	cause := crashCause(exitInfo, sbx.MemoryHandlerErr())
+
+	s.sandboxCrashedCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("cause", string(cause)),
+		telemetry.WithTeamID(sbx.Runtime.TeamID),
+	))
+
+	fields := append(
+		[]zap.Field{zap.Error(waitErr), zap.String("crash_cause", string(cause))},
+		exitInfo.LogFields()...,
+	)
+
+	if isCleanFirecrackerExit(cause, waitErr) {
+		sbxlogger.I(sbx).Warn(ctx, "sandbox stopped without a stop reason", fields...)
+
+		return
+	}
+
+	sbxlogger.I(sbx).Error(ctx, "sandbox crashed", fields...)
+}
+
+// crashCause classifies an execution that ended with no stop reason. The
+// resume path stops Firecracker as soon as the memory handler exits, so a
+// signal we sent after the handler failed is that failure, not a missing stop
+// reason. Only requested_signal is overridden: a Firecracker killed from
+// outside can take the handler down with it.
+func crashCause(exit *fc.ExitInfo, memoryHandlerErr error) fc.CrashCause {
+	cause := fc.ClassifyExit(exit)
+	if cause == fc.CrashCauseRequestedSignal && memoryHandlerErr != nil {
+		return fc.CrashCauseMemoryHandlerFailed
+	}
+
+	return cause
+}
+
+// isCleanFirecrackerExit reports whether Firecracker exited 0 and nothing else
+// failed. That is usually the guest shutting down, but it includes guest
+// kernel panics and triple faults, which the host cannot tell apart. A wait
+// error means something else failed alongside the exit, so that stays a crash.
+func isCleanFirecrackerExit(cause fc.CrashCause, waitErr error) bool {
+	return cause == fc.CrashCauseCleanExit && waitErr == nil
+}
+
+// recordPauseAdmission records one admission decision. The wait histogram
+// samples only the outcomes that actually waited; an empty outcome (the
+// caller's context ended mid-wait) records nothing — no decision was made.
+func (s *Server) recordPauseAdmission(ctx context.Context, teamID, rpc string, outcome sandbox.SnapshotAdmissionOutcome, waited time.Duration) {
+	if outcome == "" {
+		return
+	}
+
+	s.pauseAdmissionCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("outcome", string(outcome)),
+		attribute.String("rpc", rpc),
+		telemetry.WithTeamID(teamID),
+	))
+
+	if outcome == sandbox.SnapshotAdmissionReadyAfterWait || outcome == sandbox.SnapshotAdmissionRefused {
+		s.pauseAdmissionWaitDuration.Record(ctx, waited.Milliseconds(),
+			metric.WithAttributes(
+				attribute.String("outcome", string(outcome)),
+				telemetry.WithTeamID(teamID),
+			))
+	}
 }
 
 func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest) (resp *orchestrator.SandboxPauseResponse, err error) {
+	releaseWork := s.info.TrackWork()
+	defer releaseWork()
+
 	ctx, childSpan := tracer.Start(ctx, "sandbox-pause")
 	defer childSpan.End()
 
@@ -754,11 +1016,15 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 	// can't distinguish them) and success, so dashboards can scope pause
 	// call-count / error-rate / latency to filesystem-only pauses.
 	pauseStart := time.Now()
+	// Unknown until the sandbox is looked up; a pause of a missing sandbox
+	// records an empty team.
+	var sandboxTeamID string
 	defer func() {
 		s.sandboxPauseDuration.Record(ctx, time.Since(pauseStart).Milliseconds(),
 			metric.WithAttributes(
 				attribute.Bool("fs_only", in.GetFilesystemOnly()),
 				attribute.Bool("success", err == nil),
+				telemetry.WithTeamID(sandboxTeamID),
 			),
 		)
 	}()
@@ -775,24 +1041,59 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 
 		return nil, status.Error(codes.NotFound, "sandbox not found")
 	}
+	sandboxTeamID = sbx.Runtime.TeamID
 
-	ctx = featureflags.AddToContext(
-		ctx,
-		ldcontext.NewBuilder(in.GetSandboxId()).
-			Kind(featureflags.SandboxKind).
-			SetString(featureflags.SandboxTemplateAttribute, sbx.Runtime.TemplateID).
-			SetString(featureflags.SandboxKernelVersionAttribute, sbx.Config.FirecrackerConfig.KernelVersion).
-			SetString(featureflags.SandboxFirecrackerVersionAttribute, sbx.Config.FirecrackerConfig.FirecrackerVersion).
-			SetString(featureflags.SandboxEnvdVersionAttribute, sbx.Config.Envd.Version).
-			Build(),
-	)
+	ctx = featureflags.AddToContext(ctx, sandboxFlagContexts(sbx)...)
 
 	childSpan.SetAttributes(
 		telemetry.WithTeamID(sbx.Runtime.TeamID),
 		telemetry.WithFirecrackerVersion(sbx.Config.FirecrackerConfig.FirecrackerVersion),
 		telemetry.WithKernelVersion(sbx.Config.FirecrackerConfig.KernelVersion),
 		telemetry.WithEnvdVersion(sbx.Config.Envd.Version),
+		attribute.String("balloon_mode", sbx.BalloonMode()),
 	)
+
+	// Flag-gated admission pre-flight: refuse retryably BEFORE any destructive
+	// step while the parent memfile header is still deduplicating.
+	var latchedErr error
+	if graceMs := s.featureFlags.IntFlag(ctx, featureflags.PauseAdmissionGraceMs); graceMs >= 0 {
+		outcome, waited, admitErr := sbx.AwaitSnapshotAdmission(ctx, time.Duration(graceMs)*time.Millisecond, !in.GetFilesystemOnly())
+		s.recordPauseAdmission(ctx, sbx.Runtime.TeamID, "pause", outcome, waited)
+		switch {
+		case errors.Is(admitErr, sandbox.ErrSnapshotAdmissionPending):
+			sbxlogger.E(sbx).Warn(ctx, "Refusing pause: parent memfile header is still deduplicating", zap.Duration("waited", waited))
+
+			return nil, status.Errorf(codes.ResourceExhausted, "node is busy persisting sandbox '%s', please retry", in.GetSandboxId())
+		case admitErr != nil && outcome == "":
+			// The caller's context ended mid-wait; nothing was decided and the
+			// sandbox is untouched.
+			return nil, status.FromContextError(admitErr).Err()
+		case admitErr != nil:
+			// Permanent: carried into the kill path below, which needs
+			// MarkStopping first.
+			latchedErr = admitErr
+		}
+	}
+
+	// Refuse retryably, still before anything destructive, a capture the build
+	// filesystem cannot hold (pause_disk_admission.go). A sandbox that can never
+	// be persisted again is not refused but killed below, which a refusal would
+	// only defer. The estimate stays reserved until the capture is on disk and
+	// its upload has ended, or until this call fails before that.
+	var diskReservation *pauseDiskReservation
+	if latchedErr == nil && sbx.EnsurePausable() == nil {
+		reservation, refuseErr := s.admitPauseDisk(ctx, sbx, in.GetFilesystemOnly())
+		if refuseErr != nil {
+			return nil, refuseErr
+		}
+		diskReservation = reservation
+	}
+	diskHandedOff := false
+	defer func() {
+		if !diskHandedOff {
+			diskReservation.Release()
+		}
+	}()
 
 	marked := s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
 	if !marked {
@@ -803,8 +1104,9 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 
 	sbxlogger.E(sbx).Info(ctx, "Pausing sandbox")
 
-	// A latched in-place seal failure means this sandbox can never be validly
-	// persisted again. Kill it promptly and name the cause: refusing would NOT
+	// A latched in-place seal failure — or a parent memfile dedup that failed
+	// for good, found by the pre-flight — means this sandbox can never be
+	// validly persisted again. Kill it promptly and name the cause: refusing would NOT
 	// preserve it — the API pause chain has already deleted the routing entry
 	// and removes the store record regardless of this RPC's result, so a
 	// refused pause leaves a live VM that the orphan reconciler kills ~20s
@@ -813,8 +1115,12 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 	// the real cause in the error and the stop reason. The same policy covers
 	// a seal that only fails while Pause waits on it below: the deferred stop
 	// tears the sandbox down and the seal error is returned.
-	if err := sbx.EnsurePausable(); err != nil {
-		telemetry.ReportCriticalError(ctx, "sandbox cannot be persisted, killing it", err, telemetry.WithSandboxID(in.GetSandboxId()))
+	persistErr := latchedErr
+	if persistErr == nil {
+		persistErr = sbx.EnsurePausable()
+	}
+	if persistErr != nil {
+		telemetry.ReportCriticalError(ctx, "sandbox cannot be persisted, killing it", persistErr, telemetry.WithSandboxID(in.GetSandboxId()))
 		sbx.SetStopReason(sandbox.StopReasonKilled)
 		s.stopSandboxAsync(context.WithoutCancel(ctx), sbx)
 
@@ -826,7 +1132,7 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 		// downstream fills the gap).
 		s.emitSandboxKilled(ctx, sbx, killReasonSealFailed)
 
-		return nil, status.Errorf(codes.Internal, "sandbox '%s' cannot be persisted, killing it: %s", in.GetSandboxId(), err)
+		return nil, status.Errorf(codes.Internal, "sandbox '%s' cannot be persisted, killing it: %s", in.GetSandboxId(), persistErr)
 	}
 
 	// Set before the snapshot, not after it succeeds: snapshotting suspends the
@@ -849,6 +1155,16 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 		return nil, status.Errorf(codes.Internal, "error snapshotting sandbox '%s': %s", in.GetSandboxId(), err)
 	}
 
+	// The disk reservation follows the capture from here: most of it goes
+	// once the diffs are on disk, the upload's copy once the upload ends.
+	s.releasePauseDiskWhenWritten(context.WithoutCancel(ctx), res, diskReservation)
+	completeUpload := res.completeUpload
+	res.completeUpload = func(ctx context.Context, err error) {
+		completeUpload(ctx, err)
+		diskReservation.Release()
+	}
+	diskHandedOff = true
+
 	s.uploadSnapshotAsync(ctx, sbx, res)
 
 	// Best-effort: the local snapshot is now in the cache and the remote upload
@@ -863,15 +1179,16 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 	// memory resume of it would just fail (the resume is reserved for memory
 	// snapshots; fs-only is a reboot) — there is no memory working set to harvest.
 	if !in.GetFilesystemOnly() {
-		s.harvestResumePrefetchAsync(ctx, sbx, res, in.GetBuildId(), res.objectMetadata)
+		s.harvestResumePrefetchAsync(ctx, sbx, res, in.GetBuildId(), res.objectMetadata, harvestSourcePause)
 	}
 
 	teamID, buildId, eventsTTLDays, eventData := s.prepareSandboxEventData(ctx, sbx)
 	eventData[executionEventDataKey] = s.getSandboxExecutionData(sbx)
+	addPauseMode(eventData, res.filesystemOnly)
 
 	eventType := events.SandboxPausedEventPair
-	go s.sbxEventsService.Publish(
-		context.WithoutCancel(ctx),
+	s.publishEventAsync(
+		ctx,
 		teamID,
 		events.SandboxEvent{
 			Version:   events.StructureVersionV2,
@@ -894,7 +1211,103 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 	}, nil
 }
 
+// sandboxFlagContexts returns the LaunchDarkly contexts for flag evaluations
+// made on behalf of a sandbox already running on this node: the sandbox and
+// its team, the same two kinds Create evaluates with.
+func sandboxFlagContexts(sbx *sandbox.Sandbox) []ldcontext.Context {
+	return []ldcontext.Context{
+		ldcontext.NewBuilder(sbx.Runtime.SandboxID).
+			Kind(featureflags.SandboxKind).
+			SetString(featureflags.SandboxTemplateAttribute, sbx.Runtime.TemplateID).
+			SetString(featureflags.SandboxKernelVersionAttribute, sbx.Config.FirecrackerConfig.KernelVersion).
+			SetString(featureflags.SandboxFirecrackerVersionAttribute, sbx.Config.FirecrackerConfig.FirecrackerVersion).
+			SetString(featureflags.SandboxEnvdVersionAttribute, sbx.Config.Envd.Version).
+			Build(),
+		featureflags.TeamContext(sbx.Runtime.TeamID),
+	}
+}
+
+// The route a checkpoint took: in place, or the first gate condition that
+// sent it resume-fresh, in gate order. The counter and the span carry it so
+// a resume-fresh fraction is attributable per template.
+const (
+	routeInPlace          = "in_place"
+	routeSyncWPOff        = "sync_wp_off"
+	routeFlagOff          = "flag_off"
+	routeFCUnsupported    = "fc_unsupported"
+	routeBalloonReporting = "balloon_reporting"
+	routeBalloonUnknown   = "balloon_unknown"
+)
+
+// inPlaceEarlyRoute is the cheap half of the gate, in order; "" means the
+// balloon decides. fcSupported is called only when the earlier conditions
+// hold, as it logs when it refuses.
+func inPlaceEarlyRoute(syncWP, flagOn bool, fcSupported func() bool) string {
+	switch {
+	case !syncWP:
+		return routeSyncWPOff
+	case !flagOn:
+		return routeFlagOff
+	case !fcSupported():
+		return routeFCUnsupported
+	default:
+		return ""
+	}
+}
+
+// inPlaceBalloonRoute is the balloon half. Only an allow-listed mode goes in
+// place. Reporting matters only when the export would pause it: the CoW
+// window does, the synchronous copy does not, so with the deferred export
+// off a reporting or unread balloon goes in place too. With it on, reporting
+// and unknown go in place only when admit says so. A value this build does
+// not know fails closed. deferred and admit are called only when they
+// decide, so neither flag is evaluated for cohorts it never applies to.
+func inPlaceBalloonRoute(mode userfaultfd.BalloonMode, deferred, admit func() bool) string {
+	switch mode {
+	case userfaultfd.BalloonModeHinting, userfaultfd.BalloonModeNone:
+		return routeInPlace
+	case userfaultfd.BalloonModeReporting:
+		if !deferred() || admit() {
+			return routeInPlace
+		}
+
+		return routeBalloonReporting
+	case userfaultfd.BalloonModeUnknown:
+		if !deferred() || admit() {
+			return routeInPlace
+		}
+
+		return routeBalloonUnknown
+	default:
+		return routeBalloonUnknown
+	}
+}
+
+// checkpointRoute decides the route under the flags in ctx. The device read
+// behind ResolveBalloonMode runs only once the cheap conditions hold; a route
+// decided before it carries the stamped mode as its label.
+func (s *Server) checkpointRoute(ctx context.Context, sbx *sandbox.Sandbox) (string, userfaultfd.BalloonMode) {
+	early := inPlaceEarlyRoute(
+		sbx.UseSyncWP(),
+		s.featureFlags.BoolFlag(ctx, featureflags.InPlaceCheckpointFlag),
+		func() bool {
+			return firecrackerSupports(ctx, sbx, "in-place checkpoint", (*fcversion.Info).HasInPlaceCheckpoint)
+		},
+	)
+	if early != "" {
+		return early, sbx.BalloonModeValue()
+	}
+	mode := sbx.ResolveBalloonMode(ctx)
+	deferred := func() bool { return sbx.DeferredMemoryExport(ctx) }
+	admit := func() bool { return s.featureFlags.BoolFlag(ctx, featureflags.InPlaceCheckpointReportingFlag) }
+
+	return inPlaceBalloonRoute(mode, deferred, admit), mode
+}
+
 func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpointRequest) (*orchestrator.SandboxCheckpointResponse, error) {
+	releaseWork := s.info.TrackWork()
+	defer releaseWork()
+
 	ctx, childSpan := tracer.Start(ctx, "sandbox-checkpoint")
 	defer childSpan.End()
 
@@ -910,16 +1323,7 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 		return nil, status.Errorf(codes.NotFound, "sandbox '%s' not found", in.GetSandboxId())
 	}
 
-	ctx = featureflags.AddToContext(
-		ctx,
-		ldcontext.NewBuilder(in.GetSandboxId()).
-			Kind(featureflags.SandboxKind).
-			SetString(featureflags.SandboxTemplateAttribute, sbx.Runtime.TemplateID).
-			SetString(featureflags.SandboxKernelVersionAttribute, sbx.Config.FirecrackerConfig.KernelVersion).
-			SetString(featureflags.SandboxFirecrackerVersionAttribute, sbx.Config.FirecrackerConfig.FirecrackerVersion).
-			SetString(featureflags.SandboxEnvdVersionAttribute, sbx.Config.Envd.Version).
-			Build(),
-	)
+	ctx = featureflags.AddToContext(ctx, sandboxFlagContexts(sbx)...)
 
 	childSpan.SetAttributes(
 		telemetry.WithTeamID(sbx.Runtime.TeamID),
@@ -927,11 +1331,37 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 		telemetry.WithFirecrackerVersion(sbx.Config.FirecrackerConfig.FirecrackerVersion),
 		telemetry.WithKernelVersion(sbx.Config.FirecrackerConfig.KernelVersion),
 		telemetry.WithEnvdVersion(sbx.Config.Envd.Version),
+		// The stamp, so a refusal below still carries the cohort; the route
+		// decision overwrites it with the device's answer.
+		attribute.String("balloon_mode", sbx.BalloonMode()),
 	)
 
 	// Check envd version before snapshotting.
 	if err := utils.CheckEnvdVersionForSnapshot(sbx.Config.Envd.Version); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%s", err.Error())
+	}
+
+	fsOnly := in.GetFilesystemOnly()
+
+	// The same flag-gated admission pre-flight as Pause; before waitForAcquire
+	// so a grace wait never holds a start slot. A filesystem-only checkpoint
+	// has no memory parent to wait for, only the latched checks apply.
+	if graceMs := s.featureFlags.IntFlag(ctx, featureflags.PauseAdmissionGraceMs); graceMs >= 0 {
+		outcome, waited, admitErr := sbx.AwaitSnapshotAdmission(ctx, time.Duration(graceMs)*time.Millisecond, !fsOnly)
+		s.recordPauseAdmission(ctx, sbx.Runtime.TeamID, "checkpoint", outcome, waited)
+		switch {
+		case errors.Is(admitErr, sandbox.ErrSnapshotAdmissionPending):
+			sbxlogger.E(sbx).Warn(ctx, "Refusing checkpoint: parent memfile header is still deduplicating", zap.Duration("waited", waited))
+
+			return nil, status.Errorf(codes.ResourceExhausted, "node is busy persisting sandbox '%s', please retry", in.GetSandboxId())
+		case admitErr != nil && outcome == "":
+			return nil, status.FromContextError(admitErr).Err()
+		case admitErr != nil:
+			// Unlike Pause, nothing downstream re-checks a latched seal.
+			sbxlogger.E(sbx).Warn(ctx, "Refusing checkpoint: sandbox cannot be persisted", zap.Error(admitErr))
+
+			return nil, status.Errorf(codes.FailedPrecondition, "sandbox '%s' cannot be persisted: %s", in.GetSandboxId(), admitErr)
+		}
 	}
 
 	// Acquire the starting semaphore before resuming, same as Create/Pause.
@@ -940,29 +1370,95 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 	}
 	defer s.startingSandboxes.Release(1)
 
-	sbxlogger.E(sbx).Info(ctx, "Checkpointing sandbox")
+	sbxlogger.E(sbx).Info(ctx, "Checkpointing sandbox", zap.Bool("fs_only", fsOnly))
 
 	// In-place checkpoint (pause, snapshot, resume the SAME FC process) is
 	// only honored for sandboxes resumed with use_sync_wp: it skips the
 	// snapshot re-load that re-arms write-protection, so dirty tracking
-	// across repeated checkpoints relies on the sync-WP serve loop. Everything
-	// else takes the resume-fresh flow.
-	inPlace := sbx.UseSyncWP() && s.featureFlags.BoolFlag(ctx, featureflags.InPlaceCheckpointFlag)
+	// across repeated checkpoints relies on the sync-WP serve loop. It also
+	// requires the running Firecracker's release contract to include the
+	// feature (e2b releases >= 0.2.0 — the CoW memory window drives the
+	// balloon free-page-reporting pause API). Everything else takes the
+	// resume-fresh flow, so an older FC degrades gracefully rather than
+	// erroring.
+	//
+	// Sandboxes whose balloon runs free-page REPORTING are excluded as well:
+	// the CoW window pauses reporting for its lifetime and the deferred
+	// reports drain onto the serve loop the moment it resumes, so on these
+	// sandboxes the in-place path costs the latency it exists to remove.
+	// The mode is the device's, from one read cached per process, so the gate
+	// cannot disagree with the running VM or with the memory export, which
+	// reads the same cache; the template stamp is only the label. The
+	// exclusion applies only while the deferred export would pause reporting:
+	// with defer-memory-export off the synchronous copy never touches it and
+	// every balloon goes in place. A mode unknown after that read goes
+	// resume-fresh: unknown device truth
+	// never buys the in-place path. in-place-checkpoint-reporting re-admits
+	// reporting balloons, per team, as the way back without a redeploy.
+	//
+	// A filesystem-only checkpoint exports no memory, so neither the sync-WP
+	// dirty tracking, the Firecracker in-place release nor the balloon is
+	// involved, and in-place-checkpoint is not consulted: it goes in place
+	// behind filesystem-only-checkpoint alone. It has no resume-fresh
+	// fallback (resuming a fresh sandbox from a memoryless build would
+	// cold-boot it, turning "snapshot my running sandbox" into a reboot), so
+	// with its flag off it is refused before anything is touched, and the API
+	// restores the sandbox to Running.
+	//
+	// Decided here, after admission, so a refused RPC records no route; one
+	// decision feeds the span, the gate and the counter.
+	var route string
+	var balloonMode userfaultfd.BalloonMode
+	if fsOnly {
+		if !s.featureFlags.BoolFlag(ctx, featureflags.FilesystemOnlyCheckpointFlag) {
+			return nil, filesystemOnlyDisabledStatus(in.GetSandboxId()).Err()
+		}
+		route, balloonMode = routeInPlace, sbx.BalloonModeValue()
+	} else {
+		route, balloonMode = s.checkpointRoute(ctx, sbx)
+	}
+	inPlace := route == routeInPlace
+	childSpan.SetAttributes(
+		attribute.String("balloon_mode", balloonMode.String()),
+		attribute.String("route", route),
+	)
+	// A caller that went away during the device read must not be answered
+	// with resume-fresh under its dead context: that path stops the sandbox
+	// on the failure it is about to hit, while the API restores the record.
+	if err := ctx.Err(); err != nil {
+		sbxlogger.E(sbx).Info(ctx, "checkpoint abandoned by the caller after the route decision, before either path started",
+			zap.String("route", route), zap.String("balloon_mode", balloonMode.String()), zap.Error(err))
+
+		return nil, status.FromContextError(err).Err()
+	}
 
 	var res *orchestrator.SandboxCheckpointResponse
+	var deferred bool
 	var err error
+	start := time.Now()
 	if inPlace {
-		res, err = s.checkpointInPlace(ctx, sbx, in)
+		res, deferred, err = s.checkpointInPlace(ctx, sbx, in)
 	} else {
 		res, err = s.checkpointResumeFresh(ctx, sbx, in)
 	}
+	// deferred splits the in-place arm by export mechanism (CoW window or
+	// synchronous copy), so the three arms of the reporting A/B are one
+	// series apart; it is always false on resume-fresh.
+	attrs := metric.WithAttributes(
+		attribute.Bool("in_place", inPlace),
+		attribute.Bool("fs_only", fsOnly),
+		attribute.String("route", route),
+		attribute.String("balloon_mode", balloonMode.String()),
+		attribute.Bool("deferred", deferred),
+		attribute.Bool("success", err == nil),
+		telemetry.WithTeamID(sbx.Runtime.TeamID),
+	)
+	s.sandboxCheckpointDuration.Record(ctx, time.Since(start).Milliseconds(), attrs)
 
 	// The denominator for the in_place-labeled duration histograms: what
-	// fraction of checkpoints went in-place, at what success rate.
-	s.sandboxCheckpointCounter.Add(ctx, 1, metric.WithAttributes(
-		attribute.Bool("in_place", inPlace),
-		attribute.Bool("success", err == nil),
-	))
+	// fraction of checkpoints went in-place, at what success rate, and for
+	// the rest which gate condition sent them resume-fresh.
+	s.sandboxCheckpointCounter.Add(ctx, 1, attrs)
 
 	return res, err
 }
@@ -1000,13 +1496,15 @@ func (s *Server) runCheckpointUpload(ctx context.Context, sbx *sandbox.Sandbox, 
 		cancelWait()
 		if sealErr != nil {
 			// The same shape as the sync path failing fast (Run's first act
-			// is waiting this promise): finish the registered upload with
-			// the error — freeing the build's upload future — and surface
-			// it under the caller's failure code (FailedPrecondition for
+			// is waiting this promise): end the registered upload with the
+			// error — freeing the build's upload future — and surface it
+			// under the caller's failure code (FailedPrecondition for
 			// in-place: the sandbox is alive, the API restores it to
-			// Running).
+			// Running). The memfile diff is unusable, so the upload is
+			// abandoned rather than finished: nothing will read the
+			// snapshot.
 			telemetry.ReportCriticalError(ctx, "deferred memory seal failed before checkpoint upload", sealErr, telemetry.WithSandboxID(in.GetSandboxId()))
-			res.completeUpload(ctx, sealErr)
+			res.abandonUpload(ctx, sealErr)
 			if onUploadFailure != nil {
 				onUploadFailure()
 			}
@@ -1027,7 +1525,19 @@ func (s *Server) runCheckpointUpload(ctx context.Context, sbx *sandbox.Sandbox, 
 	defer cancel()
 
 	err := res.upload.Run(uploadCtx)
-	defer res.completeUpload(uploadCtx, err)
+	// A checkpoint whose upload failed is discarded — the API keeps an
+	// in-place sandbox running, and onUploadFailure kills a resume-fresh one —
+	// so its upload is abandoned rather than finished: nothing will read the
+	// snapshot.
+	uploadErr := err
+	defer func() {
+		if uploadErr != nil {
+			res.abandonUpload(uploadCtx, uploadErr)
+
+			return
+		}
+		res.completeUpload(uploadCtx, nil)
+	}()
 
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error uploading snapshot for checkpoint", err, telemetry.WithSandboxID(in.GetSandboxId()))
@@ -1054,7 +1564,10 @@ func (s *Server) runCheckpointUpload(ctx context.Context, sbx *sandbox.Sandbox, 
 // the killed event/counter itself, because the teardown's cleanup has already
 // MarkStopping-ed the sandbox out of the live map, so the API's follow-up
 // Delete finds nothing to attribute.
-func (s *Server) checkpointInPlace(ctx context.Context, sbx *sandbox.Sandbox, in *orchestrator.SandboxCheckpointRequest) (*orchestrator.SandboxCheckpointResponse, error) {
+// checkpointInPlace reports, next to the reply, whether the memory export
+// went through the CoW window (true) or the synchronous copy (false); false
+// as well when the snapshot failed before that was decided.
+func (s *Server) checkpointInPlace(ctx context.Context, sbx *sandbox.Sandbox, in *orchestrator.SandboxCheckpointRequest) (_ *orchestrator.SandboxCheckpointResponse, deferred bool, _ error) {
 	// The sandbox stays live and addressable through an in-place checkpoint —
 	// that is the point — so unlike resume-fresh there is no MarkStopping to
 	// naturally exclude concurrent lifecycle RPCs. The API already serializes
@@ -1064,7 +1577,7 @@ func (s *Server) checkpointInPlace(ctx context.Context, sbx *sandbox.Sandbox, in
 	// checkpoints into Pause/CreateSnapshot/ResumeInPlace on the same FC
 	// process. FailedPrecondition tells the API the sandbox is still healthy.
 	if !sbx.BeginInPlaceCheckpoint() {
-		return nil, status.Errorf(codes.FailedPrecondition, "a checkpoint is already in progress for sandbox '%s'", in.GetSandboxId())
+		return nil, false, status.Errorf(codes.FailedPrecondition, "a checkpoint is already in progress for sandbox '%s'", in.GetSandboxId())
 	}
 	defer sbx.EndInPlaceCheckpoint()
 
@@ -1079,7 +1592,7 @@ func (s *Server) checkpointInPlace(ctx context.Context, sbx *sandbox.Sandbox, in
 		in.GetBuildId(),
 		in.GetMetadata(),
 		storage.ObjectOriginSnapshotTemplate,
-		false, // filesystemOnly: full-memory checkpoint (fs-only in-place is a follow-up)
+		in.GetFilesystemOnly(),
 		deferRootfsExport,
 		true, // maintainSandbox: resume in place
 	)
@@ -1098,9 +1611,9 @@ func (s *Server) checkpointInPlace(ctx context.Context, sbx *sandbox.Sandbox, in
 			// would publish nothing. Emit the terminal surfaces here, like
 			// the seal-failure kill above: without them this death has no
 			// killed event and no kill-counter sample.
-			s.emitSandboxKilled(ctx, sbx, killReasonResumeFailed)
+			s.emitSandboxKilled(ctx, sbx, lostSandboxKillReason(err))
 
-			return nil, status.Errorf(codes.Internal, "error snapshotting sandbox '%s': %s", in.GetSandboxId(), err)
+			return nil, false, status.Errorf(codes.Internal, "error snapshotting sandbox '%s': %s", in.GetSandboxId(), err)
 		}
 
 		// FailedPrecondition, not Internal, for everything else: Pause's
@@ -1110,19 +1623,27 @@ func (s *Server) checkpointInPlace(ctx context.Context, sbx *sandbox.Sandbox, in
 		// transient storage or disk error destroying a running sandbox). A
 		// failing resume-on-error cleanup no longer lands here: it tears the
 		// sandbox down and tags ErrSandboxLost, taking the branch above.
-		return nil, status.Errorf(codes.FailedPrecondition, "error snapshotting sandbox '%s': %s", in.GetSandboxId(), err)
+		return nil, false, status.Errorf(codes.FailedPrecondition, "error snapshotting sandbox '%s': %s", in.GetSandboxId(), err)
 	}
 
-	// Prefetch mapping is intentionally omitted for an in-place checkpoint: the
-	// live PrefetchTracker holds the whole workload's fault history (not a
-	// cold-start working set), and embedding it made launches from the produced
-	// template over-prefetch. res.meta.Prefetch stays nil. The sandbox was already
-	// resumed in place inside Pause, so there is no resume-fresh / lifecycle setup
-	// / envd-upgrade / markSandboxLive here — the original sandbox keeps running.
+	// res.meta.Prefetch stays nil here: the live PrefetchTracker holds the whole
+	// workload's fault history (not a cold-start working set), and embedding it
+	// made launches from the produced template over-prefetch. The resume-fresh
+	// checkpoint gets its mapping from the real resume it performs; in place
+	// there is none (the sandbox was already resumed inside Pause, so there is no
+	// resume-fresh / lifecycle setup / envd-upgrade / markSandboxLive here — the
+	// original sandbox keeps running), so the mapping is harvested below from a
+	// throwaway warm resume, exactly as the pause path does. Without it a
+	// template produced in place launches with no prefetch at all under the
+	// default resume-prefetch-source, and every sandbox from it demand-faults its
+	// working set.
 
+	deferred = res.memoryExportDeferred
 	if err := s.runCheckpointUpload(ctx, sbx, res, in, codes.FailedPrecondition, nil); err != nil {
-		return nil, err
+		return nil, deferred, err
 	}
+
+	s.harvestCheckpointPrefetchAsync(ctx, sbx, res, in)
 
 	s.publishSandboxEvent(ctx, sbx, events.SandboxCheckpointedEvent)
 
@@ -1130,27 +1651,45 @@ func (s *Server) checkpointInPlace(ctx context.Context, sbx *sandbox.Sandbox, in
 
 	return &orchestrator.SandboxCheckpointResponse{
 		SchedulingMetadata: res.schedulingMetadata,
-	}, nil
+	}, deferred, nil
+}
+
+// harvestCheckpointPrefetchAsync schedules the resume-prefetch harvest for a
+// checkpoint taken in place, once its upload has been kicked off or completed:
+// the local snapshot is in the cache, the deferred seals (memfile through the
+// CoW window, rootfs when deferred rootfs export is on) are awaited by the
+// harvest itself, and the consume path waits for the upload before touching
+// metadata. Best-effort and off the checkpoint's critical path: the source
+// sandbox is already running again and the RPC result is not affected. Skipped
+// for a filesystem-only checkpoint, which has no memfile and whose template
+// cold-boots — there is no resume working set to harvest.
+func (s *Server) harvestCheckpointPrefetchAsync(ctx context.Context, sbx *sandbox.Sandbox, res *snapshotResult, in *orchestrator.SandboxCheckpointRequest) {
+	if in.GetFilesystemOnly() {
+		return
+	}
+
+	s.harvestResumePrefetchAsync(ctx, sbx, res, in.GetBuildId(), res.objectMetadata, harvestSourceCheckpoint)
 }
 
 // checkpointResumeFresh snapshots the sandbox and resumes a FRESH sandbox
 // from the produced build (new FC process, same ExecutionID). This is the
 // pre-in-place checkpoint flow and the fallback whenever in-place is not
 // available (async-WP sandbox or in-place-checkpoint flag off).
-func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox, in *orchestrator.SandboxCheckpointRequest) (*orchestrator.SandboxCheckpointResponse, error) {
-	// The old sandbox is being replaced: remove it from the live registry up
-	// front (also the natural exclusion against concurrent lifecycle RPCs —
-	// a second Checkpoint or a Kill no longer finds it) and always stop it
-	// when done. Without the MarkStopping, the stale entry would block the
-	// resumed sandbox's MarkRunning (InsertIfAbsent) and keep routing traffic
-	// to a dead lifecycle; without the deferred stop, a failure past this
-	// point would leak a running but unaddressable Firecracker process.
-	marked := s.sandboxFactory.Sandboxes.MarkStopping(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
-	if !marked {
-		telemetry.ReportCriticalError(ctx, "failed to mark sandbox as stopping", nil, telemetry.WithSandboxID(in.GetSandboxId()))
+func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox, in *orchestrator.SandboxCheckpointRequest) (_ *orchestrator.SandboxCheckpointResponse, checkpointErr error) {
+	reservation, err := s.sandboxFactory.Sandboxes.MarkStoppingReserved(ctx, sbx.Runtime.SandboxID, sbx.LifecycleID)
+	if errors.Is(err, sandbox.ErrSandboxOperationInProgress) {
+		return nil, status.Errorf(codes.FailedPrecondition, "an operation is already in progress for sandbox '%s'", in.GetSandboxId())
+	}
+	if err != nil {
+		telemetry.ReportCriticalError(ctx, "failed to mark sandbox as stopping", err, telemetry.WithSandboxID(in.GetSandboxId()))
 
 		return nil, status.Errorf(codes.Internal, "failed to checkpoint sandbox '%s'", in.GetSandboxId())
 	}
+	rollback := sandbox.NewCleanup()
+	rollback.Add(ctx, func(ctx context.Context) error { return stopAndCloseSandbox(ctx, sbx) })
+	defer func() {
+		s.finishSandboxStart(ctx, reservation, rollback, checkpointErr)
+	}()
 
 	// Always stop the old sandbox when done — on success the resumed sandbox
 	// takes over, on failure this prevents a leaked sandbox that is running
@@ -1160,11 +1699,11 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 	// Set before the snapshot, as in Pause.
 	sbx.SetStopReason(sandbox.StopReasonCheckpointing)
 
-	// Checkpoint always takes a full memory snapshot; filesystem-only checkpoint
-	// (resume-in-place would need to reboot) is not supported yet.
-	// Checkpoint resumes a fresh sandbox from the new build immediately, so the
-	// diff must be materialized synchronously — never defer the rootfs export
-	// here, and never maintain the paused sandbox.
+	// Always a full memory snapshot: the fresh sandbox is resumed from the new
+	// build, which a memoryless build could only cold-boot (Checkpoint routes
+	// filesystem-only requests to checkpointInPlace instead). The resume is
+	// immediate, so the diff must be materialized synchronously — never defer
+	// the rootfs export here, and never maintain the paused sandbox.
 	res, err := s.snapshotAndCacheSandbox(ctx, sbx, in.GetBuildId(), in.GetMetadata(), storage.ObjectOriginSnapshotTemplate, false, false, false)
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error snapshotting sandbox for checkpoint", err, telemetry.WithSandboxID(in.GetSandboxId()))
@@ -1172,14 +1711,27 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		return nil, status.Errorf(codes.Internal, "error snapshotting sandbox '%s': %s", in.GetSandboxId(), err)
 	}
 
+	// Every return before runCheckpointUpload leaves the registered upload
+	// unrun. Abandon it there, so its waiters fail instead of hanging and its
+	// template cache pin is returned.
+	handoff := checkpointHandoff{res: res}
+	defer func() { handoff.settle(context.WithoutCancel(ctx), checkpointErr) }()
+
 	// Get the template for resume
-	template, err := s.templateCache.GetTemplate(ctx, in.GetBuildId(), true, false,
+	// Pinned for the resumed sandbox's lifetime; see the Create path for why.
+	template, releaseTemplate, err := s.templateCache.GetTemplatePinned(ctx, in.GetBuildId(), true, false,
 		sbxtemplate.GetTemplateOpts{MaxSandboxLengthHours: sbx.Config.MaxSandboxLengthHours})
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error getting template for resume after checkpoint", err, telemetry.WithSandboxID(in.GetSandboxId()))
 
 		return nil, status.Errorf(codes.Internal, "error getting template for resume: %s", err)
 	}
+
+	rollback.AddNoContext(ctx, func() error {
+		releaseTemplate()
+
+		return nil
+	})
 
 	// Resume the sandbox keeping the same ExecutionID (stable identity for
 	// the API, routing catalog, and analytics) but with a fresh LifecycleID
@@ -1189,7 +1741,7 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		ctx,
 		template,
 		sbx.Config,
-		sandbox.RuntimeMetadata{
+		sandboxtypes.RuntimeMetadata{
 			TemplateID:  sbx.Runtime.TemplateID,
 			SandboxID:   sbx.Runtime.SandboxID,
 			ExecutionID: sbx.Runtime.ExecutionID,
@@ -1202,12 +1754,14 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		sbx.APIStoredConfig,
 		// Defer routing until after the upgrade's post-/init (markSandboxLive below).
 		sandbox.WithDeferredLiveRegistration(),
+		sandbox.WithExecutionStartedAt(sbx.GetExecutionStartedAt()),
 	)
 	if err != nil {
 		telemetry.ReportCriticalError(ctx, "error resuming sandbox after checkpoint", err, telemetry.WithSandboxID(in.GetSandboxId()))
 
 		return nil, status.Errorf(codes.Internal, "error resuming sandbox after checkpoint: %s", err)
 	}
+	rollback.Add(ctx, func(ctx context.Context) error { return stopAndCloseSandbox(ctx, resumedSbx) })
 
 	// Collect prefetch data immediately after resume while it's most accurate
 	prefetchData, prefetchErr := resumedSbx.MemoryPrefetchData(ctx)
@@ -1216,27 +1770,25 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 	}
 
 	// Setup lifecycle for the resumed sandbox
-	s.setupSandboxLifecycle(ctx, resumedSbx)
+	s.setupSandboxLifecycle(ctx, resumedSbx, releaseTemplate)
 
 	// resume-time envd live-upgrade. Best-effort and tightly gated so
 	// it can never disrupt the universal resume path — except an unrecoverable
 	// post-execve failure (new envd left uninitialized), which fails the
 	// checkpoint rather than leave a bricked sandbox.
 	if _, upErr := s.maybeUpgradeEnvd(ctx, resumedSbx); upErr != nil {
-		// Bricked past the execve — tear the resumed sandbox down. MarkRunning is
-		// deferred until markSandboxLive below, so the sandbox is not yet in the
-		// live registry: MarkStopping is a no-op and stopSandboxAsync does the
-		// physical teardown.
 		resumedSbx.SetStopReason(sandbox.StopReasonKilled)
-		s.sandboxFactory.Sandboxes.MarkStopping(ctx, resumedSbx.Runtime.SandboxID, resumedSbx.LifecycleID)
-		s.stopSandboxAsync(context.WithoutCancel(ctx), resumedSbx)
 
 		return nil, upErr
 	}
 
 	// Promote to the live registry now that any resume-time upgrade's post-/init
 	// has restored auth — the sandbox was resumed with routing deferred.
-	s.markSandboxLive(ctx, resumedSbx)
+	if err := s.markSandboxLive(ctx, resumedSbx, reservation); err != nil {
+		telemetry.ReportCriticalError(ctx, "error registering resumed sandbox after checkpoint", err, telemetry.WithSandboxID(in.GetSandboxId()))
+
+		return nil, status.Errorf(codes.Internal, "error registering resumed sandbox after checkpoint: %s", err)
+	}
 
 	// Embed prefetch data into the metadata so it's uploaded with the snapshot files in a single pass.
 	if prefetchErr == nil {
@@ -1244,9 +1796,10 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		if prefetchMapping != nil {
 			res.meta = res.meta.WithPrefetch(&metadata.Prefetch{
 				Memory: prefetchMapping,
+				Origin: metadata.PrefetchOriginCheckpoint,
 			})
 
-			if err := s.templateCache.UpdateMetadata(in.GetBuildId(), res.meta); err != nil {
+			if err := s.templateCache.UpdateMetadata(ctx, in.GetBuildId(), res.meta); err != nil {
 				sbxlogger.I(resumedSbx).Warn(ctx, "failed to update local metadata with prefetch", zap.Error(err))
 			}
 		}
@@ -1254,10 +1807,10 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 
 	// On upload failure, tear down the resumed sandbox — without a persisted
 	// snapshot it cannot be paused or resumed later.
+	handoff.handOff()
 	if err := s.runCheckpointUpload(ctx, resumedSbx, res, in, codes.Internal, func() {
 		resumedSbx.SetStopReason(sandbox.StopReasonKilled)
 		s.sandboxFactory.Sandboxes.MarkStopping(ctx, resumedSbx.Runtime.SandboxID, resumedSbx.LifecycleID)
-		s.stopSandboxAsync(context.WithoutCancel(ctx), resumedSbx)
 	}); err != nil {
 		return nil, err
 	}
@@ -1294,7 +1847,11 @@ func (s *Server) prepareSandboxEventData(ctx context.Context, sbx *sandbox.Sandb
 }
 
 func (s *Server) getSandboxExecutionData(sbx *sandbox.Sandbox) map[string]any {
+	// ExecutionStartedAt survives Checkpoint's handler rebuild, which resets StartedAt, so the earlier of the two is the execution start.
 	startedAt := sbx.GetStartedAt()
+	if executionStartedAt := sbx.GetExecutionStartedAt(); !executionStartedAt.IsZero() && executionStartedAt.Before(startedAt) {
+		startedAt = executionStartedAt
+	}
 
 	return map[string]any{
 		"started_at":     startedAt.UTC().Format(time.RFC3339),
@@ -1304,18 +1861,52 @@ func (s *Server) getSandboxExecutionData(sbx *sandbox.Sandbox) map[string]any {
 	}
 }
 
+// checkpointHandoff owns a checkpoint's registered upload until it is handed
+// to runCheckpointUpload, and abandons it if the checkpoint returns first.
+type checkpointHandoff struct {
+	res    *snapshotResult
+	handed bool
+}
+
+// handOff passes the upload on; settle leaves it alone from then on.
+func (h *checkpointHandoff) handOff() { h.handed = true }
+
+// settle abandons the upload unless it was handed off, failing its waiters
+// with cause, the error the checkpoint returns.
+func (h *checkpointHandoff) settle(ctx context.Context, cause error) {
+	if h.handed {
+		return
+	}
+	if cause == nil {
+		cause = errors.New("no error returned")
+	}
+
+	h.res.abandonUpload(ctx, fmt.Errorf("checkpoint abandoned before its upload started: %w", cause))
+}
+
 // snapshotResult holds the data produced by snapshotAndCacheSandbox that
 // callers need to start the background remote storage upload.
 type snapshotResult struct {
 	meta               metadata.Template
 	schedulingMetadata *orchestrator.SchedulingMetadata
 	upload             *sandbox.Upload
-	completeUpload     func(ctx context.Context, uploadErr error)
+	// completeUpload finishes the upload, reporting it landed or failed, and
+	// only uploadSnapshotAsync, whose pause or checkpoint the API already
+	// relies on, calls it with an error. abandonUpload ends an upload whose
+	// snapshot nothing will read — one that will never run, or a checkpoint's
+	// that failed: it fails the upload's waiters with the error and reports it
+	// abandoned. Both return the template cache pin.
+	completeUpload func(ctx context.Context, uploadErr error)
+	abandonUpload  func(ctx context.Context, err error)
 	// rootfsDiff is the snapshot's rootfs diff. With deferred export it is a
 	// promise-backed diff that resolves only once the background seal finishes,
 	// so the prefetch harvest waits on its CachePath before its throwaway resume
 	// (a warm resume reads the rootfs). Nil-safe callers only: always set here.
 	rootfsDiff build.Diff
+	// memoryDiff is the snapshot's memory diff. With the memfd background copy
+	// its CachePath resolves only once the copy has finished streaming into the
+	// build directory, which is when the capture's bytes are all on disk.
+	memoryDiff build.Diff
 	// objectMetadata is the storage object metadata the snapshot was uploaded
 	// with. The prefetch harvest reuses it verbatim when re-uploading the
 	// metadata object, so the two can never drift.
@@ -1370,10 +1961,14 @@ func (s *Server) snapshotAndCacheSandbox(
 	if err != nil {
 		return nil, fmt.Errorf("error snapshotting sandbox: %w", err)
 	}
+	// The prefetch writers rewrite the metafile from res.meta, so it must carry
+	// what Pause stamped (vCPU count, balloon mode), not the pre-pause copy.
+	meta = snapshot.Metadata
 
-	err = s.templateCache.AddSnapshot(
+	finishUpload, err := s.templateCache.AddSnapshot(
 		ctx,
 		meta.Template.BuildID,
+		snapshotLineage(buildOrigin, sbx.Template, maintainSandbox),
 		snapshot.MemorySnapshot.DiffHeader,
 		snapshot.RootfsDiffHeader,
 		snapshot.Snapfile,
@@ -1382,6 +1977,7 @@ func (s *Server) snapshotAndCacheSandbox(
 		snapshot.RootfsDiff,
 		snapshot.MemorySnapshot.ProvisionalDiffHeader,
 		snapshot.MemorySnapshot.ProvisionalDiff,
+		snapshot.MemorySnapshot.ProvisionalCreatedAt,
 		snapshot.MemorySnapshot.ProvisionalSwapDone,
 	)
 	if err != nil {
@@ -1397,7 +1993,7 @@ func (s *Server) snapshotAndCacheSandbox(
 
 	// Register the upload only after the snapshot is in the local cache, so a
 	// failed AddSnapshot doesn't leave an orphan future blocking re-registration.
-	upload, err := sandbox.NewUpload(ctx, s.uploads, snapshot, s.persistence, s.config.StorageConfig.CompressConfig, s.featureFlags, storage.UseCasePause, objectMetadata)
+	upload, err := sandbox.NewUpload(ctx, s.uploads, snapshot, s.persistence, s.config.StorageConfig.CompressConfig, s.featureFlags, storage.UseCasePause, objectMetadata, finishUpload)
 	if err != nil {
 		return nil, fmt.Errorf("register upload: %w", err)
 	}
@@ -1408,9 +2004,7 @@ func (s *Server) snapshotAndCacheSandbox(
 	// completeUpload don't drift if the flag flips mid-upload.
 	peerEnabled := s.featureFlags.BoolFlag(ctx, featureflags.PeerToPeerChunkTransferFlag)
 
-	completeUpload := func(ctx context.Context, uploadErr error) {
-		upload.Finish(ctx, uploadErr)
-
+	finishPeer := func(ctx context.Context, landed bool) {
 		if !peerEnabled {
 			return
 		}
@@ -1418,13 +2012,23 @@ func (s *Server) snapshotAndCacheSandbox(
 		// Only advertise the build as fully uploaded when it actually landed.
 		// On abandon/failure the bytes are not in storage, so marking it would
 		// make chunk-serving falsely report "already uploaded".
-		if uploadErr == nil {
+		if landed {
 			s.uploadedBuilds.Set(meta.Template.BuildID, struct{}{}, ttlcache.DefaultTTL)
 		}
 
 		if err := s.peerRegistry.Unregister(ctx, meta.Template.BuildID); err != nil {
 			logger.L().Warn(ctx, "failed to unregister peer address from routing", zap.String("build_id", meta.Template.BuildID), zap.Error(err))
 		}
+	}
+
+	completeUpload := func(ctx context.Context, uploadErr error) {
+		upload.Finish(ctx, uploadErr)
+		finishPeer(ctx, uploadErr == nil)
+	}
+
+	abandonUpload := func(ctx context.Context, err error) {
+		upload.Abandon(ctx, err)
+		finishPeer(ctx, false)
 	}
 
 	if peerEnabled {
@@ -1438,12 +2042,25 @@ func (s *Server) snapshotAndCacheSandbox(
 		schedulingMetadata:   snapshot.SchedulingMetadata,
 		upload:               upload,
 		completeUpload:       completeUpload,
+		abandonUpload:        abandonUpload,
 		objectMetadata:       objectMetadata,
 		filesystemOnly:       filesystemOnly,
 		rootfsDiff:           snapshot.RootfsDiff,
+		memoryDiff:           snapshot.MemorySnapshot.Diff,
 		memoryExportDeferred: snapshot.MemoryExportDeferred,
 		waitMemorySealed:     snapshot.WaitMemorySealed,
 	}, nil
+}
+
+// snapshotLineage describes the snapshot of a sandbox running on predecessor.
+// The operation leaves predecessor behind unless it maintains the sandbox, as
+// an in-place checkpoint does.
+func snapshotLineage(origin storage.ObjectOrigin, predecessor sbxtemplate.Template, maintainSandbox bool) sbxtemplate.SnapshotLineage {
+	return sbxtemplate.SnapshotLineage{
+		Origin:              origin,
+		Predecessor:         predecessor.Files().CacheKey(),
+		AbandonsPredecessor: !maintainSandbox,
+	}
 }
 
 // uploadSnapshotAsync uploads snapshot files to remote storage in the
@@ -1455,8 +2072,10 @@ func (s *Server) uploadSnapshotAsync(ctx context.Context, sbx *sandbox.Sandbox, 
 	// rather than cancelling, so an in-flight snapshot isn't dropped on restart.
 	uploadCtx := context.WithoutCancel(ctx)
 
+	releaseWork := s.info.TrackWork()
 	s.uploadsInFlight.Add(1)
 	s.uploadsWG.Go(func() {
+		defer releaseWork()
 		defer s.uploadsInFlight.Add(-1)
 
 		spanCtx, span := tracer.Start(uploadCtx, "upload snapshot")
@@ -1477,7 +2096,10 @@ func (s *Server) uploadSnapshotAsync(ctx context.Context, sbx *sandbox.Sandbox, 
 		)
 		if err != nil {
 			sbxlogger.I(sbx).Error(spanCtx, "snapshot upload did not durably land", zap.Error(err))
-			s.uploadFailedCounter.Add(spanCtx, 1, metric.WithAttributes(attribute.Bool("fs_only", res.filesystemOnly)))
+			s.uploadFailedCounter.Add(spanCtx, 1, metric.WithAttributes(
+				attribute.Bool("fs_only", res.filesystemOnly),
+				telemetry.WithTeamID(sbx.Runtime.TeamID),
+			))
 		} else {
 			sbxlogger.I(sbx).Info(spanCtx, "snapshot finished uploading successfully")
 		}
@@ -1486,21 +2108,79 @@ func (s *Server) uploadSnapshotAsync(ctx context.Context, sbx *sandbox.Sandbox, 
 	})
 }
 
-// setupSandboxLifecycle sets up the cleanup goroutine for a sandbox.
-// markSandboxLive promotes a resumed sandbox to the live registry and starts its
-// health checks. It is the counterpart to WithDeferredLiveRegistration (resume)
-// and RebootSandbox's deferMarkRunning: callers on the resume-time upgrade path
-// resume with routing deferred and call this only after maybeUpgradeEnvd has
-// completed its post-/init, so the sandbox never appears in routing during the
-// upgrade's pre-init auth window. Idempotent — MarkRunning is InsertIfAbsent.
-func (s *Server) markSandboxLive(ctx context.Context, sbx *sandbox.Sandbox) {
-	s.sandboxFactory.Sandboxes.MarkRunning(ctx, sbx)
-
-	go sbx.Checks.Start(context.WithoutCancel(ctx))
+type sandboxTeardown interface {
+	Stop(ctx context.Context) error
+	Wait(ctx context.Context) error
+	Close(ctx context.Context) error
 }
 
-func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox) {
+func stopAndCloseSandbox(ctx context.Context, sbx sandboxTeardown) error {
+	ctx = context.WithoutCancel(ctx)
+	stopErr := sbx.Stop(ctx)
+	// Stop only signals UFFD; drain must wait for its exit.
+	waitErr := sbx.Wait(ctx)
+	closeErr := sbx.Close(ctx)
+
+	return errors.Join(stopErr, waitErr, closeErr)
+}
+
+func (s *Server) finishSandboxStart(ctx context.Context, reservation *sandbox.Reservation, rollback *sandbox.Cleanup, operationErr error) {
+	if operationErr == nil || rollback == nil {
+		reservation.Release()
+
+		return
+	}
+
+	releaseWork := s.info.TrackWork()
 	go func() {
+		defer releaseWork()
+		defer reservation.Release()
+		ctx := context.WithoutCancel(ctx)
+		if err := rollback.Run(ctx); err != nil {
+			telemetry.ReportCriticalError(ctx, "failed to clean up sandbox start", err)
+		}
+	}()
+}
+
+func (s *Server) markSandboxLive(ctx context.Context, sbx *sandbox.Sandbox, reservation *sandbox.Reservation) error {
+	if err := reservation.MarkRunning(ctx, sbx); err != nil {
+		sbx.SetStopReason(sandbox.StopReasonRegistrationFailed)
+
+		return err
+	}
+
+	go sbx.Checks.Start(context.WithoutCancel(ctx))
+
+	return nil
+}
+
+func (s *Server) sandboxAlreadyRunning(ctx context.Context, sandboxID, executionID string, cause error) error {
+	telemetry.ReportCriticalError(ctx, "refusing to create sandbox: its ID is already taken on this node", cause,
+		telemetry.WithSandboxID(sandboxID),
+		attribute.String("requested_execution_id", executionID),
+	)
+
+	return status.Errorf(codes.AlreadyExists, "sandbox '%s' is already running on this node: %s", sandboxID, cause)
+}
+
+// setupSandboxLifecycle starts the goroutine that waits for the sandbox to end
+// and tears it down. releaseTemplate lifts this sandbox's pin on its template;
+// it runs after the sandbox is closed, on every ending (kill, pause, checkpoint
+// hand-off, crash), and is idempotent so the caller's error rollback may also
+// hold a reference to it.
+func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox, releaseTemplate func()) {
+	s.sandboxFactory.Sandboxes.TrackLifecycle(ctx, sbx)
+	releaseWork := s.info.TrackWork()
+	go func() {
+		defer releaseWork()
+
+		// Deferred so it runs only after the body below has closed the sandbox:
+		// the template must not become evictable while the sandbox is still
+		// using it, since eviction deletes the snapfile.
+		if releaseTemplate != nil {
+			defer releaseTemplate()
+		}
+
 		ctx, childSpan := tracer.Start(context.WithoutCancel(ctx), "stop sandbox-lifecycle", trace.WithNewRoot())
 		defer childSpan.End()
 
@@ -1514,7 +2194,7 @@ func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox
 		// A guest that dies cleanly leaves no wait error, so the log above
 		// misses it.
 		if sbx.GetStopReason() == sandbox.StopReasonCrashed {
-			sbxlogger.I(sbx).Error(ctx, "sandbox crashed", zap.Error(waitErr))
+			s.recordCrash(ctx, sbx, waitErr)
 		}
 
 		// Every ending — kill, pause, checkpoint hand-off, crash — passes here.
@@ -1536,7 +2216,10 @@ func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox
 
 // stopSandboxAsync stops the sandbox in a background goroutine.
 func (s *Server) stopSandboxAsync(ctx context.Context, sbx *sandbox.Sandbox) {
+	releaseWork := s.info.TrackWork()
 	go func() {
+		defer releaseWork()
+
 		ctx, childSpan := tracer.Start(context.WithoutCancel(ctx), "stop sandbox-async", trace.WithNewRoot())
 		defer childSpan.End()
 
@@ -1551,8 +2234,8 @@ func (s *Server) stopSandboxAsync(ctx context.Context, sbx *sandbox.Sandbox) {
 func (s *Server) publishSandboxEvent(ctx context.Context, sbx *sandbox.Sandbox, eventType string) {
 	teamID, buildId, eventsTTLDays, eventData := s.prepareSandboxEventData(ctx, sbx)
 
-	go s.sbxEventsService.Publish(
-		context.WithoutCancel(ctx),
+	s.publishEventAsync(
+		ctx,
 		teamID,
 		events.SandboxEvent{
 			Version:   events.StructureVersionV2,
@@ -1571,6 +2254,95 @@ func (s *Server) publishSandboxEvent(ctx context.Context, sbx *sandbox.Sandbox, 
 	)
 }
 
+func (s *Server) publishEventAsync(ctx context.Context, teamID uuid.UUID, event events.SandboxEvent) {
+	releaseWork := s.info.TrackWork()
+	go func() {
+		defer releaseWork()
+
+		s.sbxEventsService.Publish(context.WithoutCancel(ctx), teamID, event)
+	}()
+}
+
+// recordUpgradePhase records one live-upgrade phase's wall-time. The phases hold
+// independent budgets, so the combined upgrade.duration histogram cannot say
+// which of them a slow upgrade is approaching; this can. result is the phase's
+// own outcome, not the upgrade's.
+//
+// It covers `resolve` as well as the two budgeted phases, because resolve is
+// where the target's version is probed and that probe is the largest cost on a
+// cold node: exec'ing the binary off the gcsfuse mount demand-pages it in small
+// reads, which costs far more than reading the same bytes sequentially. It also
+// sits BEFORE the combined histogram starts timing, so without
+// this phase the dominant cost of a cold upgrade appears in no metric at all.
+func (s *Server) recordUpgradePhase(ctx context.Context, teamID, phase, result string, start time.Time) {
+	s.envdUpgradePhaseDuration.Record(ctx, time.Since(start).Milliseconds(),
+		metric.WithAttributes(
+			attribute.String("phase", phase),
+			attribute.String("result", result),
+			telemetry.WithTeamID(teamID),
+		))
+}
+
+// resolvePhaseResult labels the resolve phase, and reports whether it is worth
+// recording at all.
+//
+// recorded is false for the reasons the resolver returns WITHOUT calling
+// getVersion: those samples time a string comparison and a stat, and mixing them
+// with the ones that paid for an exec off the mount makes the distribution
+// meaningless. Every reason that did probe -- or that deliberately did not, having
+// consulted the cache -- is labelled as itself, so the series can be cut by what
+// actually happened.
+func resolvePhaseResult(path, reason string) (string, bool) {
+	if path != "" {
+		return "success", true
+	}
+	switch reason {
+	case "off", "not_staged", "invalid_target":
+		// Returned before getVersion; nothing was measured.
+		return "", false
+	default:
+		// same_version, downgrade, getversion_failed all probed; binary_not_cached
+		// consulted the cache and deliberately did not; source_stalled waited on the
+		// mount up to its stat budget.
+		return reason, true
+	}
+}
+
+// phaseResult labels a phase by whether it errored.
+func phaseResult(err error) string {
+	if err != nil {
+		return "failed"
+	}
+
+	return "success"
+}
+
+// recordDeliveryPhase records the delivery phase. It takes CallEnvdUpgrade's two
+// return values rather than a label, so the delivery phase cannot be recorded
+// with the two-outcome phaseResult -- which read an expired budget as a success
+// and hid the one stall this phase was added to expose. The mistake is now a
+// compile error rather than something a test has to catch.
+func (s *Server) recordDeliveryPhase(ctx context.Context, teamID string, execConfirmed bool, err error, start time.Time) {
+	s.recordUpgradePhase(ctx, teamID, "deliver", deliveryResult(execConfirmed, err), start)
+}
+
+// deliveryResult labels the delivery phase, which has three outcomes rather than
+// two. CallEnvdUpgrade returns a nil error when the deadline fired or the parent
+// was cancelled -- deliberately, because envd may still be mid-handover, so the
+// caller must keep a follow-up not-ready recoverable. Labelling that "success"
+// would hide the exact stall this phase exists to expose: a delivery that ran out
+// its budget looks identical to one that finished.
+func deliveryResult(execConfirmed bool, err error) string {
+	switch {
+	case err != nil:
+		return "failed"
+	case !execConfirmed:
+		return "unconfirmed"
+	default:
+		return "success"
+	}
+}
+
 // maybeUpgradeEnvd is the orchestrator's resume-time envd live-upgrade trigger
 // . At resume it asks EnvdUpgradeTargetFlag whether the sandbox's envd
 // should be swapped for a newer node-local build and, if so, delivers that
@@ -1583,7 +2355,9 @@ func (s *Server) publishSandboxEvent(ctx context.Context, sbx *sandbox.Sandbox, 
 //
 // It returns whether an upgrade actually completed (for the resume-latency
 // label) and emits the rollout metrics: orchestrator.envd.upgrade.attempts
-// {result,from_version,to_version}, .duration{result}, and .gated{reason}.
+// {result,from_version,to_version}, .duration{result}, .gated{reason}, and
+// .phase.duration{phase,result}, which splits the duration into the resolve,
+// deliver and ready phases so a stalled delivery is not read as a slow probe.
 func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (upgraded bool, fatalErr error) {
 	// Decide, label, and confirm against the version the running envd actually
 	// reports (captured on the resume-path /init) — not the template built-with,
@@ -1615,22 +2389,110 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 				attribute.String("to_version", toVersion),
 			))
 			s.envdUpgradeDuration.Record(ctx, time.Since(start).Milliseconds(),
-				metric.WithAttributes(attribute.String("result", result)))
+				metric.WithAttributes(
+					attribute.String("result", result),
+					telemetry.WithTeamID(sbx.Runtime.TeamID),
+				))
 		}
 	}()
 
-	// Flag-driven resolver, keyed on the LIVE version. "" path => no upgrade, with
-	// a reason: off / same_version are the expected per-resume no-op (a re-resume
-	// of an already-upgraded sandbox), deliberately not counted as noise; the rest
-	// (not_staged — e.g. a bad SHA / rubbish flag value, getversion_failed,
-	// downgrade) are misconfigurations worth a counted, logged signal so a broken
-	// target is distinguishable from "already current".
-	path, tv, reason := featureflags.ResolveEnvdUpgrade(ctx, s.featureFlags, from, s.config.HostEnvdPath, buildenvd.GetEnvdVersion)
+	// The flag first, and on its own: resolving a target stats up to three paths and execs
+	// the candidate for its version, and a cluster with the flag off must pay none of that.
+	target := featureflags.EnvdUpgradeTarget(ctx, s.featureFlags)
+	if featureflags.EnvdUpgradeTargetDisabled(target) {
+		return false, nil
+	}
+
+	// The *running* envd must already have the /upgrade endpoint + handover code,
+	// else the delivery POST would 404 or hang. Count the skip so a ramp can see
+	// the gated population.
+	//
+	// Ahead of the resolver because it is a comparison against a version already in memory.
+	// It also makes the counter mean what its comment says: behind the resolver, a not_staged
+	// node or an already-current sandbox pre-empted this label, so the "gated population" it
+	// claims to size was systematically undercounted. With the binary cache in front of the
+	// probe there is a second reason: resolving first would let a transient cache miss report
+	// binary_not_cached for this whole population, so the series an operator reads to size the
+	// too-old cohort would go to zero on a cold node while nothing about that cohort changed.
+	if ok, err := utils.IsGTEVersion(from, utils.MinEnvdVersionForUpgrade); err != nil || !ok {
+		s.envdUpgradeGated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", "old_envd")))
+
+		return false, nil
+	}
+
+	// Resolve the target: "" path => no upgrade, with a reason. off / same_version are the
+	// expected per-resume no-op (a re-resume of an already-upgraded sandbox), deliberately
+	// not counted as noise; the misconfigurations (not_staged — e.g. a bad SHA / rubbish flag
+	// value, invalid_target, getversion_failed, downgrade) are worth a counted, logged signal
+	// so a broken target is distinguishable from "already current". binary_not_cached is in
+	// the same set but is counted WITHOUT a line: it is this node's own expected state on a
+	// cold cache rather than anything an operator can fix, and it recurs on every resume
+	// until a warm lands -- see the case below.
+	//
+	// This has to precede the exec-context gate below, even though that gate needs nothing
+	// from it. The offline swap advances a sandbox's envd to the promoted binary at cold
+	// boot, so a large share of the fleet resolves to same_version — and those sandboxes are
+	// not gated by anything, they simply have nowhere to upgrade to. Declining them first
+	// would count every one of their resumes as an exec-context decline and make that
+	// counter a measure of the fleet rather than of the population the gate holds back.
+	//
+	// Probe the target's version through the node-local binary cache when
+	// enabled. Uncached, the probe is a fork+exec of a 13 MB binary on the gcsfuse
+	// mount, and it runs on every sampled resume before any decision is made. That
+	// is far more expensive than its size suggests on a cold node: exec
+	// demand-pages the binary in small reads, each one a round trip to the mount,
+	// which is more than an order of magnitude slower than reading the same bytes
+	// sequentially off a cold mount.
+	//
+	// So a hit answers from a local copy, and a MISS DEFERS THE UPGRADE rather than
+	// reading the source. That is the point of the cache and not a limitation of
+	// it: the probe carries no budget of its own beyond the resume's own deadline,
+	// and delivery carries 30 s, so an upgrade that reaches the mount can add tens
+	// of seconds to a resume a customer is waiting on. The warm lands in the
+	// background, the upgrade is idempotent and re-fires on the next resume, so
+	// deferring costs one cycle. Off, it is the direct fork+exec, unchanged.
+	resolveStart := time.Now()
+	getVersion := buildenvd.GetEnvdVersion
+	var binCache *envdbin.Resolver
+	cache := s.sandboxFactory.EnvdBinCache()
+	// The candidate checks stat the mount before any version probe, so they are
+	// bounded whether or not the cache is engaged.
+	stat := cache.BoundedStat
+	// The nil check is not redundant with the flag: a Factory built as a struct
+	// literal (as tests do) has no cache.
+	if cache != nil && s.featureFlags.BoolFlag(ctx, featureflags.EnvdBinaryCacheFlag) {
+		binCache = envdbin.NewResolver(cache, envdbin.OpLive)
+		getVersion = binCache.Version
+		stat = binCache.Stat
+	}
+
+	path, tv, reason := featureflags.ResolveEnvdUpgrade(ctx, target, from, s.config.HostEnvdPath, getVersion, stat)
+	reason = envdbin.GatedReason(reason, binCache.DeferralOutcome())
+	// Labelled by the resolver's own reason, not by success/no_upgrade, and skipped
+	// entirely where the resolver returned before probing anything.
+	//
+	// This histogram exists to expose the version probe, which is the dominant cost
+	// of a cold upgrade and is invisible to the combined duration histogram. A
+	// success/no_upgrade label defeats that: "off" and "not_staged" return before
+	// getVersion is called and so measure nothing, while "same_version" -- the
+	// steady-state majority -- returns after paying for it in full. Averaged
+	// together the series is dominated by samples where no probe ran, and cannot
+	// answer the one question it was added for.
+	if resolveResult, recorded := resolvePhaseResult(path, reason); recorded {
+		s.recordUpgradePhase(ctx, sbx.Runtime.TeamID, "resolve", resolveResult, resolveStart)
+	}
 	toVersion = tv
 	if path == "" {
 		switch reason {
 		case "off", "same_version":
 			// expected no-op — not counted
+		case envdbin.ReasonNotCached, featureflags.ReasonSourceStalled:
+			// Counted, because it is the cost side of gating on the cache, but not
+			// warned: on a node that has just booted this is the expected state for
+			// one resume, and the background warm clears it. A stall is counted
+			// under its own reason and warned once per path per window by the
+			// cache, not here on every resume.
+			s.envdUpgradeGated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 		default:
 			s.envdUpgradeGated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 			sbxlogger.I(sbx).Warn(ctx, "envd auto-upgrade: target not resolved",
@@ -1640,11 +2502,65 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 		return false, nil
 	}
 
-	// The *running* envd must already have the /upgrade endpoint + handover code,
-	// else the delivery POST would 404 or hang. Count the skip so a ramp can see
-	// the gated population.
-	if ok, err := utils.IsGTEVersion(from, utils.MinEnvdVersionForUpgrade); err != nil || !ok {
-		s.envdUpgradeGated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", "old_envd")))
+	// Never replace the envd process without a user to re-send afterwards. The new image
+	// rebuilds its exec context from scratch, so a post-upgrade /init carrying nothing
+	// leaves it on the compiled-in fallback for the rest of the sandbox's life —
+	// silently, with a 200 on every RPC.
+	//
+	// This is not defensive. The metadata cannot establish what a build sent whenever it
+	// records anything other than config.TemplateDefaultUser (see
+	// metadata.Template.EnvdDefaultUser), and a template that named its own user is in
+	// exactly that set while genuinely serving that name. Replacing its process is what
+	// would drop it to the fallback.
+	//
+	// The handover blob carries the identity independently, which is what will retire this
+	// gate. The condition is per-swap and not fleet-wide: what matters is the envd THIS
+	// sandbox is running, never whether every sandbox has the field. Do not read it as the
+	// latter and conclude the gate is permanent — a snapshot paused before the field
+	// existed keeps that envd in its RAM for as long as it stays paused, so "every sandbox
+	// has it" has no completion date, while "this one does" resolves on its own for
+	// anything that cold-boots.
+	//
+	// It retires itself per swap: the resume's own /init precedes this call and returns
+	// X-Envd-Defaults, whose fallback field is !UserDelivered in the running process, so a
+	// sandbox whose envd is holding a delivered identity is no longer declined. No release
+	// number is involved in either term — the header answers the question from the running
+	// process, and a constant guessed now would rot.
+	if reason := envdUpgradeDeclineReason(
+		utils.DerefOrDefault(sbx.Config.Envd.DefaultUser, ""),
+		sbx.EnvdWorkdirWithheld(),
+		envdPreservesExecContext(sbx.EnvdReportedDefaults()),
+	); reason != "" {
+		s.envdUpgradeGated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+		// Counted, not logged, and that is the whole of the volume control. Both reasons are
+		// stable properties of the template and the running envd, so a per-resume warn
+		// repeats for the whole life of every sandbox in a population that is expected
+		// rather than broken -- and there is nowhere to dedupe it: a Sandbox is constructed
+		// fresh on every resume, so per-instance state cannot span two of them. The sibling
+		// old_envd gate above is counter-only for the same reason. Naming the templates the
+		// gate holds back needs a signal that outlives one resume, which this is not.
+
+		return false, nil
+	}
+
+	// Resolved before the attempt is marked, so a refusal is counted as the
+	// deferral it is rather than as an upgrade that was tried and failed. Delivery
+	// hands back the very bytes the resolver decided on: when the cache holds them
+	// this reads local disk instead of streaming 13 MB off gcsfuse, which is what
+	// pushed delivery past its budget on a contended node, and it removes the
+	// second independent read of the source, so a promotion landing mid-upgrade can
+	// no longer deliver a binary whose version was never the one recorded.
+	deliverPath, deliverable := binCache.SourcePath(ctx, path)
+	if !deliverable {
+		// The copy that carried the resolved version is gone, so nothing on local
+		// disk holds the bytes that version describes. Skip rather than read the
+		// source: that would be the mount cost this cache exists to avoid,
+		// delivering bytes whose version was never verified against them. Nothing
+		// has been sent to the guest, so this is a deferral -- counted beside the
+		// other reasons a resume chose not to upgrade -- and the next resume retries.
+		s.envdUpgradeGated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", envdbin.ReasonCopyVanished)))
+		sbxlogger.I(sbx).Warn(ctx, "envd auto-upgrade: cached binary went away after its version was resolved; deferring",
+			zap.String("from", from), zap.String("to", toVersion), zap.String("path", path))
 
 		return false, nil
 	}
@@ -1667,13 +2583,45 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 	)
 
 	sbxlogger.I(sbx).Info(upCtx, "envd auto-upgrade: delivering+triggering",
-		zap.String("from", from), zap.String("to", toVersion), zap.String("path", path))
+		zap.String("from", from), zap.String("to", toVersion), zap.String("path", path),
+		zap.String("bin_cache", string(binCache.Outcome())))
 
 	// Stream the new binary over the authenticated /upgrade endpoint (delivery
 	// + trigger in one call) and let envd same-PID re-exec into it. NB: not the
 	// build-time /files CopyFile path — a live, post-/init sandbox rejects that.
-	execConfirmed, err := sbx.CallEnvdUpgrade(upCtx, path, "/usr/bin/envd.next", deliverTimeout)
+	deliverStart := time.Now()
+	execConfirmed, err := sbx.CallEnvdUpgrade(upCtx, deliverPath, "/usr/bin/envd.next", deliverTimeout)
+	// A retired copy is a deferral, not a delivery, so it gets no phase sample:
+	// the open fails in microseconds, and a ~0 ms observation would drag down the
+	// quantiles of the histogram added to expose delivery STALLS -- while the
+	// attempts series deliberately records nothing for it, so deliver{failed}
+	// would also outnumber the attempts it is read against.
+	deferredCopyGone := binCache != nil && errors.Is(err, fs.ErrNotExist)
+	if !deferredCopyGone {
+		s.recordDeliveryPhase(ctx, sbx.Runtime.TeamID, execConfirmed, err, deliverStart)
+	}
 	if err != nil {
+		// A promotion can retire the copy between the resolver's stat and this
+		// open. Nothing reached the guest, so that is the same deferral the stat
+		// reports and not a failed delivery: labelling it delivery_failed would say
+		// the trigger failed when no byte was ever sent.
+		// Gated on the cache being ENGAGED, not just on the errno. With the flag off
+		// deliverPath is the source itself, so a genuinely missing promoted binary
+		// would take this branch: relabelled as a cache event that cannot happen
+		// without a cache, dropped from the attempts series, and demoted from Error
+		// to Warn. That is the flag-off path changing behaviour, which it must not.
+		if deferredCopyGone {
+			// Nothing was attempted, so the deferred recorder must not count an
+			// attempt or a duration for it -- that is what keeps the attempts series
+			// free of a population that delivered nothing.
+			attempted = false
+			s.envdUpgradeGated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", envdbin.ReasonCopyVanished)))
+			sbxlogger.I(sbx).Warn(upCtx, "envd auto-upgrade: cached binary went away before delivery; deferring",
+				zap.String("from", from), zap.String("to", toVersion), zap.String("path", path))
+
+			return false, nil
+		}
+
 		result = "delivery_failed"
 		span.RecordError(err)
 		sbxlogger.I(sbx).Error(upCtx, "envd auto-upgrade: trigger failed", zap.Error(err))
@@ -1692,10 +2640,13 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 	// exec'd envd never gets its auth/env restored). Version confirmation below
 	// then correctly distinguishes an actual exec from an untouched old envd.
 	readyCtx := context.WithoutCancel(upCtx)
-	if err := sbx.WaitForEnvd(readyCtx, sandbox.StartTypeResume, readyTimeout); err != nil {
+	readyStart := time.Now()
+	readyErr := sbx.WaitForEnvd(readyCtx, sandbox.StartTypeResume, readyTimeout)
+	s.recordUpgradePhase(ctx, sbx.Runtime.TeamID, "ready", phaseResult(readyErr), readyStart)
+	if readyErr != nil {
 		result = "not_ready"
-		span.RecordError(err)
-		sbxlogger.I(sbx).Error(upCtx, "envd auto-upgrade: envd not ready after upgrade", zap.Error(err))
+		span.RecordError(readyErr)
+		sbxlogger.I(sbx).Error(upCtx, "envd auto-upgrade: envd not ready after upgrade", zap.Error(readyErr))
 
 		if !execConfirmed {
 			// The delivery deadline fired without a confirmed exec — envd may
@@ -1711,7 +2662,7 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 		// WithAuthorization handover gate fail-closes every RPC. It can't be made
 		// both usable and secure without /init, so fail the resume (unrecoverable)
 		// rather than return a live-but-permanently-bricked sandbox.
-		return false, fmt.Errorf("envd live-upgrade left the sandbox uninitialized (post-upgrade /init failed): %w", err)
+		return false, fmt.Errorf("envd live-upgrade left the sandbox uninitialized (post-upgrade /init failed): %w", readyErr)
 	}
 
 	// Confirm by ground truth: the running envd must now report the target
@@ -1778,4 +2729,85 @@ func (s *Server) maybeUpgradeEnvd(ctx context.Context, sbx *sandbox.Sandbox) (up
 	}
 
 	return true, nil
+}
+
+// The gated reasons a live upgrade is declined. Named constants because they are dashboard
+// values a rollout reads, and separate values because they cost different things: one
+// protects an identity the host cannot reconstruct, the other a workdir it cannot prove.
+const (
+	envdUpgradeGateNoDefaultUser     = "no_default_user"
+	envdUpgradeGateUnprovableWorkdir = "unprovable_workdir"
+)
+
+// envdPreservesExecContext reports whether the running envd will carry its exec context
+// across its own replacement without the host re-sending anything.
+//
+// Both terms are required, and the second is not redundant. A reporting envd that was never
+// told a user writes NO defaults into the handover blob at all — handoverDefaults refuses to
+// pass the compiled-in fallback off as a delivered identity — so its blob would carry the
+// exec context no further than a silent envd's. Testing only for a reported header would let
+// that swap through.
+func envdPreservesExecContext(reported *sandbox.EnvdEffectiveDefaults) bool {
+	return reported != nil && !reported.Fallback
+}
+
+// envdUpgradeDeclineReason reports why a live envd upgrade must not be attempted, or "" when
+// it may proceed. One rule: never replace the process without being able to restore
+// everything it was serving.
+//
+// A pure function over the three facts it needs, so the policy and its emitted labels are
+// pinned by a test rather than only by the call site: the whole point of the gate is that
+// its failure mode is silent in both directions — let a swap through and the sandbox loses
+// state with a 200 on every RPC, decline one that could have proceeded and it simply never
+// upgrades, which nothing else reports.
+//
+// envdPreserves is a capability, not a value: the header and the handover blob's defaults
+// field ship in the same envd, so an envd that reports a delivered exec context is also one
+// whose blob carries it across the swap by itself. That is what makes BOTH rules
+// self-retiring — each declines only while the running envd cannot preserve the value without
+// help, never on the shape of the template alone, so no template is excluded permanently.
+func envdUpgradeDeclineReason(sentUser string, workdirWithheld, envdPreserves bool) string {
+	// Both terms, so this rule retires itself per swap exactly as the workdir rule does. The
+	// host having nothing to send is not sufficient to decline: once the running envd
+	// reports a delivered identity, its blob restores that identity across the execve, and
+	// the post-upgrade /init carrying an empty user is a no-op in SetData rather than an
+	// overwrite. Declining on the sent user alone would exclude every template recording a
+	// non-default user for as long as it stays a memory snapshot, which is stricter than the
+	// mechanism needs and has no end date.
+	//
+	// It makes the guest's own report load-bearing, and the exposure is bounded to the
+	// sandbox that lies: a guest reporting fallback=false when it was never told gets a swap
+	// whose blob then carries nothing, so it loses its own default user. It cannot reach any
+	// other sandbox, and the default user is not a privilege boundary — any holder of the
+	// sandbox token can already run as any user that exists in the guest.
+	if sentUser == "" && !envdPreserves {
+		return envdUpgradeGateNoDefaultUser
+	}
+
+	// A recorded workdir that was not re-sent lives only in the process being replaced,
+	// and the metadata cannot establish it (finalize sends it above the template version
+	// gate and nothing below it, and that version is not in the snapshot), so nothing can
+	// put it back afterwards. Declining keeps it; upgrading trades it for a version bump.
+	if workdirWithheld && !envdPreserves {
+		return envdUpgradeGateUnprovableWorkdir
+	}
+
+	return ""
+}
+
+// filesystemOnlyDisabledStatus is the flag refusal with a typed detail, so the
+// API can answer it as its own pre-flight does instead of a generic failure
+// when the two flag evaluations disagree.
+func filesystemOnlyDisabledStatus(sandboxID string) *status.Status {
+	st := status.Newf(codes.FailedPrecondition, "filesystem-only checkpoint of sandbox '%s' is disabled", sandboxID)
+	withDetails, err := st.WithDetails(&orchestrator.UserError{
+		Code:       orchestrator.UserErrorCode_FILESYSTEM_ONLY_CHECKPOINT_DISABLED,
+		Message:    st.Message(),
+		HttpStatus: http.StatusBadRequest,
+	})
+	if err != nil {
+		return st
+	}
+
+	return withDetails
 }

@@ -18,14 +18,20 @@ func TestResolveEnvdUpgradePath(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	promoted := filepath.Join(dir, "envd")       // HOST_ENVD_PATH
-	shaBin := filepath.Join(dir, "envd.1f95888") // versioned binary
+	promoted := filepath.Join(dir, "envd")         // HOST_ENVD_PATH
+	shaBin := filepath.Join(dir, "envd.1f95888")   // legacy SHA-named binary, flat layout
+	verBin := filepath.Join(dir, "envd.v0.7.1")    // version-named binary, flat layout
+	nestedBin := filepath.Join(dir, "v0.8.0/envd") // versioned binary, release-bucket layout
 	require.NoError(t, os.WriteFile(promoted, []byte("x"), 0o755))
 	require.NoError(t, os.WriteFile(shaBin, []byte("x"), 0o755))
+	require.NoError(t, os.WriteFile(verBin, []byte("x"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(nestedBin), 0o755))
+	require.NoError(t, os.WriteFile(nestedBin, []byte("x"), 0o755))
 
-	// Version map: promoted binary is 0.6.12, the SHA binary is 0.7.0. An
-	// unknown path returns an error (unreadable binary).
-	versions := map[string]string{promoted: "0.6.12", shaBin: "0.7.0"}
+	// Version map: promoted binary is 0.6.12, the SHA binary is 0.7.0, the
+	// flat version-named binary is 0.7.1, the nested release binary is 0.8.0.
+	// An unknown path returns an error (unreadable binary).
+	versions := map[string]string{promoted: "0.6.12", shaBin: "0.7.0", verBin: "0.7.1", nestedBin: "0.8.0"}
 	getVersion := func(_ context.Context, path string) (string, error) {
 		v, ok := versions[path]
 		if !ok {
@@ -50,6 +56,8 @@ func TestResolveEnvdUpgradePath(t *testing.T) {
 		{"sha, exists and newer -> sha path", "1f95888", "0.6.11", shaBin, "0.7.0", ""},
 		{"sha, same version -> empty", "1f95888", "0.7.0", "", "", "same_version"},
 		{"sha, missing binary -> not_staged", "deadbee", "0.6.11", "", "", "not_staged"},
+		{"version, exists and newer -> version path", "v0.7.1", "0.7.0", verBin, "0.7.1", ""},
+		{"version, missing binary -> not_staged", "v0.9.9", "0.6.11", "", "", "not_staged"},
 		// Upgrade-only: an older staged target must not trigger a downgrade.
 		{"sha, older target -> downgrade refused", "1f95888", "0.8.0", "", "", "downgrade"},
 		{"promoted, older target -> downgrade refused", "promoted", "0.7.0", "", "", "downgrade"},
@@ -57,13 +65,20 @@ func TestResolveEnvdUpgradePath(t *testing.T) {
 		// joined into a path (no traversal out of the staging dir / arbitrary exec).
 		{"target with .. -> invalid_target", "../../etc/passwd", "0.6.11", "", "", "invalid_target"},
 		{"target with slash -> invalid_target", "sub/envd", "0.6.11", "", "", "invalid_target"},
-		{"target with dot -> invalid_target", "1f95888.", "0.6.11", "", "", "invalid_target"},
+		{"target with leading dot -> invalid_target", ".hidden", "0.6.11", "", "", "invalid_target"},
+		{"target starting with dot -> invalid_target", ".v0.7.0", "0.6.11", "", "", "invalid_target"},
+		// Dotted release names are valid targets; an unstaged one is not_staged.
+		{"release target, nested layout -> nested path", "v0.8.0", "0.6.11", nestedBin, "0.8.0", ""},
+		{"release target, not staged", "v9.9.9", "0.6.11", "", "", "not_staged"},
+		// Hyphens are admitted (prerelease names like v0.7.0-rc1), so a dashed
+		// target that isn't staged is not_staged, not invalid_target.
+		{"dashed release target, not staged", "v0.7.0-rc1", "0.6.11", "", "", "not_staged"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			gotPath, gotVersion, gotReason := resolveEnvdUpgradePath(t.Context(), tt.target, tt.builtWith, promoted, getVersion)
+			gotPath, gotVersion, gotReason := resolveEnvdUpgradePath(t.Context(), tt.target, tt.builtWith, promoted, getVersion, nil)
 			assert.Equal(t, tt.wantPath, gotPath)
 			assert.Equal(t, tt.wantVersion, gotVersion)
 			assert.Equal(t, tt.wantReason, gotReason)
@@ -84,8 +99,38 @@ func TestResolveEnvdUpgradePath_VersionError(t *testing.T) {
 		return "", assert.AnError
 	}
 
-	gotPath, gotVersion, gotReason := resolveEnvdUpgradePath(t.Context(), "promoted", "0.6.11", promoted, getVersion)
+	gotPath, gotVersion, gotReason := resolveEnvdUpgradePath(t.Context(), "promoted", "0.6.11", promoted, getVersion, nil)
 	assert.Empty(t, gotPath)
 	assert.Empty(t, gotVersion)
 	assert.Equal(t, "getversion_failed", gotReason)
+}
+
+// The cache's delivery refusal — an engaged resolver holding no entry for the
+// path — is unreachable only while this resolution asks for the version exactly
+// once, on the string it goes on to return: a lookup that hit here cannot miss at
+// delivery time. Nothing else pins that. A second call, or a normalisation
+// applied to the returned path but not to the probed one, would put a mount read
+// back on the resume path and deliver bytes whose version was never verified,
+// with no other test failing.
+func TestTheUpgradeResolutionProbesExactlyOnceOnThePathItReturns(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	host := filepath.Join(dir, "envd")
+	require.NoError(t, os.WriteFile(host, []byte("binary"), 0o755))
+
+	var asked []string
+	getVersion := func(_ context.Context, path string) (string, error) {
+		asked = append(asked, path)
+
+		return "0.7.0", nil
+	}
+
+	path, version, reason := resolveEnvdUpgradePath(t.Context(), "promoted", "0.6.0", host, getVersion, nil)
+
+	require.Empty(t, reason)
+	require.Equal(t, "0.7.0", version)
+	require.Len(t, asked, 1, "exactly one probe, or the delivery refusal becomes reachable")
+	require.Equal(t, path, asked[0],
+		"the version must be probed on the very string the caller later delivers")
 }

@@ -21,9 +21,13 @@ import (
 	"github.com/e2b-dev/infra/packages/envd/internal/execcontext"
 	"github.com/e2b-dev/infra/packages/envd/internal/host"
 	"github.com/e2b-dev/infra/packages/envd/internal/logs"
+	"github.com/e2b-dev/infra/packages/envd/internal/logs/exporter"
 	"github.com/e2b-dev/infra/packages/envd/internal/permissions"
 	publicport "github.com/e2b-dev/infra/packages/envd/internal/port"
+	"github.com/e2b-dev/infra/packages/envd/internal/reaper"
+	"github.com/e2b-dev/infra/packages/envd/internal/reexec"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/cgroups"
+	"github.com/e2b-dev/infra/packages/envd/internal/services/cpus"
 	filesystemRpc "github.com/e2b-dev/infra/packages/envd/internal/services/filesystem"
 	processRpc "github.com/e2b-dev/infra/packages/envd/internal/services/process"
 	"github.com/e2b-dev/infra/packages/envd/internal/utils"
@@ -44,10 +48,6 @@ const (
 	// /init to thaw it. Comfortably past the orchestrator's upgrade readiness
 	// budget, so it only fires when that /init genuinely never arrives.
 	handoverFallbackThawTimeout = 60 * time.Second
-
-	// This is the default user used in the container if not specified otherwise.
-	// It should be always overridden by the user in /init when building the template.
-	defaultUser = "root"
 
 	kilobyte = 1024
 	megabyte = 1024 * kilobyte
@@ -156,6 +156,7 @@ func withCORS(h http.Handler) http.Handler {
 }
 
 func main() {
+	reexec.Main()
 	parseFlags()
 
 	if versionFlag {
@@ -184,7 +185,7 @@ func run() error {
 	}
 
 	defaults := &execcontext.Defaults{
-		User:    defaultUser,
+		User:    execcontext.BuiltinDefaultUser,
 		EnvVars: utils.NewEnvVars(),
 	}
 	isFCBoolStr := strconv.FormatBool(!isNotFC)
@@ -199,7 +200,14 @@ func run() error {
 		go host.PollForMMDSOpts(ctx, mmdsChan, defaults.EnvVars)
 	}
 
-	l := logs.NewLogger(ctx, !isNotFC, verbose, mmdsChan)
+	logFlusher := api.NewNoopLogFlusher()
+	var logWriters []io.Writer
+	if !isNotFC {
+		logExporter := exporter.NewHTTPLogsExporter(ctx, mmdsChan)
+		logWriters = append(logWriters, logExporter)
+		logFlusher = logExporter
+	}
+	l := logs.NewLogger(verbose, logWriters...)
 
 	m := chi.NewRouter()
 
@@ -219,6 +227,17 @@ func run() error {
 	// HTTP API (/freeze, /unfreeze, /init thaw) so every freeze/unfreeze caller
 	// serializes on a single lock.
 	workloadFreezer := cgroups.NewWorkloadFreezer(cgroupManager)
+	// Backstop for a freeze that never gets its thaw -- an orchestrator that resumes and
+	// never calls /init, or a thaw that fails outright. Without it such a guest stays
+	// frozen for the rest of its life.
+	workloadFreezer.SetThawWatchdog(cgroups.DefaultThawWatchdogWindow, func(res cgroups.ThawResult, err error) {
+		e := l.Warn().Int("thawed", res.Thawed).Int("visited", res.Visited).
+			Int("failed", res.Failed).Bool("truncated", res.Truncated)
+		if err != nil {
+			e = e.Err(err)
+		}
+		e.Msg("thaw watchdog fired: a freeze was never followed by a thaw")
+	})
 
 	processLogger := l.With().Str("logger", "process").Logger()
 	processService := processRpc.Handle(m, &processLogger, defaults, workloadFreezer)
@@ -259,7 +278,22 @@ func run() error {
 		}()
 	}
 
-	service := api.New(&envLogger, defaults, mmdsChan, isNotFC, workloadFreezer)
+	var helpers reaper.Registry
+	for _, pid := range handover.Helpers {
+		helpers.Adopt(int(pid))
+	}
+
+	var oomWatcher *host.OOMWatcher
+	cpuManager := cpus.NewNoopManager()
+	if !isNotFC {
+		oomWatcher = host.NewOOMWatcher(&envLogger)
+		go oomWatcher.Watch(ctx)
+
+		cpuManager = cpus.New(envLogger, &helpers)
+		cpuManager.Start(ctx)
+	}
+
+	service := api.New(&envLogger, defaults, mmdsChan, isNotFC, workloadFreezer, oomWatcher, cpuManager, logFlusher)
 	if resumeHandover {
 		// Restore the NFS mount ledger carried across the upgrade before the
 		// post-upgrade /init runs setupNFS, so it recognizes a still-live mount
@@ -308,7 +342,7 @@ func run() error {
 	defer portScanner.Destroy()
 
 	portLogger := l.With().Str("logger", "port-forwarder").Logger()
-	portForwarder := publicport.NewForwarder(&portLogger, portScanner, cgroupManager)
+	portForwarder := publicport.NewForwarder(&portLogger, portScanner, workloadFreezer)
 	if resumeHandover {
 		// Re-adopt the socats carried across the upgrade before the forwarder's
 		// first scan, so it recognizes already-forwarded ports instead of spawning
@@ -371,12 +405,14 @@ func run() error {
 		mounts := service.ExportMounts()
 		forwards, releaseForwards := portForwarder.ExportForwardsHold()
 		defer releaseForwards()
+		helperPids, releaseHelpers := helpers.ExportHold()
+		defer releaseHelpers()
 
 		// Upgrade only returns on failure — a successful execve replaces this
 		// process (and drops the held freeze/watcher/forward locks with it). On
 		// failure the OLD envd is still running; the deferred releases + thaw keep
 		// the old version serving rather than leaving the sandbox hung.
-		return processService.Upgrade(newBin, pkg.Version, watchers, mounts, forwards)
+		return processService.Upgrade(newBin, pkg.Version, watchers, mounts, forwards, helperPids)
 	}
 
 	// Orchestrator-driven trigger: authenticated POST /upgrade with the target

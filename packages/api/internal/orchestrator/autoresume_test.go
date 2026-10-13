@@ -33,7 +33,6 @@ func newTestAutoResumeOrchestrator(t *testing.T) *Orchestrator {
 			storage,
 			redisreservations.NewReservationStorage(client, storage.Notifier()),
 			sandbox.Callbacks{
-				AddSandboxToRoutingTable: func(context.Context, sandbox.Sandbox) {},
 				AsyncNewlyCreatedSandbox: func(context.Context, sandbox.Sandbox, sandbox.CreationMetadata) {},
 			},
 		),
@@ -44,6 +43,7 @@ func newTestAutoResumeOrchestrator(t *testing.T) *Orchestrator {
 func testSandboxForAutoResume(state sandbox.State) sandbox.Sandbox {
 	return sandbox.Sandbox{
 		SandboxID:         "test-sandbox",
+		ExecutionID:       uuid.NewString(),
 		TeamID:            uuid.New(),
 		StartTime:         time.Now(),
 		EndTime:           time.Now().Add(time.Hour),
@@ -61,10 +61,10 @@ func addSandbox(t *testing.T, o *Orchestrator, sbx sandbox.Sandbox) {
 
 func registerNode(o *Orchestrator, sbx sandbox.Sandbox, ip string) {
 	o.registerNode(&nodemanager.Node{
-		ID:               sbx.NodeID,
-		ClusterID:        sbx.ClusterID,
-		IPAddress:        ip,
-		NomadNodeShortID: "test-node",
+		ID:         sbx.NodeID,
+		ClusterID:  sbx.ClusterID,
+		IPAddress:  ip,
+		WorkloadID: "test-node",
 	})
 }
 
@@ -123,6 +123,31 @@ func TestHandleExistingSandboxAutoResume(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, handled)
 		assert.Equal(t, "10.0.0.2", nodeIP)
+	})
+
+	t.Run("pausing sandbox restored after a refusal routes to the running node", func(t *testing.T) {
+		t.Parallel()
+
+		o := newTestAutoResumeOrchestrator(t)
+		sbx := testSandboxForAutoResume(sandbox.StateRunning)
+		addSandbox(t, o, sbx)
+		registerNode(o, sbx, "10.0.0.3")
+
+		transition, alreadyDone, finish, err := o.sandboxStore.StartRemoving(t.Context(), sbx.TeamID, sbx.SandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionPause})
+		require.NoError(t, err)
+		require.False(t, alreadyDone)
+
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			_, err := o.sandboxStore.RestoreRunning(context.WithoutCancel(t.Context()), transition, 0)
+			assert.NoError(t, err)
+			finish(context.WithoutCancel(t.Context()), sandbox.ErrTransitionRestored)
+		}()
+
+		nodeIP, handled, err := o.HandleExistingSandboxAutoResume(t.Context(), sbx.TeamID, sbx.SandboxID, transition.Sandbox, time.Minute)
+		require.NoError(t, err)
+		assert.True(t, handled)
+		assert.Equal(t, "10.0.0.3", nodeIP)
 	})
 
 	t.Run("pausing sandbox returns still transitioning after retries", func(t *testing.T) {

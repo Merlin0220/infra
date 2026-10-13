@@ -77,7 +77,7 @@ func (b *EnsureFreeDiskBuilder) Hash(_ context.Context, sourceLayer phases.Layer
 	return cache.HashKeys(
 		sourceLayer.Hash,
 		resizeDiskName,
-		strconv.FormatInt(b.Config.DiskSizeMB, 10),
+		strconv.FormatInt(b.Config.FreeDiskSizeMB, 10),
 	), nil
 }
 
@@ -144,7 +144,8 @@ func (b *EnsureFreeDiskBuilder) Build(
 	defer cancel()
 
 	// Load the last user-step rootfs as the immutable parent of the resized layer.
-	sourceTemplate, err := b.templateCache.GetTemplate(ctx, sourceLayer.Metadata.Template.BuildID, false, true)
+	sourceTemplate, releaseTemplate, err := b.templateCache.GetTemplatePinned(ctx, sourceLayer.Metadata.Template.BuildID, false, true)
+	defer releaseTemplate()
 	if err != nil {
 		return phases.LayerResult{}, fmt.Errorf("get source template: %w", err)
 	}
@@ -160,7 +161,7 @@ func (b *EnsureFreeDiskBuilder) Build(
 	}
 
 	// Measure the source and produce either an empty or grown rootfs layer.
-	rootfsDiff, rootfsHeader, res, err := b.growAndExport(ctx, sourceRootfs, layerBuildID, b.Config.DiskSizeMB)
+	rootfsDiff, rootfsHeader, res, err := b.growAndExport(ctx, sourceRootfs, layerBuildID, b.Config.FreeDiskSizeMB)
 	if err != nil {
 		return phases.LayerResult{}, fmt.Errorf("resize disk: %w", err)
 	}

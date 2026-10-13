@@ -3,11 +3,13 @@
 package peerserver
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	templatemocks "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template/mocks"
@@ -27,9 +29,10 @@ func TestFileSource_Exists_FileOnDisk(t *testing.T) {
 	tmplMock.EXPECT().Snapfile().Return(f, nil)
 
 	cache := peerservermocks.NewMockCache(t)
-	cache.EXPECT().GetCachedTemplate("build-1").Return(tmplMock, true)
+	cache.EXPECT().LookupPinned(mock.Anything, "build-1").Return(tmplMock, func() {}, true)
 
-	src, err := ResolveBlob(cache, "build-1", storage.SnapfileName)
+	src, release, err := ResolveBlob(t.Context(), cache, "build-1", storage.SnapfileName)
+	defer release()
 	require.NoError(t, err)
 
 	exists, err := src.Exists(t.Context())
@@ -47,9 +50,10 @@ func TestFileSource_Exists_FileNotOnDisk(t *testing.T) {
 	tmplMock.EXPECT().Snapfile().Return(f, nil)
 
 	cache := peerservermocks.NewMockCache(t)
-	cache.EXPECT().GetCachedTemplate("build-1").Return(tmplMock, true)
+	cache.EXPECT().LookupPinned(mock.Anything, "build-1").Return(tmplMock, func() {}, true)
 
-	src, err := ResolveBlob(cache, "build-1", storage.SnapfileName)
+	src, release, err := ResolveBlob(t.Context(), cache, "build-1", storage.SnapfileName)
+	defer release()
 	require.NoError(t, err)
 
 	exists, err := src.Exists(t.Context())
@@ -70,15 +74,46 @@ func TestFileSource_Stream_FileOnDisk(t *testing.T) {
 	tmplMock.EXPECT().Snapfile().Return(f, nil)
 
 	cache := peerservermocks.NewMockCache(t)
-	cache.EXPECT().GetCachedTemplate("build-1").Return(tmplMock, true)
+	cache.EXPECT().LookupPinned(mock.Anything, "build-1").Return(tmplMock, func() {}, true)
 
-	src, err := ResolveBlob(cache, "build-1", storage.SnapfileName)
+	src, release, err := ResolveBlob(t.Context(), cache, "build-1", storage.SnapfileName)
+	defer release()
 	require.NoError(t, err)
 
 	sender := &collectSender{}
 
 	require.NoError(t, src.Stream(t.Context(), sender))
 	assert.Equal(t, content, string(sender.data))
+}
+
+// A snapfile larger than the bound has to reach the peer as several bounded
+// messages. This covers chunkWriter's call site, which the in-memory sources
+// bypass.
+func TestFileSource_Stream_ChunksLargeFile(t *testing.T) {
+	t.Parallel()
+
+	content := bytes.Repeat([]byte("s"), 2*sendChunkSize+7)
+	path := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(path, content, 0o600))
+
+	f := templatemocks.NewMockFile(t)
+	f.EXPECT().Path().Return(path)
+
+	tmplMock := templatemocks.NewMockTemplate(t)
+	tmplMock.EXPECT().Snapfile().Return(f, nil)
+
+	cache := peerservermocks.NewMockCache(t)
+	cache.EXPECT().LookupPinned(mock.Anything, "build-1").Return(tmplMock, func() {}, true)
+
+	src, release, err := ResolveBlob(t.Context(), cache, "build-1", storage.SnapfileName)
+	defer release()
+	require.NoError(t, err)
+
+	sender := &collectSender{}
+	require.NoError(t, src.Stream(t.Context(), sender))
+
+	assert.Equal(t, []int{sendChunkSize, sendChunkSize, 7}, sender.sends)
+	assert.Equal(t, content, sender.data)
 }
 
 func TestFileSource_Stream_FileNotOnDisk(t *testing.T) {
@@ -91,9 +126,10 @@ func TestFileSource_Stream_FileNotOnDisk(t *testing.T) {
 	tmplMock.EXPECT().Snapfile().Return(f, nil)
 
 	cache := peerservermocks.NewMockCache(t)
-	cache.EXPECT().GetCachedTemplate("build-1").Return(tmplMock, true)
+	cache.EXPECT().LookupPinned(mock.Anything, "build-1").Return(tmplMock, func() {}, true)
 
-	src, err := ResolveBlob(cache, "build-1", storage.SnapfileName)
+	src, release, err := ResolveBlob(t.Context(), cache, "build-1", storage.SnapfileName)
+	defer release()
 	require.NoError(t, err)
 
 	err = src.Stream(t.Context(), &collectSender{})

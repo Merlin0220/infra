@@ -1,5 +1,164 @@
 # Changelog
 
+## 0.16.1 (2026-09-10)
+
+
+### Bug Fixes
+
+* **clean-nfs-cache:** install CA certificates (ec5bb0c)
+
+## 0.16.0 (2026-09-10)
+
+
+### Features
+
+* **orchestrator:** expose sandbox limit metric (e567524)
+
+
+### Bug Fixes
+
+* **deps:** move the workspace to the Go 1.26.8 toolchain (e7116f5)
+* **deps:** update module github.com/stretchr/testify to v1.12.1 (a58bcb5)
+* **deps:** update module github.com/txn2/txeh to v1.8.1 (36a09d6)
+* **deps:** update module golang.org/x/oauth2 to v0.37.0 (92ca7bd)
+* **deps:** update module google.golang.org/api to v0.297.0 (852f328)
+* **deps:** update module google.golang.org/grpc to v1.83.2 [security] (7123140)
+* **deps:** update opentelemetry (34ecda9)
+* **deps:** update testcontainers-go monorepo to v0.44.0 (5473119)
+* **orchestrator:** bound sandbox proxy shutdown (ef855d0)
+* **orchestrator:** label a journal replay from the superblock, not e2fsck's exit code (949045d)
+
+
+### Performance Improvements
+
+* **orchestrator:** confine volume filesystems with openat2 instead of mount namespaces (358f142)
+
+## 0.15.0 (2026-09-10)
+
+
+### Features
+
+* **orchestrator:** publish sandbox routing record behind feature flags (3bc98a0)
+* **orch:** grant envd's memory protection through a system.slice drop-in (90bf96d)
+* **orch:** report and record the memory protection on envd's cgroup chain per start (8a1809e)
+
+## 0.14.0 (2026-09-09)
+
+
+### Features
+
+* **orchestrator:** add shutting-down status (c7bb7eb)
+* **orchestrator:** report outstanding work (b51e116)
+
+
+### Bug Fixes
+
+* **deps:** update module google.golang.org/grpc to v1.83.1 [security] (27006d5)
+* **orchestrator:** bound peer blob sends below the receive limit (4e98e00)
+
+
+### Code Refactoring
+
+* **orchestrator:** track outstanding node work (ffab524)
+
+## 0.13.0 (2026-09-07)
+
+
+### Features
+
+* **orchestrator:** snapshot-admission pre-flight for pause and checkpoint (flag-gated) (b47217c)
+* **templates:** configure free disk targets (b88aab9)
+* **templates:** separate build and free disk targets (432ab9a)
+
+
+### Bug Fixes
+
+* **envd:** stop counting a vanished cgroup as a freeze or thaw failure (9c5f26e)
+* **orchestrator:** guard draining status transitions (faf3d8a)
+* **orch:** re-send a sandbox's default user so a live envd upgrade cannot lose it (366ea8f)
+
+
+### Performance Improvements
+
+* **orch:** cache the host envd binary instead of re-reading it per resume (0ab5687)
+
+
+### Code Refactoring
+
+* **orchestrator:** derive sandbox log fields from the runtime metadata (b8a47d3)
+
+## 0.12.0 (2026-09-02)
+
+
+### Features
+
+* **ext4:** allow enabling the directory index on the rootfs (4c50658)
+* **orchestrator:** stamp build.result on template build spans (087d56a)
+
+
+### Bug Fixes
+
+* **orchestrator:** close nbd descriptor before data-path teardown (57f7c58)
+* **orchestrator:** provision findutils so template finalize survives minimal RPM-family images (12b48d9)
+* **orchestrator:** publish cache cleaner image (3a0869d)
+* **orchestrator:** remove the fs-only pause version gate (3ecf457)
+
+
+### Code Refactoring
+
+* **orchestrator:** inject the logger into the uffd memory backend (4ca4bf9)
+
+## 0.11.0 (2026-08-29)
+
+
+### Features
+
+* **orch:** make a blocked NBD close attributable in traces (71495c2)
+
+
+### Bug Fixes
+
+* **orchestrator:** remove the cache file when a diff turns out to be empty (acc670b)
+* rate-limit stale log drop warnings (9e4d5c4)
+
+## 0.10.0 (2026-08-27)
+
+
+### Features
+
+* **orchestrator:** evaluate feature flags with an instance group context (cb05c1f)
+* **orchestrator:** let the sandbox proxy dial HTTPS backends (7434ff9)
+* **orchestrator:** manage the build-time envd via a build-envd-version flag, like kernel and firecracker (35f5a63)
+* **orchestrator:** pre-boot filesystem recovery for cold-boot resumes (e6b0067)
+* **snapshots:** gate in-place checkpoint and fs-only snapshots on FC release &gt;= 0.2.0 (c7b5dff)
+
+
+### Bug Fixes
+
+* **orchestrator:** drop raw debugfs output from offline-swap errors (621cdd9)
+* **orchestrator:** let release-please stamp the hard-coded version constant (7aa055b)
+* **orchestrator:** treat a failed or signalled e2fsck as a failed integrity check (6b03458)
+
+## [0.2.0](https://github.com/e2b-dev/infra/compare/orchestrator-v0.1.0...orchestrator-v0.2.0) (2026-08-24)
+
+
+### Features
+
+* **checkpoint:** capture the in-place memory export through an async CoW window ([#1948](https://github.com/e2b-dev/infra/issues/1948)) ([8f14236](https://github.com/e2b-dev/infra/commit/8f1423617974aaa2cd1992baaadfdacfb394ec3d))
+* **envd:** freeze the customer's cgroups before a pause, not only our own ([#1929](https://github.com/e2b-dev/infra/issues/1929)) ([e117443](https://github.com/e2b-dev/infra/commit/e117443ac949de0810e8eaa9bec9f5d0126d1fa4))
+* **envd:** wait for the pre-pause freeze to stop the workload ([#1900](https://github.com/e2b-dev/infra/issues/1900)) ([99ca5cc](https://github.com/e2b-dev/infra/commit/99ca5ccbfdb47a05c3a2914df2c21b0bdfcefa95))
+* filesystem-only resume of memory-inclusive snapshots ([#1958](https://github.com/e2b-dev/infra/issues/1958)) ([6061743](https://github.com/e2b-dev/infra/commit/60617431dda40837e8530508f2ed29ac077c2319))
+* **shared:** use TypeID encoding for object IDs ([#2016](https://github.com/e2b-dev/infra/issues/2016)) ([4a5075b](https://github.com/e2b-dev/infra/commit/4a5075b135262c8ecd9c53d87fc6617d8811dfd7))
+
+
+### Bug Fixes
+
+* **network:** match wildcard transform domains ([#1897](https://github.com/e2b-dev/infra/issues/1897)) ([0521db3](https://github.com/e2b-dev/infra/commit/0521db34f974a129cbb62a4e32b8347c5b6cfdad))
+* **orchestrator:** apply egress CIDRs whose range ends at 255.255.255.255 ([#2012](https://github.com/e2b-dev/infra/issues/2012)) ([bceeaec](https://github.com/e2b-dev/infra/commit/bceeaec13483548db307a6358b90005e00087f17))
+* **orchestrator:** copy skeleton files without invoking cd ([#1949](https://github.com/e2b-dev/infra/issues/1949)) ([b8238ac](https://github.com/e2b-dev/infra/commit/b8238ac7512482d5a87fd4c8e52dfd61387cf411))
+* **orchestrator:** stop flushing Firecracker metrics after the VM exits ([#1335](https://github.com/e2b-dev/infra/issues/1335)) ([454a1ae](https://github.com/e2b-dev/infra/commit/454a1aea3f038b01ef01be9aaba006cfc3258de4))
+* **proxy:** add CORS to synthesized responses and answer proxy-only preflights ([#2068](https://github.com/e2b-dev/infra/issues/2068)) ([26faf4f](https://github.com/e2b-dev/infra/commit/26faf4f4dae8f87ca5682bcfca85c03f2a27b215))
+
 ## [0.1.0](https://github.com/e2b-dev/infra/compare/orchestrator-v0.0.2...orchestrator-v0.1.0) (2026-08-18)
 
 

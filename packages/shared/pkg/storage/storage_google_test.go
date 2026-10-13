@@ -4,7 +4,7 @@ package storage
 // fake-gcs-server container over the GCS JSON API. Note production uses the
 // gRPC client (NewGCP); tests use the HTTP client — no emulator speaks the
 // GCS gRPC protocol. The XML multipart upload side (MultipartUploader) is
-// covered in gcp_multipart_test.go against MinIO.
+// covered in gcp_multipart_test.go against RustFS.
 
 import (
 	"bytes"
@@ -59,7 +59,7 @@ func startFakeGCSBackend(t *testing.T) *gcpStorage {
 	require.NoError(t, err, "start fake-gcs-server container")
 
 	t.Cleanup(func() {
-		if err := container.Terminate(context.Background()); err != nil {
+		if err := container.Terminate(context.WithoutCancel(t.Context())); err != nil {
 			t.Logf("cleanup: failed to terminate fake-gcs-server container: %v", err)
 		}
 	})

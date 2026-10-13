@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
+	"github.com/e2b-dev/infra/packages/shared/pkg/sandboxtypes"
 )
 
 type networkAssignHookFunc func(context.Context, *Sandbox, NetworkAssignReason) error
@@ -20,7 +21,7 @@ func (f networkAssignHookFunc) OnNetworkAssign(ctx context.Context, sbx *Sandbox
 
 func testNetworkAssignHookSandbox() *Sandbox {
 	return &Sandbox{
-		Metadata:    &Metadata{Runtime: RuntimeMetadata{SandboxID: "sandbox-id"}},
+		Metadata:    &Metadata{Runtime: sandboxtypes.RuntimeMetadata{SandboxID: "sandbox-id"}},
 		LifecycleID: "lifecycle-id",
 	}
 }
@@ -75,7 +76,7 @@ func TestFactoryRunNetworkAssignHookRecoversPanic(t *testing.T) {
 func TestNewFactoryDefaultsNilNetworkAssignHook(t *testing.T) {
 	t.Parallel()
 
-	factory := NewFactory(cfg.BuilderConfig{}, nil, nil, nil, nil, nil, nil, nil, nil)
+	factory := NewFactory(t.Context(), cfg.BuilderConfig{}, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	require.IsType(t, NoopNetworkAssignHook{}, factory.networkAssignHook)
 }

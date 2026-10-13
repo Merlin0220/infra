@@ -78,10 +78,25 @@ type mockSandboxClient struct {
 	orchestrator.SandboxServiceClient
 }
 
+// MockResolvedFirecrackerVersion is the resolved version the default mock
+// Create echoes — deliberately distinct from any declared build version in
+// the tests, so assertions can prove the record stores the ECHO rather than
+// silently keeping the declared value.
+const MockResolvedFirecrackerVersion = "v1.14-9.9.9"
+
 // Create is a mock implementation that always returns success, echoing the
-// filesystem-boot demand like a current orchestrator build.
+// filesystem-boot demand and the resolved Firecracker version like a current
+// orchestrator build.
 func (n *mockSandboxClient) Create(_ context.Context, req *orchestrator.SandboxCreateRequest, _ ...grpc.CallOption) (*orchestrator.SandboxCreateResponse, error) {
-	return &orchestrator.SandboxCreateResponse{FilesystemBootApplied: req.GetFilesystemBoot()}, nil
+	return &orchestrator.SandboxCreateResponse{
+		FilesystemBootApplied:      req.GetFilesystemBoot(),
+		ResolvedFirecrackerVersion: MockResolvedFirecrackerVersion,
+	}, nil
+}
+
+// Update is a mock implementation that always accepts the new egress config.
+func (n *mockSandboxClient) Update(_ context.Context, _ *orchestrator.SandboxUpdateRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
 }
 
 // mockLegacySandboxClient mimics an orchestrator that predates the
@@ -156,6 +171,13 @@ func WithCPUInfo(cpuArch, cpuFamily, cpuModel string) TestOptions {
 	}
 }
 
+// WithOrchestratorVersion sets the orchestrator release the test node reports.
+func WithOrchestratorVersion(version string) TestOptions {
+	return func(node *TestNode) {
+		node.meta.Version = version
+	}
+}
+
 func WithLabels(labels []string) TestOptions {
 	return func(node *TestNode) {
 		labelsSet := make(map[string]struct{}, len(labels))
@@ -191,6 +213,17 @@ func WithSandboxCreateError(err error) TestOptions {
 func WithAllocatedMemoryBytes(bytes uint64) TestOptions {
 	return func(node *TestNode) {
 		node.metrics.MemoryAllocatedBytes = bytes
+	}
+}
+
+// WithHugePages sets the hugepage pool the test node reports: page counts, as
+// the kernel exposes them (total / used / reserved), plus the page size.
+func WithHugePages(total, used, reserved, pageSizeBytes uint64) TestOptions {
+	return func(node *TestNode) {
+		node.metrics.HugePagesTotal = total
+		node.metrics.HugePagesUsed = used
+		node.metrics.HugePagesReserved = reserved
+		node.metrics.HugePageSizeBytes = pageSizeBytes
 	}
 }
 

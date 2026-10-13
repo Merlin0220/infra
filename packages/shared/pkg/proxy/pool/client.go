@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log"
 	"net"
@@ -14,10 +15,15 @@ import (
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/cors"
 	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/template"
 	"github.com/e2b-dev/infra/packages/shared/pkg/proxy/tracking"
 	"github.com/e2b-dev/infra/packages/shared/pkg/smap"
 )
+
+// Bound the TLS handshake so a stalled HTTPS backend cannot hold a
+// connection open indefinitely (response streaming is intentionally unbounded).
+const tlsHandshakeTimeout = 10 * time.Second
 
 type ProxyClient struct {
 	httputil.ReverseProxy
@@ -36,6 +42,7 @@ func newProxyClient(
 	currentConnsCounter *atomic.Int64,
 	l *log.Logger,
 	disableKeepAlives bool,
+	insecureSkipTLSVerify bool,
 ) *ProxyClient {
 	activeConnections := smap.New[*tracking.Connection]()
 
@@ -45,7 +52,7 @@ func newProxyClient(
 		MaxIdleConnsPerHost:   maxHostIdleConns,
 		MaxIdleConns:          maxIdleConns,
 		IdleConnTimeout:       idleTimeout,
-		TLSHandshakeTimeout:   0,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
 		ResponseHeaderTimeout: 0,
 		DisableKeepAlives:     disableKeepAlives,
 		ForceAttemptHTTP2:     false,
@@ -91,6 +98,9 @@ func newProxyClient(
 		},
 		DisableCompression: true, // No need to request or manipulate compression
 	}
+	if insecureSkipTLSVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // Sandbox services commonly use self-signed certificates.
+	}
 
 	pc := &ProxyClient{
 		transport:         transport,
@@ -119,18 +129,25 @@ func newProxyClient(
 			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// The upstream could not answer, so the proxy is the only party left
+			// to answer the preflight, and a browser drops the real request
+			// unless the preflight gets a 2xx.
+			if cors.HandlePreflight(w, r) {
+				return
+			}
+
 			ctx := r.Context()
 			t, ok := pc.getDestination(r)
 			if !ok {
 				logger.L().Error(ctx, "proxy request without sandbox received error", zap.Error(err))
-				http.Error(w, "Failed to route request to sandbox", http.StatusInternalServerError)
+				cors.Error(w, "Failed to route request to sandbox", http.StatusInternalServerError)
 
 				return
 			}
 
 			if r.Host == "" { // kept around for historical reasons, unsure of usefulness. todo: find out if this is useful.
 				t.RequestLogger.Error(ctx, "error handler called from rewrite because of missing DestinationContext", zap.Error(err))
-				http.Error(w, "Failed to route request to sandbox", http.StatusInternalServerError)
+				cors.Error(w, "Failed to route request to sandbox", http.StatusInternalServerError)
 
 				return
 			}
@@ -154,7 +171,7 @@ func newProxyClient(
 				if err != nil {
 					logger.L().Error(ctx, "failed to handle error", zap.Error(err))
 
-					http.Error(w, "Failed to handle closed port error", http.StatusInternalServerError)
+					cors.Error(w, "Failed to handle closed port error", http.StatusInternalServerError)
 
 					return
 				}
@@ -162,7 +179,7 @@ func newProxyClient(
 				return
 			}
 
-			http.Error(w, "Failed to route request to sandbox", http.StatusBadGateway)
+			cors.Error(w, "Failed to route request to sandbox", http.StatusBadGateway)
 		},
 		ModifyResponse: func(r *http.Response) error {
 			ctx := r.Request.Context()

@@ -2,6 +2,9 @@
 
 Instructions for AI agents working in this repository.
 
+Also read [CLAUDE.md](CLAUDE.md) for development commands and package
+conventions if it is not already in context. It applies to all agents.
+
 ## Understanding the repository
 
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before working on or reviewing code here. It describes what each service does, how services interact (sandbox creation, traffic routing, pause/resume, template builds), the data stores, and the deployment topology — it is the fastest way to build correct context about this codebase.
@@ -22,5 +25,5 @@ Output style rules (strict, override any defaults):
 ## Scope
 
 - Skip style/nit comments — `golangci-lint` covers those.
-- Skip test-coverage comments — Codecov covers those.
+- Skip test-coverage comments.
 - Focus on: race conditions, nil-deref, error handling, auth/authz, request routing, resource leaks, SQL/migration correctness, and gRPC/proto compatibility.

@@ -62,6 +62,18 @@ func TestResolveFirecrackerVersion_LegacyGoldens(t *testing.T) {
 	}
 }
 
+func TestDisableLegacyTeamMutationsFlagFallback(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClientWithDatasource(ldtestdata.DataSource())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, client.Close(context.WithoutCancel(t.Context())))
+	})
+
+	assert.False(t, client.BoolFlag(t.Context(), DisableLegacyTeamMutationsFlag))
+}
+
 // Guards the default map shipped in this package: every entry's key must be
 // the LD key its value derives to, or the lookup silently never hits.
 func TestFirecrackerVersionMap_KeysMatchLDKeys(t *testing.T) {
@@ -170,5 +182,78 @@ func TestResolveFirecrackerVersion_MetricAttributes(t *testing.T) {
 	}
 	for i, w := range want {
 		assert.True(t, found[i], "no datapoint with exactly %v", w.Encoded(attribute.DefaultEncoder()))
+	}
+}
+
+func TestParseLogsReadConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		raw  string
+		want bool
+	}{
+		{raw: "", want: false},
+		{raw: "true", want: true},
+		{raw: "1", want: true},
+		{raw: " TRUE ", want: true},
+		{raw: "false", want: false},
+		{raw: "yes", want: false},
+		{raw: "clickhouse", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run("LOGS_READ_CONFIG="+tt.raw, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, parseLogsReadConfig(tt.raw))
+		})
+	}
+}
+
+func TestGetIsolatedSchedulingHosts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		value    ldvalue.Value
+		expected map[string]struct{}
+	}{
+		{
+			name:     "unset leaves scheduling unpartitioned",
+			value:    ldvalue.Null(),
+			expected: map[string]struct{}{},
+		},
+		{
+			name:     "array of host ids",
+			value:    ldvalue.FromJSONMarshal([]string{"node-a", "node-b"}),
+			expected: map[string]struct{}{"node-a": {}, "node-b": {}},
+		},
+		{
+			name:     "empty entries are dropped",
+			value:    ldvalue.FromJSONMarshal([]string{"node-a", ""}),
+			expected: map[string]struct{}{"node-a": {}},
+		},
+		{
+			name:     "a non-array value reads as empty rather than stranding every sandbox",
+			value:    ldvalue.FromJSONMarshal(map[string]bool{"node-a": true}),
+			expected: map[string]struct{}{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			td := ldtestdata.DataSource()
+			td.Update(td.Flag(IsolatedSchedulingHostsFlag.Key()).ValueForAll(tt.value))
+
+			client, err := NewClientWithDatasource(td)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, client.Close(context.WithoutCancel(t.Context())))
+			})
+
+			assert.Equal(t, tt.expected, GetIsolatedSchedulingHosts(t.Context(), client))
+		})
 	}
 }
